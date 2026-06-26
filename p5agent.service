@@ -1,0 +1,21 @@
+[Unit]
+Description=p5agent remote management agent
+Documentation=https://github.com/maratal/p5agent  # repo URL
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Token, app dir, and port are provided here (written by install.sh).
+EnvironmentFile=/etc/p5agent.env
+ExecStart=/usr/bin/python3 /opt/p5agent/agent.py
+Restart=always
+RestartSec=2
+# The agent must run management commands as root, so it runs as root.
+User=root
+# Send logs to the journal: journalctl -u p5agent -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
