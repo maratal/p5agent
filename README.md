@@ -173,9 +173,22 @@ bash install.sh
 
 Only `P5AGENT_TOKEN` is required. The script copies the agent to `/opt/p5agent`,
 writes `/etc/p5agent.env`, installs and starts the `p5agent` systemd service,
-and opens the port in UFW. Source-IP enforcement is done per-endpoint by the
-agent (only `/command` is locked to `P5AGENT_ALLOW_IP`, which defaults to
-`127.0.0.1`), so the port itself is open to all hosts.
+and configures the firewall.
+
+The firewall (UFW) is reset to **deny all incoming by default**, with these ways
+in:
+
+- the agent port (`5005`) — open to all hosts (per-endpoint source-IP
+  enforcement is done inside the agent, only `/command` is IP-locked);
+- SSH (`22`) — allowed from `P5AGENT_ALLOW_IP` and from the droplet's own
+  internal VPC subnet (auto-detected, so peer droplets on the same private
+  network can SSH in);
+- a port per installed app — `install_app.sh` opens the `port` from each
+  `/install-app` request as it sets the app up.
+
+Every other port is closed. Note: `P5AGENT_ALLOW_IP` defaults to `127.0.0.1`, so
+if you do not set it to your admin IP, **remote SSH is limited to the VPC and
+localhost**.
 
 ```bash
 systemctl status p5agent     # service state

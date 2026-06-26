@@ -156,6 +156,14 @@ if [[ -n "$repo" ]]; then
         fi
     fi
 
+    # Open the app's port in the firewall (everything else is denied by default).
+    if [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )); then
+        if command -v ufw >/dev/null 2>&1; then
+            logline "Opening firewall port $port for $name"
+            runlog "ufw allow '$port/tcp' comment '$name'"
+        fi
+    fi
+
     setup=""
     for candidate in setup.sh install.sh; do
         [[ -f "$target/$candidate" ]] && { setup="$target/$candidate"; break; }
