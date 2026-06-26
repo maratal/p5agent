@@ -6,8 +6,8 @@
 #
 # Environment:
 #   P5AGENT_TOKEN     required — shared secret for privileged endpoints
-#   P5AGENT_ALLOW_IP  optional — restrict the port to this source IP
-#                     (the dashboard's IP); defaults to 127.0.0.1 (localhost only)
+#   P5AGENT_ALLOW_IP  optional — client IP allowed to call /command (saved to the
+#                     env file and enforced by the agent); default 127.0.0.1
 #   P5AGENT_PORT      optional — listen port (default: 5005)
 #   P5AGENT_TLS_CERT  recommended — TLS cert (PEM) to serve HTTPS
 #   P5AGENT_TLS_KEY   recommended — TLS key  (PEM) to serve HTTPS
@@ -27,6 +27,7 @@ PROJECT="p5agent"
 INSTALL_DIR="/opt/$PROJECT"
 ENV_FILE="/etc/$PROJECT.env"
 SERVICE="$PROJECT.service"
+DATA_DIR="/var/lib/$PROJECT"
 
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 PORT="${P5AGENT_PORT:-5005}"
@@ -55,12 +56,22 @@ log "Writing $ENV_FILE"
 umask 077
 cat > "$ENV_FILE" <<EOF
 P5AGENT_TOKEN=$TOKEN
+P5AGENT_ALLOW_IP=$ALLOW_IP
 P5AGENT_PORT=$PORT
+P5AGENT_DATA_DIR=$DATA_DIR
 P5AGENT_TLS_CERT=$TLS_CERT
 P5AGENT_TLS_KEY=$TLS_KEY
 EOF
 chmod 600 "$ENV_FILE"
 ok "Configuration written"
+
+# ── Runtime state ────────────────────────────────────────────────────────────
+# Mutable state (the live install log and the installed-apps list) lives outside
+# the git checkout so /update never disturbs it.
+log "Preparing data dir $DATA_DIR"
+mkdir -p "$DATA_DIR"
+[[ -f "$DATA_DIR/installed_apps.json" ]] || echo "[]" > "$DATA_DIR/installed_apps.json"
+ok "Data dir ready"
 
 # ── systemd service ──────────────────────────────────────────────────────────
 log "Installing systemd service"
@@ -71,18 +82,15 @@ systemctl restart "$PROJECT"
 ok "Service $PROJECT started"
 
 # ── Firewall ─────────────────────────────────────────────────────────────────
-# Lock the agent port to a single source IP (the dashboard) so the root control
-# plane is not reachable from the open internet. Defaults to 127.0.0.1, i.e.
-# localhost only — reach it via an SSH tunnel until a dashboard IP is set.
+# Open the port to all hosts. Source-IP enforcement is done per-endpoint inside
+# the agent (only /command is locked to P5AGENT_ALLOW_IP); /install-app and
+# /update must be reachable from any IP, so the firewall does not scope by IP.
 if command -v ufw >/dev/null 2>&1; then
-    # Clear any prior, broader rule for this port to avoid leaving it open.
-    ufw delete allow "${PORT}/tcp" >/dev/null 2>&1 || true
-    log "Restricting port $PORT to $ALLOW_IP in UFW"
-    ufw allow from "$ALLOW_IP" to any port "$PORT" proto tcp \
-        comment "$PROJECT (dashboard)" >/dev/null 2>&1 || true
-    ok "Firewall: $PORT/tcp allowed only from $ALLOW_IP"
+    log "Opening port $PORT in UFW"
+    ufw allow "${PORT}/tcp" comment "$PROJECT" >/dev/null 2>&1 || true
+    ok "Firewall: $PORT/tcp open"
 else
-    fail "ufw not found — cannot restrict port $PORT to $ALLOW_IP; refusing to install without firewall scoping"
+    log "ufw not found — skipping firewall rule (port governed by host firewall)"
 fi
 
 ok "$PROJECT installed — listening on :$PORT"

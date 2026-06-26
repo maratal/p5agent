@@ -4,18 +4,27 @@ p5agent — minimal remote management agent.
 
 A tiny HTTP control plane for a deployed droplet, written with the Python
 standard library only (no pip installs; Ubuntu ships python3). It runs as a
-root systemd service on port 5005 and exposes three operations, all protected
-by a shared secret token:
+root systemd service on port 5005 and exposes:
 
-    GET  /          liveness probe (no token required)
-    *    /update    git-pull the deployed app repo, then run its update.sh
-    *    /command   save the request into /tmp/command_<dd_mm_yy_hh_mm_ss>.sh,
-                    grant execute permission, and run it as root
+    GET  /            liveness probe (no token required)
+    *    /update      git-pull this checkout, then run update.sh
+    *    /command     save the request to /tmp/command_<dd_mm_yy_hh_mm_ss>.sh and
+                      run it as root — restricted to P5AGENT_ALLOW_IP
+    *    /install-app  spawn install_app.sh in the background to install an app
+                      and its dependencies; returns 200 once the job is launched
+    GET  /progress    current install log (setup.log); empty when nothing runs
+    GET  /supported   the supported_deps.json registry
+    GET  /apps        the installed_apps.json list
+
+All endpoints except `/` require the shared secret token. `/command` is the only
+one restricted by source IP.
 
 Configuration is read from the environment (see /etc/p5agent.env):
 
     P5AGENT_TOKEN     shared secret required on every privileged request
+    P5AGENT_ALLOW_IP  client IP allowed to call /command (default: 127.0.0.1)
     P5AGENT_PORT      listen port                        (default: 5005)
+    P5AGENT_DATA_DIR  runtime state dir                  (default: /var/lib/p5agent)
     P5AGENT_TMP_DIR   where command scripts are written  (default: /tmp)
     P5AGENT_TIMEOUT   max seconds for any command        (default: 1800)
     P5AGENT_TLS_CERT  TLS certificate (PEM) — enables HTTPS
@@ -43,12 +52,21 @@ TOKEN = os.environ.get("P5AGENT_TOKEN", "")
 # install.sh decides via PROJECT). update.sh lives alongside this file.
 APP_DIR = os.path.dirname(os.path.realpath(__file__))
 APP_NAME = os.path.basename(APP_DIR)
+ALLOW_IP = os.environ.get("P5AGENT_ALLOW_IP", "127.0.0.1")
 BIND = os.environ.get("P5AGENT_BIND", "0.0.0.0")
 PORT = int(os.environ.get("P5AGENT_PORT", "5005"))
+DATA_DIR = os.environ.get("P5AGENT_DATA_DIR", "/var/lib/p5agent")
 TMP_DIR = os.environ.get("P5AGENT_TMP_DIR", "/tmp")
 CMD_TIMEOUT = int(os.environ.get("P5AGENT_TIMEOUT", "1800"))  # 30 minutes
 TLS_CERT = os.environ.get("P5AGENT_TLS_CERT", "")
 TLS_KEY = os.environ.get("P5AGENT_TLS_KEY", "")
+
+# Files the agent serves/spawns. The install lifecycle (deps, clone, setup,
+# logging, progress) lives entirely in install_app.sh + supported_deps.json.
+INSTALL_SCRIPT = os.path.join(APP_DIR, "install_app.sh")
+SUPPORTED_DEPS = os.path.join(APP_DIR, "supported_deps.json")
+SETUP_LOG = os.path.join(DATA_DIR, "setup.log")
+INSTALLED_APPS = os.path.join(DATA_DIR, "installed_apps.json")
 
 
 def run(cmd, cwd=None):
@@ -82,15 +100,26 @@ def unique_script_path():
     return path
 
 
+def read_file(path):
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "p5agent/1.0"
     protocol_version = "HTTP/1.1"
 
     # ---- low-level helpers ----------------------------------------------
     def _send(self, status, payload):
-        body = json.dumps(payload).encode("utf-8")
+        self._send_raw(status, json.dumps(payload), "application/json")
+
+    def _send_raw(self, status, text, content_type):
+        body = text.encode("utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -114,6 +143,16 @@ class Handler(BaseHTTPRequestHandler):
             supplied = auth[len("Bearer "):]
         return hmac.compare_digest(supplied, TOKEN)
 
+    def _ip_allowed(self):
+        # Per-endpoint source-IP check (enforced in-process, not just by the
+        # firewall). Loopback is treated as equivalent when ALLOW_IP is local.
+        ip = self.client_address[0]
+        if ip == ALLOW_IP:
+            return True
+        if ALLOW_IP in ("127.0.0.1", "localhost") and ip in ("127.0.0.1", "::1"):
+            return True
+        return False
+
     def log_message(self, fmt, *args):
         sys.stderr.write("[p5agent] %s %s\n" % (self.address_string(), fmt % args))
 
@@ -124,24 +163,36 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._dispatch()
 
+    ROUTES = ("/update", "/command", "/install-app", "/progress",
+              "/supported", "/apps")
+
     def _dispatch(self):
         path = self._path()
         if path == "/":
             return self._send(200, {"status": "ok", "service": "p5agent"})
-        if path not in ("/update", "/command"):
+        if path not in self.ROUTES:
             return self._send(404, {"error": "not found", "path": path})
         if not self._authorized():
             return self._send(401, {"error": "unauthorized"})
+        # /command is the only endpoint locked to the allowed source IP.
+        if path == "/command" and not self._ip_allowed():
+            return self._send(403, {"error": "forbidden",
+                                    "detail": "/command is restricted to %s" % ALLOW_IP})
         try:
-            if path == "/update":
-                return self._do_update()
-            return self._do_command()
+            return {
+                "/update": self._do_update,
+                "/command": self._do_command,
+                "/install-app": self._do_install_app,
+                "/progress": self._do_progress,
+                "/supported": self._do_supported,
+                "/apps": self._do_apps,
+            }[path]()
         except Exception as exc:  # noqa: BLE001 - never leak a traceback as 500 HTML
             return self._send(500, {"error": "internal error", "detail": str(exc)})
 
     # ---- operations ------------------------------------------------------
     def _do_update(self):
-        """1) git pull the deployed app repo (best effort), 2) run its update.sh.
+        """1) git pull this checkout (best effort), 2) run its update.sh.
 
         The git pull is advisory: update.sh re-fetches and hard-resets the repo
         itself, so a pull hiccup (e.g. no upstream tracking) must not fail the
@@ -194,6 +245,51 @@ class Handler(BaseHTTPRequestHandler):
         rc, out = run([path], cwd=TMP_DIR)
         status = 200 if rc == 0 else 500
         return self._send(status, {"returncode": rc, "output": out, "script": path})
+
+    def _do_install_app(self):
+        """Launch install_app.sh in the background and return immediately."""
+        raw = self._body().decode("utf-8", "replace").strip()
+        if not raw:
+            return self._send(400, {"error": "empty body"})
+        try:
+            req = json.loads(raw)
+        except ValueError:
+            return self._send(400, {"error": "body must be JSON"})
+        if not (req.get("repo") or "").strip():
+            return self._send(400, {"error": "repo is required"})
+        if not os.path.isfile(INSTALL_SCRIPT):
+            return self._send(500, {"error": "install_app.sh not found"})
+
+        ts = datetime.now().strftime("%d_%m_%y_%H_%M_%S")
+        req_path = os.path.join(TMP_DIR, "install_request_%s.json" % ts)
+        with open(req_path, "w") as fh:
+            json.dump(req, fh)
+
+        try:
+            subprocess.Popen(
+                ["bash", INSTALL_SCRIPT, req_path],
+                cwd=APP_DIR,
+                env=dict(os.environ, HOME="/root"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,  # survive the agent and this request
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._send(500, {"error": "failed to launch installer",
+                                    "detail": str(exc)})
+        return self._send(200, {"status": "started"})
+
+    def _do_progress(self):
+        """Return the live install log; empty when nothing is installing."""
+        return self._send_raw(200, read_file(SETUP_LOG), "text/plain; charset=utf-8")
+
+    def _do_supported(self):
+        """Return the supported dependencies registry."""
+        return self._send_raw(200, read_file(SUPPORTED_DEPS) or "[]", "application/json")
+
+    def _do_apps(self):
+        """Return the installed apps list."""
+        return self._send_raw(200, read_file(INSTALLED_APPS) or "[]", "application/json")
 
 
 def main():

@@ -1,0 +1,106 @@
+[
+  {
+    "name": "postgresql",
+    "display-name": "PostgreSQL",
+    "icon-url": "https://cdn.simpleicons.org/postgresql",
+    "package-manager": "apt",
+    "package": "postgresql"
+  },
+  {
+    "name": "mysql",
+    "display-name": "MySQL",
+    "icon-url": "https://cdn.simpleicons.org/mysql",
+    "package-manager": "apt",
+    "package": "mysql-server"
+  },
+  {
+    "name": "mariadb",
+    "display-name": "MariaDB",
+    "icon-url": "https://cdn.simpleicons.org/mariadb",
+    "package-manager": "apt",
+    "package": "mariadb-server"
+  },
+  {
+    "name": "redis",
+    "display-name": "Redis",
+    "icon-url": "https://cdn.simpleicons.org/redis",
+    "package-manager": "apt",
+    "package": "redis-server"
+  },
+  {
+    "name": "sqlite",
+    "display-name": "SQLite",
+    "icon-url": "https://cdn.simpleicons.org/sqlite",
+    "package-manager": "apt",
+    "package": "sqlite3"
+  },
+  {
+    "name": "nginx",
+    "display-name": "nginx",
+    "icon-url": "https://cdn.simpleicons.org/nginx",
+    "package-manager": "apt",
+    "package": "nginx"
+  },
+  {
+    "name": "nodejs",
+    "display-name": "Node.js",
+    "icon-url": "https://cdn.simpleicons.org/nodedotjs",
+    "package-manager": "apt",
+    "package": "nodejs"
+  },
+  {
+    "name": "python3",
+    "display-name": "Python 3",
+    "icon-url": "https://cdn.simpleicons.org/python",
+    "package-manager": "apt",
+    "package": "python3"
+  },
+  {
+    "name": "ruby",
+    "display-name": "Ruby",
+    "icon-url": "https://cdn.simpleicons.org/ruby",
+    "package-manager": "apt",
+    "package": "ruby-full"
+  },
+  {
+    "name": "golang",
+    "display-name": "Go",
+    "icon-url": "https://cdn.simpleicons.org/go",
+    "package-manager": "apt",
+    "package": "golang"
+  },
+  {
+    "name": "php",
+    "display-name": "PHP",
+    "icon-url": "https://cdn.simpleicons.org/php",
+    "package-manager": "apt",
+    "package": "php"
+  },
+  {
+    "name": "java",
+    "display-name": "Java (OpenJDK)",
+    "icon-url": "https://cdn.simpleicons.org/openjdk",
+    "package-manager": "apt",
+    "package": "default-jdk"
+  },
+  {
+    "name": "ffmpeg",
+    "display-name": "FFmpeg",
+    "icon-url": "https://cdn.simpleicons.org/ffmpeg",
+    "package-manager": "apt",
+    "package": "ffmpeg"
+  },
+  {
+    "name": "imagemagick",
+    "display-name": "ImageMagick",
+    "icon-url": "https://cdn.simpleicons.org/imagemagick",
+    "package-manager": "apt",
+    "package": "imagemagick"
+  },
+  {
+    "name": "swift",
+    "display-name": "Swift",
+    "icon-url": "https://cdn.simpleicons.org/swift",
+    "install-cmd": "install_swift.sh"
+  }
+]
