@@ -10,8 +10,8 @@
 #                     the agent) and the only IP allowed to SSH in; default
 #                     127.0.0.1 (which blocks remote SSH — set your admin IP)
 #   P5AGENT_PORT      optional — listen port (default: 5005)
-#   P5AGENT_TLS_CERT  recommended — TLS cert (PEM) to serve HTTPS
-#   P5AGENT_TLS_KEY   recommended — TLS key  (PEM) to serve HTTPS
+#   P5AGENT_TLS_CERT  optional — TLS cert (PEM); a self-signed one is generated if unset
+#   P5AGENT_TLS_KEY   optional — TLS key  (PEM); a self-signed one is generated if unset
 
 set -euo pipefail
 
@@ -21,6 +21,14 @@ fail() { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
 [[ "$(id -u)" -eq 0 ]] || fail "This script must be run as root"
 command -v python3 >/dev/null 2>&1 || fail "python3 is required but not installed"
+
+# Ensure git (the agent self-updates via git pull) and openssl (for the
+# self-signed cert below) are present — neither is guaranteed on a fresh image.
+if ! command -v git >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq || true
+    apt-get install -y git openssl || fail "could not install git and openssl"
+fi
 
 # Project name — drives the install dir, env file, and systemd unit names.
 # (The P5AGENT_* env keys below are read by agent.py and are intentionally fixed.)
@@ -38,9 +46,6 @@ TLS_KEY="${P5AGENT_TLS_KEY:-}"
 ALLOW_IP="${P5AGENT_ALLOW_IP:-127.0.0.1}"
 
 [[ -n "$TOKEN" ]] || fail "P5AGENT_TOKEN is required (the shared secret)"
-if [[ -z "$TLS_CERT" || -z "$TLS_KEY" ]]; then
-    log "WARNING: no TLS cert/key given — agent will serve plain HTTP"
-fi
 
 # ── Place the agent code ─────────────────────────────────────────────────────
 log "Installing agent to $INSTALL_DIR"
@@ -51,6 +56,22 @@ if [[ "$SRC_DIR" != "$INSTALL_DIR" ]]; then
     cp -a "$SRC_DIR/." "$INSTALL_DIR/"
 fi
 ok "Agent code in place"
+
+# ── TLS certificate ──────────────────────────────────────────────────────────
+# Use the provided cert/key, or generate a self-signed one (under the install
+# dir) so the agent always serves HTTPS on :5005.
+if [[ -z "$TLS_CERT" || -z "$TLS_KEY" ]]; then
+    log "No TLS cert/key provided — generating a self-signed certificate"
+    CERT_DIR="$INSTALL_DIR/certs"
+    mkdir -p "$CERT_DIR"
+    IP=$(curl -s --max-time 10 http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address 2>/dev/null || hostname -I | awk '{print $1}')
+    openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
+        -keyout "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" \
+        -subj "/CN=$IP" -addext "subjectAltName=IP:$IP"
+    TLS_CERT="$CERT_DIR/cert.pem"
+    TLS_KEY="$CERT_DIR/key.pem"
+    ok "Self-signed certificate generated for $IP"
+fi
 
 # ── Configuration (root-only readable) ───────────────────────────────────────
 log "Writing $ENV_FILE"

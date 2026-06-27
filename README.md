@@ -118,11 +118,12 @@ to `/etc/p5agent.env`, mode 600):
 | `P5AGENT_DATA_DIR` | `/var/lib/p5agent` | Runtime state: `setup.log`, `installed_apps.json`. |
 | `P5AGENT_TMP_DIR` | `/tmp` | Where `/command` scripts and archived install logs go. |
 | `P5AGENT_TIMEOUT` | `1800` | Max seconds any command may run. |
-| `P5AGENT_TLS_CERT` | *(empty)* | TLS certificate (PEM). Enables HTTPS. |
-| `P5AGENT_TLS_KEY` | *(empty)* | TLS private key (PEM). Enables HTTPS. |
+| `P5AGENT_TLS_CERT` | *(empty)* | TLS certificate (PEM). If unset, install.sh generates a self-signed one. |
+| `P5AGENT_TLS_KEY` | *(empty)* | TLS private key (PEM). If unset, install.sh generates a self-signed one. |
 
-When `P5AGENT_TLS_CERT` and `P5AGENT_TLS_KEY` point to PEM files, the agent
-serves HTTPS (TLS 1.2+).
+The agent always serves HTTPS (TLS 1.2+). Point `P5AGENT_TLS_CERT`/`KEY` at your
+own PEM files, or leave them unset and `install.sh` generates a self-signed
+certificate (for the droplet's IP) under `/opt/p5agent/certs`.
 
 ## Files
 
@@ -164,16 +165,13 @@ convention for where a service keeps its files:
 Run as root from a checkout of this repo:
 
 ```bash
-P5AGENT_TOKEN=<secret> \
-P5AGENT_ALLOW_IP=<dashboard_ip> \
-P5AGENT_TLS_CERT=/opt/p5agent/certs/cert.pem \
-P5AGENT_TLS_KEY=/opt/p5agent/certs/key.pem \
-bash install.sh
+P5AGENT_TOKEN=<secret> P5AGENT_ALLOW_IP=<dashboard_ip> bash install.sh
 ```
 
-Only `P5AGENT_TOKEN` is required. The script copies the agent to `/opt/p5agent`,
-writes `/etc/p5agent.env`, installs and starts the `p5agent` systemd service,
-and configures the firewall.
+Only `P5AGENT_TOKEN` is required. The script ensures `git` and `openssl` are
+installed, copies the agent to `/opt/p5agent`, generates a self-signed TLS cert
+(unless one is provided), writes `/etc/p5agent.env`, installs and starts the
+`p5agent` systemd service, and configures the firewall.
 
 The firewall (UFW) is reset to **deny all incoming by default**, with these ways
 in:
