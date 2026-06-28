@@ -304,20 +304,46 @@ class Handler(BaseHTTPRequestHandler):
         return self._send_raw(200, read_file(INSTALLED_APPS) or "[]", "application/json")
 
 
+class Server(ThreadingHTTPServer):
+    """Threaded HTTP(S) server.
+
+    Crucially, the listening socket is NOT TLS-wrapped. Instead each accepted
+    connection gets a timeout and (when TLS is enabled) its handshake is done in
+    get_request under that timeout. Wrapping the listening socket would run the
+    TLS handshake inside accept() on the single accept loop, so a client that
+    finishes the TCP connection but stalls the handshake — a laptop sleeping
+    mid-request, a plain-HTTP probe to the TLS port, a port scan — would block
+    the loop forever and wedge the whole agent. Here a stalled/garbage handshake
+    just times out, raising OSError, which serve_forever swallows; the loop keeps
+    accepting.
+    """
+
+    daemon_threads = True
+    ssl_ctx = None
+    conn_timeout = 30  # seconds; bounds the handshake and request/response I/O
+
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        sock.settimeout(self.conn_timeout)
+        if self.ssl_ctx is not None:
+            sock = self.ssl_ctx.wrap_socket(sock, server_side=True)
+        return sock, addr
+
+
 def main():
     if not TOKEN:
         sys.stderr.write(
             "[p5agent] WARNING: P5AGENT_TOKEN is empty — every privileged "
             "request will be rejected with 401.\n"
         )
-    server = ThreadingHTTPServer((BIND, PORT), Handler)
+    server = Server((BIND, PORT), Handler)
 
     scheme = "http"
     if TLS_CERT and TLS_KEY:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(certfile=TLS_CERT, keyfile=TLS_KEY)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-        server.socket = ctx.wrap_socket(server.socket, server_side=True)
+        server.ssl_ctx = ctx
         scheme = "https"
     else:
         sys.stderr.write(
