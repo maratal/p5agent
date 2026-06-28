@@ -56,7 +56,6 @@ fi
 # ── Read the request ─────────────────────────────────────────────────────────
 jget() { python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2],'') or '')" "$REQ" "$1"; }
 repo=$(jget repo); key=$(jget key); branch=$(jget branch)
-branch="${branch:-main}"   # no version given → default to the main branch
 name=$(jget name); product=$(jget product-name); port=$(jget port)
 [[ -n "$name" ]] || { base="${repo##*/}"; name="${base%.git}"; }
 target="$APPS_DIR/$name"
@@ -96,6 +95,13 @@ PY
 if (( ${#DEPS[@]} == 0 )); then
     logline "No dependencies requested"
 else
+    # DigitalOcean password-auth droplets flag root's password "must change on
+    # first login". That makes PAM abort chfn/adduser inside package postinst
+    # scripts (notably postgresql) with "authentication token is no longer
+    # valid", failing the whole apt step. Reset root's last-change date so those
+    # service-user setups succeed.
+    runlog "chage -d \"\$(date +%F)\" root || true"
+
     logline "Updating package lists"
     runlog "apt-get update -qq"
     for dep in "${DEPS[@]}"; do
@@ -150,27 +156,23 @@ if [[ -n "$repo" ]]; then
                 https://*)            clone_url="https://$key@${repo#https://}" ;;
             esac
         fi
-        if [[ -n "$branch" ]]; then
-            # Target the requested ref (a branch or a tag). git --branch accepts
-            # both. If the value looks like a semver, also try the common
-            # "v"-prefixed / unprefixed tag variant so e.g. "1.2.3" matches a
-            # "v1.2.3" release tag (and vice versa).
-            refs=("$branch")
-            if [[ "$branch" =~ ^v?[0-9]+(\.[0-9]+){1,2}$ ]]; then
-                if [[ "$branch" == v* ]]; then refs+=("${branch#v}"); else refs+=("v$branch"); fi
-            fi
-            cloned=0
-            for ref in "${refs[@]}"; do
-                if runlog "git clone --depth 1 --branch '$ref' '$clone_url' '$target'"; then
-                    cloned=1; break
-                fi
-                logline "ref '$ref' not found"
-                rm -rf "$target"
-            done
-            (( cloned )) || fail "$name clone failed (no branch or tag matching '$branch')"
-        else
-            runlog "git clone --depth 1 '$clone_url' '$target'" || fail "$name clone failed"
+        # Target the requested ref (branch or tag); no version given → main. A
+        # semver also tries the common "v"-prefixed / unprefixed variant (so
+        # "1.2.3" matches a "v1.2.3" release tag).
+        ref_in="${branch:-main}"
+        refs=("$ref_in")
+        if [[ "$ref_in" =~ ^v?[0-9]+(\.[0-9]+){1,2}$ ]]; then
+            if [[ "$ref_in" == v* ]]; then refs+=("${ref_in#v}"); else refs+=("v$ref_in"); fi
         fi
+        cloned=0
+        for ref in "${refs[@]}"; do
+            if runlog "git clone --depth 1 --branch '$ref' '$clone_url' '$target'"; then
+                cloned=1; break
+            fi
+            logline "ref '$ref' not found"
+            rm -rf "$target"
+        done
+        (( cloned )) || fail "$name clone failed (no branch or tag matching '$ref_in')"
     fi
 
     # Open the app's port in the firewall (everything else is denied by default).
