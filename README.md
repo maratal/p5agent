@@ -176,17 +176,14 @@ installed, copies the agent to `/opt/p5agent`, generates a self-signed TLS cert
 The firewall (UFW) is reset to **deny all incoming by default**, with these ways
 in:
 
+- SSH (`22`) — open to all, so admins and the DigitalOcean console can always
+  reach the box;
 - the agent port (`5005`) — open to all hosts (per-endpoint source-IP
   enforcement is done inside the agent, only `/command` is IP-locked);
-- SSH (`22`) — allowed from `P5AGENT_ALLOW_IP` and from the droplet's own
-  internal VPC subnet (auto-detected, so peer droplets on the same private
-  network can SSH in);
-- a port per installed app — `install_app.sh` opens the `port` from each
-  `/install-app` request as it sets the app up.
+- a port per installed app — re-opened on every run from the `port` of each
+  entry in `installed_apps.json`.
 
-Every other port is closed. Note: `P5AGENT_ALLOW_IP` defaults to `127.0.0.1`, so
-if you do not set it to your admin IP, **remote SSH is limited to the VPC and
-localhost**.
+Every other port is closed. (`P5AGENT_ALLOW_IP` only governs who may call `/command`)
 
 ```bash
 systemctl status p5agent     # service state

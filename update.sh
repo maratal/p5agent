@@ -18,6 +18,11 @@ ok()  { printf '\033[1;32m✓ %s\033[0m\n' "$*"; }
 
 [[ "$(id -u)" -eq 0 ]] || { echo "This script must be run as root" >&2; exit 1; }
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Re-apply the firewall (non-fatal if ufw is missing).
+bash "$SCRIPT_DIR/firewall.sh" || log "Firewall step skipped (ufw unavailable?)"
+
 log "Scheduling p5agent restart to load the updated code"
 systemd-run --collect --on-active=1s --unit=p5agent-restart \
     systemctl restart p5agent

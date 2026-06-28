@@ -104,40 +104,10 @@ systemctl restart "$PROJECT"
 ok "Service $PROJECT started"
 
 # ── Firewall ─────────────────────────────────────────────────────────────────
-# Lock the box to two ways in and deny everything else:
-#   - the agent port: open to all (per-endpoint source-IP enforcement is done
-#     inside the agent, since /install-app and /update must reach any IP)
-#   - SSH (22): restricted to the allowed IP
-# A reset guarantees no stray rules leave another port open.
-if command -v ufw >/dev/null 2>&1; then
-    log "Configuring UFW (deny by default; allow $PORT; SSH from $ALLOW_IP)"
-    ufw --force reset >/dev/null 2>&1 || true
-    ufw default deny incoming >/dev/null 2>&1 || true
-    ufw default allow outgoing >/dev/null 2>&1 || true
-    ufw allow "${PORT}/tcp" comment "$PROJECT" >/dev/null 2>&1 || true
-    ufw allow from "$ALLOW_IP" to any port 22 proto tcp comment "SSH ($ALLOW_IP)" >/dev/null 2>&1 || true
-
-    # Also allow SSH from peer droplets on the same internal (VPC) network.
-    # DigitalOcean assigns each droplet a private IP in a 10.x.0.0/20 VPC range;
-    # detect this droplet's private subnet and allow 22 from it.
-    PRIV_CIDR=$(ip -o -f inet addr show 2>/dev/null | awk '$4 ~ /^10\./ {print $4; exit}')
-    if [[ -n "$PRIV_CIDR" ]]; then
-        VPC_NET=$(python3 -c "import ipaddress,sys;print(ipaddress.ip_network(sys.argv[1],strict=False))" "$PRIV_CIDR" 2>/dev/null)
-        if [[ -n "$VPC_NET" ]]; then
-            ufw allow from "$VPC_NET" to any port 22 proto tcp comment "SSH (VPC $VPC_NET)" >/dev/null 2>&1 || true
-            log "SSH also allowed from internal network $VPC_NET"
-        fi
-    fi
-
-    ufw --force enable >/dev/null 2>&1 || true
-    ok "Firewall: default deny; ${PORT}/tcp open; 22/tcp from $ALLOW_IP${VPC_NET:+ + $VPC_NET}"
-    if [[ "$ALLOW_IP" == "127.0.0.1" || "$ALLOW_IP" == "localhost" ]]; then
-        log "WARNING: SSH is now limited to $ALLOW_IP — remote SSH is blocked."
-        log "         Set P5AGENT_ALLOW_IP to your admin IP to keep SSH access."
-    fi
-else
-    fail "ufw not found — cannot configure the firewall"
-fi
+# Apply the firewall rule set (shared with update.sh; reads /etc/p5agent.env,
+# just written above). Aborts the install if ufw is unavailable.
+log "Configuring firewall"
+bash "$INSTALL_DIR/firewall.sh"
 
 ok "$PROJECT installed — listening on :$PORT"
 echo "Check status: systemctl status $PROJECT   |   logs: journalctl -u $PROJECT -f"
