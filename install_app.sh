@@ -8,7 +8,7 @@
 # Everything is logged, line-by-line with timestamps, to $SETUP_LOG. The browser
 # polls /progress (which returns that file) every few seconds. While the file
 # exists and is being updated, an install is "in progress". On completion the
-# log is moved to $TMP_DIR/x_setup_<ts>.log (and to ...-failed.log on failure),
+# log is moved to $TMP_DIR/p5agent_setup_<ts>.log (and to ...-failed.log on failure),
 # which leaves /progress empty — the browser's signal that nothing is running.
 #
 # Concurrency: a second invocation sees a recent $SETUP_LOG and exits. A stale
@@ -32,7 +32,7 @@ stamp()    { while IFS= read -r line; do printf '[%s] %s\n' "$(ts)" "$line"; don
 runlog()   { bash -c "$1" 2>&1 | stamp; return "${PIPESTATUS[0]}"; }
 
 archive() {  # archive() <suffix>  — move the log out of the way
-    cp "$SETUP_LOG" "$TMP_DIR/x_setup_$(date +%Y%m%d_%H%M%S)${1:-}.log" 2>/dev/null || true
+    cp "$SETUP_LOG" "$TMP_DIR/p5agent_setup_$(date +%Y%m%d_%H%M%S)${1:-}.log" 2>/dev/null || true
     rm -f "$SETUP_LOG"
 }
 

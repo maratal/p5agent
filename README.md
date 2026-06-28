@@ -78,7 +78,7 @@ Only `repo` is required. `install_app.sh` then, logging every step to
 3. **Runs the setup script** — `setup.sh` or `install.sh` from the repo, if
    present.
 4. **Records the app** in `installed_apps.json` and writes `Setup completed.`,
-   then moves `setup.log` to `<tmp>/x_setup_<timestamp>.log` (so `/progress`
+   then moves `setup.log` to `<tmp>/p5agent_setup_<timestamp>.log` (so `/progress`
    goes empty — the signal that nothing is running).
 
 A version may be appended after a space (e.g. `swift 6`, `ruby 3.4.5`). Most
@@ -89,7 +89,7 @@ current list comes from `/supported`.
 served by `/progress`. A second `/install-app` while one is active is a no-op.
 If `setup.log` is stale (untouched > 10 min), the next run waits 30s and, if
 still unchanged, treats the previous install as failed — archiving it to
-`<tmp>/x_setup_<timestamp>-failed.log` and clearing `setup.log`.
+`<tmp>/p5agent_setup_<timestamp>-failed.log` and clearing `setup.log`.
 
 ## Authorization
 
@@ -157,7 +157,7 @@ convention for where a service keeps its files:
 | `/opt/p5agent` | add-on application software | the agent's code (this checkout) |
 | `/etc/p5agent.env` | host configuration | the agent's config, mode 600 |
 | `/var/lib/p5agent` | persistent application state | `setup.log` and `installed_apps.json` |
-| `/tmp` | temporary files | archived install logs (`x_setup_<ts>.log`) and `/command` scripts |
+| `/tmp` | temporary files | archived install logs (`p5agent_setup_<ts>.log`) and `/command` scripts |
 | `/opt/<name>` | add-on application software | installed apps |
 
 ## Install
