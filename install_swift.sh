@@ -25,8 +25,11 @@ else
 fi
 
 echo "Installing Swift $V ($ARCH)"
+# build-essential provides gcc and its runtime objects (crtbeginS.o, crtendS.o,
+# libgcc) that Swift's clang-based linker needs — without it `swift build` fails
+# to link with "cannot open crtbeginS.o" / "cannot find -lgcc".
 apt-get install -y \
-    binutils libc6-dev libcurl4-openssl-dev libedit2 libpython3-dev \
+    build-essential binutils libc6-dev libcurl4-openssl-dev libedit2 libpython3-dev \
     libsqlite3-0 libxml2-dev libz3-dev pkg-config unzip zlib1g-dev
 
 TAG="swift-$V-RELEASE"
