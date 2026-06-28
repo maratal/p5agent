@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Apply a freshly pulled p5agent update by restarting the service.
 #
-# agent.py pulls the latest code (and resets to HEAD if the pull is refused)
-# BEFORE invoking this script, so by the time this runs its directory already
-# holds the new code — including the newest version of this very script. All
-# that remains is to load it by restarting the service.
+# agent.py syncs the checkout to the remote (fetch + hard-reset to the upstream
+# branch, so force-pushes are honoured) BEFORE invoking this script, so by the
+# time this runs its directory already holds the new code — including the newest
+# version of this very script. All that remains is to re-apply the firewall and
+# load the new code by restarting the service.
 #
 # The restart is detached via systemd-run: this script is spawned by the running
 # agent, so restarting the agent directly would kill this process and cut off

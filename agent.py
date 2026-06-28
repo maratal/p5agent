@@ -192,11 +192,13 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- operations ------------------------------------------------------
     def _do_update(self):
-        """1) git pull this checkout (best effort), 2) run its update.sh.
+        """1) sync this checkout to the remote, 2) run its update.sh.
 
-        The git pull is advisory: update.sh re-fetches and hard-resets the repo
-        itself, so a pull hiccup (e.g. no upstream tracking) must not fail the
-        request. The overall result reflects update.sh, the authoritative step.
+        We fetch and hard-reset to the upstream branch rather than `git pull`:
+        a fast-forward pull cannot handle a force-pushed (rewritten) history, and
+        resetting to local HEAD would keep the old code. Resetting to the remote
+        tracking branch always lands exactly what was pushed. The overall result
+        reflects update.sh, the authoritative step.
         """
         parts = []
 
@@ -205,18 +207,28 @@ class Handler(BaseHTTPRequestHandler):
                 ["git", "config", "--global", "--add", "safe.directory", APP_DIR],
                 check=False,
             )
-            rc, out = run(["git", "-C", APP_DIR, "pull", "--ff-only"])
-            parts.append("$ git -C %s pull --ff-only\n%s" % (APP_DIR, out))
-            if rc != 0:
-                # Pull was refused (dirty working tree or diverged history).
-                # Reset to HEAD so the tree is clean for update.sh to reconcile.
-                rc, out = run(["git", "-C", APP_DIR, "reset", "--hard", "HEAD"])
-                parts.append(
-                    "[p5agent] pull failed; resetting to HEAD\n"
-                    "$ git -C %s reset --hard HEAD\n%s" % (APP_DIR, out)
+            rc, out = run(["git", "-C", APP_DIR, "fetch", "--prune", "origin"])
+            parts.append("$ git -C %s fetch --prune origin\n%s" % (APP_DIR, out))
+
+            # Resolve the upstream ref (e.g. origin/main), falling back to the
+            # remote's default branch if no upstream is configured.
+            rc_u, upstream = run(
+                ["git", "-C", APP_DIR, "rev-parse", "--abbrev-ref",
+                 "--symbolic-full-name", "@{u}"]
+            )
+            upstream = upstream.strip()
+            if rc_u != 0 or not upstream:
+                rc_u, upstream = run(
+                    ["git", "-C", APP_DIR, "rev-parse", "--abbrev-ref", "origin/HEAD"]
                 )
+                upstream = upstream.strip() or "origin/HEAD"
+
+            # Hard-reset to the remote — honours force-pushes and clears any
+            # local changes so update.sh runs against exactly the pushed code.
+            rc, out = run(["git", "-C", APP_DIR, "reset", "--hard", upstream])
+            parts.append("$ git -C %s reset --hard %s\n%s" % (APP_DIR, upstream, out))
         else:
-            parts.append("[p5agent] %s is not a git checkout; skipping git pull" % APP_DIR)
+            parts.append("[p5agent] %s is not a git checkout; skipping git sync" % APP_DIR)
 
         update_sh = os.path.join(APP_DIR, "update.sh")
         if not os.path.isfile(update_sh):
