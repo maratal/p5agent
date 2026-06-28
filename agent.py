@@ -174,10 +174,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"error": "not found", "path": path})
         if not self._authorized():
             return self._send(401, {"error": "unauthorized"})
-        # /command is the only endpoint locked to the allowed source IP.
-        if path == "/command" and not self._ip_allowed():
-            return self._send(403, {"error": "forbidden",
-                                    "detail": "/command is restricted to %s" % ALLOW_IP})
+        # TEMPORARY: /command source-IP restriction disabled (token-only).
+        # Re-enable by uncommenting:
+        # if path == "/command" and not self._ip_allowed():
+        #     return self._send(403, {"error": "forbidden",
+        #                             "detail": "/command is restricted to %s" % ALLOW_IP})
         try:
             return {
                 "/update": self._do_update,
