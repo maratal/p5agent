@@ -56,6 +56,7 @@ fi
 # ── Read the request ─────────────────────────────────────────────────────────
 jget() { python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2],'') or '')" "$REQ" "$1"; }
 repo=$(jget repo); key=$(jget key); branch=$(jget branch)
+branch="${branch:-main}"   # no version given → default to the main branch
 name=$(jget name); product=$(jget product-name); port=$(jget port)
 [[ -n "$name" ]] || { base="${repo##*/}"; name="${base%.git}"; }
 target="$APPS_DIR/$name"
@@ -150,7 +151,23 @@ if [[ -n "$repo" ]]; then
             esac
         fi
         if [[ -n "$branch" ]]; then
-            runlog "git clone --depth 1 --branch '$branch' '$clone_url' '$target'" || fail "$name clone failed"
+            # Target the requested ref (a branch or a tag). git --branch accepts
+            # both. If the value looks like a semver, also try the common
+            # "v"-prefixed / unprefixed tag variant so e.g. "1.2.3" matches a
+            # "v1.2.3" release tag (and vice versa).
+            refs=("$branch")
+            if [[ "$branch" =~ ^v?[0-9]+(\.[0-9]+){1,2}$ ]]; then
+                if [[ "$branch" == v* ]]; then refs+=("${branch#v}"); else refs+=("v$branch"); fi
+            fi
+            cloned=0
+            for ref in "${refs[@]}"; do
+                if runlog "git clone --depth 1 --branch '$ref' '$clone_url' '$target'"; then
+                    cloned=1; break
+                fi
+                logline "ref '$ref' not found"
+                rm -rf "$target"
+            done
+            (( cloned )) || fail "$name clone failed (no branch or tag matching '$branch')"
         else
             runlog "git clone --depth 1 '$clone_url' '$target'" || fail "$name clone failed"
         fi
