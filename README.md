@@ -61,6 +61,8 @@ curl -X POST "https://<ip>:5005/install-app" \
        "branch": "main",
        "name": "app",
        "product-name": "My App",
+       "app-type": "swift",
+       "app-cmd": "App serve --env production",
        "port": "8080",
        "dependencies": ["postgresql", "swift 6"]
      }'
@@ -75,8 +77,12 @@ Only `repo` is required. `install_app.sh` then, logging every step to
    `<name> installation began … <name> installation completed`.
 2. **Clones the repo** into `/opt/<name>` (the key is embedded for a private
    clone and never echoed back).
-3. **Runs the setup script** — `setup.sh` or `install.sh` from the repo, if
-   present.
+3. **Sets the app up.** If the repo ships a `setup.sh` or `install.sh`, that is
+   run (it builds the app and configures its own service). Otherwise the
+   standard per-type builder `install_<app-type>_app.sh` is run (e.g.
+   `install_swift_app.sh` → `swift build -c release`), and a systemd service is
+   created from the `app-cmd` run command in the request (`app-type` selects the
+   builder).
 4. **Records the app** in `installed_apps.json` and writes `Setup completed.`,
    then moves `setup.log` to `<tmp>/p5agent_setup_<timestamp>.log` (so `/progress`
    goes empty — the signal that nothing is running).
@@ -133,6 +139,8 @@ certificate (for the droplet's IP) under `/opt/p5agent/certs`.
 | `update.sh` | repo | Restarts the service to apply a pulled update. |
 | `install_app.sh` | repo | Backgrounded app installer (deps + clone + setup). |
 | `install_swift.sh` | repo | Dedicated Swift installer; referenced by the `swift` entry's `install-cmd`. |
+| `app_support/install_<type>_app.sh` | repo | Standard minimal builder per app type (swift, nodejs, python, ruby, go, php, java), used when a cloned repo has no `setup.sh`/`install.sh`. It builds the app and creates its systemd service. |
+| `app_support/wire_<dbtype>.sh` | repo | Per-database-type wiring (postgresql, mysql, mariadb, sqlite): creates the app's database/user and writes `/etc/<name>.env` (loaded by the service). Used for repos with no installer of their own. |
 | `supported_deps.json` | repo | Registry of installable dependencies: `name`, `display-name`, `icon-url`, and a `package-manager` (+ optional `package`) or `install-cmd`. Served by `/supported`. |
 | `setup.log` | data dir | Live install log; served by `/progress`. |
 | `installed_apps.json` | data dir | Installed apps (`name`, `product-name`, `path`, `port`, `dependencies`); served by `/apps`. |

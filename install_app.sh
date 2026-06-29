@@ -17,6 +17,7 @@
 REQ="${1:?usage: install_app.sh <request.json>}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+SUPPORT="$HERE/app_support"   # per-app-type builders + per-db-type wiring scripts
 SUPPORTED="$HERE/supported_deps.json"
 DATA_DIR="${P5AGENT_DATA_DIR:-/var/lib/p5agent}"
 TMP_DIR="${P5AGENT_TMP_DIR:-/tmp}"
@@ -38,6 +39,77 @@ archive() {  # archive() <suffix>  — move the log out of the way
 
 fail() { logline "$*"; printf '\nSetup failed.\n' >> "$SETUP_LOG"; archive "-failed"; exit 1; }
 
+# Create + start a systemd service that runs $APP_CMD in $APP_DIR. The only
+# per-type difference is where the built artifact lives, so the builder passes
+# that as the PATH prefix; everything else is uniform. Exported so the per-type
+# install_<type>_app.sh scripts (run as child shells) can call it; it uses plain
+# echo (captured into the install log by the caller) — no logline/runlog deps.
+create_service() {  # create_service <path-prefix>   (uses APP_NAME/APP_DIR/APP_PORT/APP_CMD/APP_SERVICES)
+    [[ -n "${APP_CMD:-}" ]] || { echo "No run command (app-cmd) — skipping service"; return 0; }
+    echo "Creating systemd service ${APP_NAME}"
+    # Order (and pull in) after any service dependencies the app needs — the
+    # database etc. — so they are up before the app starts. APP_SERVICES is a
+    # space-separated list of unit names (e.g. "postgresql.service").
+    local after="network.target" wants=""
+    if [[ -n "${APP_SERVICES:-}" ]]; then
+        after="network.target ${APP_SERVICES}"
+        wants="Wants=${APP_SERVICES}"
+    fi
+    cat > "/etc/systemd/system/${APP_NAME}.service" <<EOF
+[Unit]
+Description=${APP_NAME} (p5agent)
+After=${after}
+${wants}
+
+[Service]
+Type=simple
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=-/etc/${APP_NAME}.env
+Environment=PORT=${APP_PORT}
+Environment=HOST=0.0.0.0
+Environment=PATH=${1}:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env ${APP_CMD}
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=${APP_NAME}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable "${APP_NAME}" 2>/dev/null || true
+    systemctl restart "${APP_NAME}" || echo "service ${APP_NAME} failed to start (journalctl -u ${APP_NAME})"
+}
+export -f create_service
+
+# Shared DB helpers for the per-type wire_<dbtype>.sh scripts. Like create_service
+# they run in those child shells, so they are exported. db_password re-uses the
+# existing password on re-install; write_db_env writes /etc/<name>.env (loaded by
+# the service via EnvironmentFile) with both DATABASE_* fields and a DATABASE_URL.
+db_password() {  # db_password <env-file>  -> reused-or-new password
+    if [[ -f "$1" ]] && grep -q '^DATABASE_PASSWORD=' "$1"; then
+        sed -n 's/^DATABASE_PASSWORD=//p' "$1" | head -1
+    else
+        openssl rand -hex 16
+    fi
+}
+write_db_env() {  # write_db_env <scheme> <port> <password>   (uses $DB_NAME)
+    local f="/etc/${DB_NAME}.env"
+    ( umask 077; cat > "$f" <<EOF
+DATABASE_HOST=localhost
+DATABASE_PORT=$2
+DATABASE_NAME=$DB_NAME
+DATABASE_USERNAME=$DB_NAME
+DATABASE_PASSWORD=$3
+DATABASE_URL=$1://$DB_NAME:$3@localhost:$2/$DB_NAME
+EOF
+    )
+    echo "Wrote DB connection settings to $f"
+}
+export -f db_password write_db_env
+
 # ── Concurrency / stale-log check ────────────────────────────────────────────
 if [[ -f "$SETUP_LOG" ]]; then
     last=$(stat -c %Y "$SETUP_LOG" 2>/dev/null || echo 0)
@@ -57,6 +129,7 @@ fi
 jget() { python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2],'') or '')" "$REQ" "$1"; }
 repo=$(jget repo); key=$(jget key); branch=$(jget branch)
 name=$(jget name); product=$(jget product-name); port=$(jget port)
+app_type=$(jget app-type); app_cmd=$(jget app-cmd)
 [[ -n "$name" ]] || { base="${repo##*/}"; name="${base%.git}"; }
 target="$APPS_DIR/$name"
 
@@ -92,6 +165,7 @@ else:
 PY
 }
 
+app_services=""   # systemd units of service deps (postgres, redis, …) the app needs
 if (( ${#DEPS[@]} == 0 )); then
     logline "No dependencies requested"
 else
@@ -139,6 +213,22 @@ else
                 fail "No install method for '$depname'"
                 ;;
         esac
+
+        # Enable + start service-type dependencies (they aren't reliably started
+        # on a non-interactive install, and the app needs them running).
+        svc=""
+        case "$depname" in
+            postgresql) svc=postgresql ;;
+            mysql)      svc=mysql ;;
+            mariadb)    svc=mariadb ;;
+            redis)      svc=redis-server ;;
+            nginx)      svc=nginx ;;
+        esac
+        if [[ -n "$svc" ]]; then
+            runlog "systemctl enable --now '$svc'" || logline "Could not enable/start $svc"
+            app_services="${app_services:+$app_services }${svc}.service"
+        fi
+
         logline "$display installation completed"
     done
 fi
@@ -188,11 +278,33 @@ if [[ -n "$repo" ]]; then
         [[ -f "$target/$candidate" ]] && { setup="$target/$candidate"; break; }
     done
     if [[ -n "$setup" ]]; then
+        # The repo ships its own installer — it builds and sets up its service.
         logline "Running ${setup##*/}"
         ( cd "$target" && runlog "bash '$setup'" ) || fail "$name setup failed"
         logline "$name installation completed"
     else
-        logline "No setup.sh or install.sh in repo — skipping setup"
+        # No repo installer: wire the app's database (per-type wire_<dbtype>.sh, if
+        # it uses one) so the service can connect, then run the per-type builder
+        # which builds the app AND creates its systemd service. The run command
+        # comes from the request (APP_CMD).
+        db_type=""
+        for d in "${DEPS[@]}"; do
+            case "${d%% *}" in postgresql|mysql|mariadb|sqlite) db_type="${d%% *}"; break ;; esac
+        done
+        if [[ -n "$db_type" && -f "$SUPPORT/wire_${db_type}.sh" ]]; then
+            logline "Wiring $db_type database for $name"
+            ( DB_NAME="$name" runlog "bash '$SUPPORT/wire_${db_type}.sh'" ) || logline "DB wiring failed ($db_type)"
+        fi
+        type_script="$SUPPORT/install_${app_type}_app.sh"
+        if [[ -n "$app_type" && -f "$type_script" ]]; then
+            logline "No setup.sh/install.sh — running install_${app_type}_app.sh"
+            ( cd "$target" && APP_DIR="$target" APP_NAME="$name" APP_PORT="$port" APP_CMD="$app_cmd" \
+                APP_SERVICES="$app_services" \
+                runlog "bash '$type_script'" ) || fail "$name install failed (install_${app_type}_app.sh)"
+        else
+            logline "No setup.sh/install.sh and no builder for app type '${app_type:-?}' — skipping"
+        fi
+        logline "$name installation completed"
     fi
 
     # ── Record the installed app ─────────────────────────────────────────────

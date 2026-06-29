@@ -49,11 +49,25 @@
     "package": "nodejs"
   },
   {
+    "name": "npm",
+    "display-name": "npm",
+    "icon-url": "https://cdn.simpleicons.org/npm",
+    "package-manager": "apt",
+    "package": "npm"
+  },
+  {
     "name": "python3",
     "display-name": "Python 3",
     "icon-url": "https://cdn.simpleicons.org/python",
     "package-manager": "apt",
     "package": "python3"
+  },
+  {
+    "name": "python3-venv",
+    "display-name": "Python venv",
+    "icon-url": "https://cdn.simpleicons.org/python",
+    "package-manager": "apt",
+    "package": "python3-venv"
   },
   {
     "name": "ruby",
@@ -77,11 +91,32 @@
     "package": "php"
   },
   {
+    "name": "composer",
+    "display-name": "Composer",
+    "icon-url": "https://cdn.simpleicons.org/composer",
+    "package-manager": "apt",
+    "package": "composer"
+  },
+  {
     "name": "java",
     "display-name": "Java (OpenJDK)",
     "icon-url": "https://cdn.simpleicons.org/openjdk",
     "package-manager": "apt",
     "package": "default-jdk"
+  },
+  {
+    "name": "maven",
+    "display-name": "Apache Maven",
+    "icon-url": "https://cdn.simpleicons.org/apachemaven",
+    "package-manager": "apt",
+    "package": "maven"
+  },
+  {
+    "name": "gradle",
+    "display-name": "Gradle",
+    "icon-url": "https://cdn.simpleicons.org/gradle",
+    "package-manager": "apt",
+    "package": "gradle"
   },
   {
     "name": "ffmpeg",
