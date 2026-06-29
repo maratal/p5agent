@@ -44,7 +44,7 @@ fail() { logline "$*"; printf '\nSetup failed.\n' >> "$SETUP_LOG"; archive "-fai
 # that as the PATH prefix; everything else is uniform. Exported so the per-type
 # install_<type>_app.sh scripts (run as child shells) can call it; it uses plain
 # echo (captured into the install log by the caller) — no logline/runlog deps.
-create_service() {  # create_service <path-prefix>   (uses APP_NAME/APP_DIR/APP_PORT/APP_CMD/APP_SERVICES)
+create_service() {  # create_service <path-prefix>  (uses APP_NAME/APP_DIR/APP_PORT/APP_CMD/APP_SERVICES/APP_USER)
     [[ -n "${APP_CMD:-}" ]] || { echo "No run command (app-cmd) — skipping service"; return 0; }
     echo "Creating systemd service ${APP_NAME}"
     # Order (and pull in) after any service dependencies the app needs — the
@@ -55,6 +55,19 @@ create_service() {  # create_service <path-prefix>   (uses APP_NAME/APP_DIR/APP_
         after="network.target ${APP_SERVICES}"
         wants="Wants=${APP_SERVICES}"
     fi
+    # Run as the dedicated non-root app user when one exists, granting it the
+    # capability to bind privileged ports (443) — no setcap on the binary needed.
+    # Hand it ownership of the app dir, env file and cert dir so it can read them.
+    local user_lines=""
+    if [[ -n "${APP_USER:-}" ]] && id "${APP_USER}" &>/dev/null; then
+        user_lines="User=${APP_USER}
+Group=${APP_USER}
+AmbientCapabilities=CAP_NET_BIND_SERVICE"
+        chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}" 2>/dev/null || true
+        [[ -f "/etc/${APP_NAME}.env" ]]  && chown "${APP_USER}:${APP_USER}" "/etc/${APP_NAME}.env" 2>/dev/null || true
+        [[ -d "/etc/${APP_NAME}" ]]      && chown -R "${APP_USER}:${APP_USER}" "/etc/${APP_NAME}" 2>/dev/null || true
+        [[ -d "/var/lib/${APP_NAME}" ]]  && chown -R "${APP_USER}:${APP_USER}" "/var/lib/${APP_NAME}" 2>/dev/null || true
+    fi
     cat > "/etc/systemd/system/${APP_NAME}.service" <<EOF
 [Unit]
 Description=${APP_NAME} (p5agent)
@@ -63,6 +76,7 @@ ${wants}
 
 [Service]
 Type=simple
+${user_lines}
 WorkingDirectory=${APP_DIR}
 EnvironmentFile=-/etc/${APP_NAME}.env
 Environment=PORT=${APP_PORT}
@@ -109,6 +123,26 @@ EOF
     echo "Wrote DB connection settings to $f"
 }
 export -f db_password write_db_env
+
+# Generate a self-signed TLS cert for the droplet's IP (so generic apps can serve
+# HTTPS) and record its paths in /etc/<name>.env. Re-uses an existing cert.
+setup_tls() {  # uses $name
+    local cert_dir="/etc/${name}/certs" cert="/etc/${name}/certs/cert.pem" key="/etc/${name}/certs/key.pem"
+    local env_file="/etc/${name}.env" ip
+    mkdir -p "$cert_dir"
+    if [[ ! -f "$cert" || ! -f "$key" ]]; then
+        ip=$(curl -s --max-time 10 http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address 2>/dev/null \
+             || hostname -I | awk '{print $1}')
+        logline "Generating self-signed TLS certificate for ${ip:-the server}"
+        openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
+            -keyout "$key" -out "$cert" \
+            -subj "/CN=${ip:-localhost}" -addext "subjectAltName=IP:${ip:-127.0.0.1}" 2>&1 | stamp
+    fi
+    touch "$env_file"; chmod 600 "$env_file"
+    sed -i '/^TLS_CERT_PATH=/d;/^TLS_KEY_PATH=/d' "$env_file"
+    { echo "TLS_CERT_PATH=$cert"; echo "TLS_KEY_PATH=$key"; } >> "$env_file"
+    logline "Wrote TLS cert paths to $env_file"
+}
 
 # ── Concurrency / stale-log check ────────────────────────────────────────────
 if [[ -f "$SETUP_LOG" ]]; then
@@ -279,14 +313,22 @@ if [[ -n "$repo" ]]; then
     done
     if [[ -n "$setup" ]]; then
         # The repo ships its own installer — it builds and sets up its service.
+        # P5AGENT=1 tells the repo installer it is running under the agent, so it
+        # can skip droplet-level provisioning the agent already did (firewall,
+        # system upgrade, dependency install).
         logline "Running ${setup##*/}"
-        ( cd "$target" && runlog "bash '$setup'" ) || fail "$name setup failed"
+        ( cd "$target" && P5AGENT=1 runlog "bash '$setup'" ) || fail "$name setup failed"
         logline "$name installation completed"
     else
-        # No repo installer: wire the app's database (per-type wire_<dbtype>.sh, if
-        # it uses one) so the service can connect, then run the per-type builder
-        # which builds the app AND creates its systemd service. The run command
-        # comes from the request (APP_CMD).
+        # No repo installer. Create a dedicated non-root user to run the app as,
+        # wire its database, generate a self-signed TLS cert, then run the per-type
+        # builder (which builds and creates the service, running as that user).
+        app_user="$name"
+        if ! id "$app_user" &>/dev/null; then
+            runlog "useradd --system --user-group --no-create-home --shell /usr/sbin/nologin '$app_user'" \
+                || logline "Could not create user $app_user"
+        fi
+
         db_type=""
         for d in "${DEPS[@]}"; do
             case "${d%% *}" in postgresql|mysql|mariadb|sqlite) db_type="${d%% *}"; break ;; esac
@@ -295,15 +337,28 @@ if [[ -n "$repo" ]]; then
             logline "Wiring $db_type database for $name"
             ( DB_NAME="$name" runlog "bash '$SUPPORT/wire_${db_type}.sh'" ) || logline "DB wiring failed ($db_type)"
         fi
+
+        setup_tls
+
         type_script="$SUPPORT/install_${app_type}_app.sh"
         if [[ -n "$app_type" && -f "$type_script" ]]; then
             logline "No setup.sh/install.sh — running install_${app_type}_app.sh"
             ( cd "$target" && APP_DIR="$target" APP_NAME="$name" APP_PORT="$port" APP_CMD="$app_cmd" \
-                APP_SERVICES="$app_services" \
+                APP_SERVICES="$app_services" APP_USER="$app_user" \
                 runlog "bash '$type_script'" ) || fail "$name install failed (install_${app_type}_app.sh)"
         else
             logline "No setup.sh/install.sh and no builder for app type '${app_type:-?}' — skipping"
         fi
+
+        # Let the app user trigger its own redeploy if the repo ships those scripts.
+        if [[ -f "$target/refresh.sh" || -f "$target/update.sh" ]]; then
+            cat > "/etc/sudoers.d/$name" <<EOF
+$app_user ALL=(root) NOPASSWD: $target/refresh.sh, /usr/bin/systemd-run --collect $target/update.sh
+EOF
+            chmod 440 "/etc/sudoers.d/$name"
+            logline "Configured sudoers for $app_user"
+        fi
+
         logline "$name installation completed"
     fi
 

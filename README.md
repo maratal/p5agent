@@ -78,11 +78,14 @@ Only `repo` is required. `install_app.sh` then, logging every step to
 2. **Clones the repo** into `/opt/<name>` (the key is embedded for a private
    clone and never echoed back).
 3. **Sets the app up.** If the repo ships a `setup.sh` or `install.sh`, that is
-   run (it builds the app and configures its own service). Otherwise the
-   standard per-type builder `install_<app-type>_app.sh` is run (e.g.
-   `install_swift_app.sh` → `swift build -c release`), and a systemd service is
-   created from the `app-cmd` run command in the request (`app-type` selects the
-   builder).
+   run (it builds the app and configures its own service). Otherwise the generic
+   path: it creates a dedicated non-root user to run the app, wires its database
+   (`wire_<db>.sh`), generates a self-signed TLS cert (written to
+   `/etc/<name>.env`), runs the per-type builder `install_<app-type>_app.sh`
+   (e.g. `install_swift_app.sh` → `swift build -c release`), and creates a
+   systemd service from the request's `app-cmd` — running as that user with
+   `AmbientCapabilities=CAP_NET_BIND_SERVICE` so it can bind 443. (`app-type`
+   selects the builder.)
 4. **Records the app** in `installed_apps.json` and writes `Setup completed.`,
    then moves `setup.log` to `<tmp>/p5agent_setup_<timestamp>.log` (so `/progress`
    goes empty — the signal that nothing is running).
