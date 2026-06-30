@@ -22,7 +22,7 @@ one restricted by source IP.
 Configuration is read from the environment (see /etc/p5agent.env):
 
     P5AGENT_TOKEN     shared secret required on every privileged request
-    P5AGENT_ALLOW_IP  client IP allowed to call /command (default: 127.0.0.1)
+    P5AGENT_ALLOW_IP  comma-separated client IPs allowed to call /command (default: 127.0.0.1)
     P5AGENT_PORT      listen port                        (default: 5005)
     P5AGENT_DATA_DIR  runtime state dir                  (default: /var/lib/p5agent)
     P5AGENT_TMP_DIR   where command scripts are written  (default: /tmp)
@@ -52,7 +52,7 @@ TOKEN = os.environ.get("P5AGENT_TOKEN", "")
 # install.sh decides via PROJECT). update.sh lives alongside this file.
 APP_DIR = os.path.dirname(os.path.realpath(__file__))
 APP_NAME = os.path.basename(APP_DIR)
-ALLOW_IP = os.environ.get("P5AGENT_ALLOW_IP", "127.0.0.1")
+ALLOW_IP = {ip.strip() for ip in os.environ.get("P5AGENT_ALLOW_IP", "127.0.0.1").split(",") if ip.strip()}
 BIND = os.environ.get("P5AGENT_BIND", "0.0.0.0")
 PORT = int(os.environ.get("P5AGENT_PORT", "5005"))
 DATA_DIR = os.environ.get("P5AGENT_DATA_DIR", "/var/lib/p5agent")
@@ -147,9 +147,9 @@ class Handler(BaseHTTPRequestHandler):
         # Per-endpoint source-IP check (enforced in-process, not just by the
         # firewall). Loopback is treated as equivalent when ALLOW_IP is local.
         ip = self.client_address[0]
-        if ip == ALLOW_IP:
+        if ip in ALLOW_IP:
             return True
-        if ALLOW_IP in ("127.0.0.1", "localhost") and ip in ("127.0.0.1", "::1"):
+        if ALLOW_IP & {"127.0.0.1", "localhost"} and ip in ("127.0.0.1", "::1"):
             return True
         return False
 
@@ -176,8 +176,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(401, {"error": "unauthorized"})
         # /command is the only endpoint locked to the allowed source IP.
         if path == "/command" and not self._ip_allowed():
+            def _mask_ip(ip):
+                return ip[:2] + "*" * max(0, len(ip) - 4) + ip[-2:] if len(ip) > 4 else ip
             return self._send(403, {"error": "forbidden",
-                                    "detail": "/command is restricted to %s" % ALLOW_IP})
+                                    "detail": "/command is restricted to %s" % ", ".join(_mask_ip(ip) for ip in sorted(ALLOW_IP))})
         try:
             return {
                 "/update": self._do_update,
