@@ -5,14 +5,16 @@
 # itself (clone repo, then run setup.sh or install.sh). Run detached by the
 # agent; it is the single owner of the install lifecycle.
 #
-# Everything is logged, line-by-line with timestamps, to $SETUP_LOG. The browser
-# polls /progress (which returns that file) every few seconds. While the file
-# exists and is being updated, an install is "in progress". On completion the
-# log is moved to $TMP_DIR/p5agent_setup_<ts>.log (and to ...-failed.log on failure),
-# which leaves /progress empty — the browser's signal that nothing is running.
-#
-# Concurrency: a second invocation sees a recent $SETUP_LOG and exits. A stale
-# log (untouched > 10 min) is treated as a failed run and archived first.
+# Everything is logged, line-by-line with timestamps, to $SETUP_LOG, which the
+# agent serves as the "log" field of /progress. The AGENT owns the install
+# lifecycle: it takes the lock (pending_install.json) before spawning this
+# script, refuses concurrent installs, and decides the outcome —
+#   completed: the log's LAST line is "<name> installation completed" (written
+#              at the very end below, upon which pending_install.json is
+#              removed; the log stays until the next accepted install);
+#   failed:    fail() archives the log and removes the lock, so /progress
+#              drops back to {} — the polling peer's failure signal. A run
+#              that dies silently is cleared by the agent's 30-minute stall rule.
 
 REQ="${1:?usage: install_app.sh <request.json>}"
 
@@ -24,6 +26,7 @@ TMP_DIR="${P5AGENT_TMP_DIR:-/tmp}"
 APPS_DIR="${P5AGENT_APPS_DIR:-/opt}"
 SETUP_LOG="$DATA_DIR/setup.log"
 INSTALLED="$DATA_DIR/installed_apps.json"
+PENDING="$DATA_DIR/pending_install.json"   # the agent's install lock/status record
 
 mkdir -p "$DATA_DIR" "$TMP_DIR"
 
@@ -37,7 +40,7 @@ archive() {  # archive() <suffix>  — move the log out of the way
     rm -f "$SETUP_LOG"
 }
 
-fail() { logline "$*"; printf '\nSetup failed.\n' >> "$SETUP_LOG"; archive "-failed"; exit 1; }
+fail() { logline "$*"; archive "-failed"; rm -f "$PENDING"; exit 1; }
 
 # Create + start a systemd service that runs $APP_CMD in $APP_DIR. The only
 # per-type difference is where the built artifact lives, so the builder passes
@@ -144,22 +147,9 @@ setup_tls() {  # uses $name
     logline "Wrote TLS cert paths to $env_file"
 }
 
-# ── Concurrency / stale-log check ────────────────────────────────────────────
-if [[ -f "$SETUP_LOG" ]]; then
-    last=$(stat -c %Y "$SETUP_LOG" 2>/dev/null || echo 0)
-    if (( $(date +%s) - last < 600 )); then
-        exit 0   # an install is actively running — leave it alone
-    fi
-    # Stale (>10 min). Wait 30s; if still untouched, the previous run failed.
-    sleep 30
-    if [[ "$(stat -c %Y "$SETUP_LOG" 2>/dev/null || echo 0)" == "$last" ]]; then
-        archive "-failed"
-    else
-        exit 0   # it moved — another run is active after all
-    fi
-fi
-
 # ── Read the request ─────────────────────────────────────────────────────────
+# (No concurrency guard here: the agent refuses a second install and clears the
+# previous run's log before spawning this script.)
 jget() { python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2],'') or '')" "$REQ" "$1"; }
 repo=$(jget repo); key=$(jget key); branch=$(jget branch)
 name=$(jget name); product=$(jget product-name); port=$(jget port)
@@ -318,7 +308,6 @@ if [[ -n "$repo" ]]; then
         # system upgrade, dependency install).
         logline "Running ${setup##*/}"
         ( cd "$target" && P5AGENT=1 runlog "bash '$setup'" ) || fail "$name setup failed"
-        logline "$name installation completed"
     else
         # No repo installer. Create a dedicated non-root user to run the app as,
         # wire its database, generate a self-signed TLS cert, then run the per-type
@@ -358,8 +347,6 @@ EOF
             chmod 440 "/etc/sudoers.d/$name"
             logline "Configured sudoers for $app_user"
         fi
-
-        logline "$name installation completed"
     fi
 
     # ── Record the installed app ─────────────────────────────────────────────
@@ -388,5 +375,9 @@ PY
 fi
 
 # ── Done ─────────────────────────────────────────────────────────────────────
-printf '\nSetup completed.\n' >> "$SETUP_LOG"
-archive ""
+# This MUST be the log's last line: it is the agent's completion marker —
+# /progress reports completed=true when the log ends with it. Logging it
+# releases the install lock (pending_install.json); the log itself stays in
+# place as the record until the next accepted install archives it.
+logline "$name installation completed"
+rm -f "$PENDING"

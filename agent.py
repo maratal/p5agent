@@ -11,8 +11,12 @@ root systemd service on port 5005 and exposes:
     *    /command     save the request to /tmp/command_<dd_mm_yy_hh_mm_ss>.sh and
                       run it as root — restricted to P5AGENT_ALLOW_IP
     *    /install-app  spawn install_app.sh in the background to install an app
-                      and its dependencies; returns 200 once the job is launched
-    GET  /progress    current install log (setup.log); empty when nothing runs
+                      and its dependencies; returns 200 once the job is launched.
+                      One install runs at a time: the request is recorded in
+                      pending_install.json the moment it is accepted, and a
+                      second request is refused with 409 while one is running
+    GET  /progress    current install status as JSON:
+                      { "app", "started_at", "log"?, "completed"? } — {} when idle
     GET  /supported   the supported_deps.json registry
     GET  /apps        the installed_apps.json list
 
@@ -42,6 +46,7 @@ import os
 import ssl
 import subprocess
 import sys
+import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -67,6 +72,12 @@ INSTALL_SCRIPT = os.path.join(APP_DIR, "install_app.sh")
 SUPPORTED_DEPS = os.path.join(APP_DIR, "supported_deps.json")
 SETUP_LOG = os.path.join(DATA_DIR, "setup.log")
 INSTALLED_APPS = os.path.join(DATA_DIR, "installed_apps.json")
+# The install lock/status record, written the moment /install-app accepts a
+# request: {"app": <name>, "started_at": <unix ts>}. While it exists no second
+# install is accepted. install_app.sh removes it right after logging the
+# completion marker; a failed install is cleared here (stall rule) or by fail().
+PENDING_INSTALL = os.path.join(DATA_DIR, "pending_install.json")
+INSTALL_STALL_SECS = 1800  # no log activity for 30 min → the install failed
 
 
 def run(cmd, cwd=None):
@@ -106,6 +117,115 @@ def read_file(path):
             return fh.read()
     except OSError:
         return ""
+
+
+def app_name_from_request(req):
+    """The app's install name: explicit "name", else the repo basename."""
+    name = (req.get("name") or "").strip()
+    if name:
+        return name
+    base = (req.get("repo") or "").rstrip("/").rsplit("/", 1)[-1]
+    return base[:-4] if base.endswith(".git") else base
+
+
+def clear_install(failed=False):
+    """Drop pending_install.json; archive setup.log out of the way."""
+    if os.path.exists(SETUP_LOG):
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        suffix = "-failed" if failed else ""
+        try:
+            os.replace(SETUP_LOG, os.path.join(TMP_DIR, "p5agent_setup_%s%s.log" % (stamp, suffix)))
+        except OSError:
+            try:
+                os.remove(SETUP_LOG)
+            except OSError:
+                pass
+    try:
+        os.remove(PENDING_INSTALL)
+    except OSError:
+        pass
+
+
+COMPLETED_SUFFIX = " installation completed"
+
+
+def completed_app(log):
+    """The app name from the completion marker — the log's LAST line being
+    "[ts] <app> installation completed" — or None."""
+    lines = log.rstrip().splitlines() if log.strip() else []
+    if not lines or not lines[-1].endswith(COMPLETED_SUFFIX):
+        return None
+    app = lines[-1][:-len(COMPLETED_SUFFIX)]
+    if app.startswith("[") and "] " in app:
+        app = app.split("] ", 1)[1]
+    return app.strip() or None
+
+
+def log_started_at(log):
+    """Unix timestamp of the log's first "[Y-m-d H:M:S] ..." line; falls back
+    to the log file's mtime."""
+    try:
+        first = log.lstrip().splitlines()[0]
+        return int(datetime.strptime(first[1:20], "%Y-%m-%d %H:%M:%S").timestamp())
+    except (IndexError, ValueError):
+        pass
+    try:
+        return int(os.stat(SETUP_LOG).st_mtime)
+    except OSError:
+        return 0
+
+
+def install_status():
+    """The current install, or None when idle. The agent — and only the agent —
+    decides the install's fate:
+
+      completed  the log's last line is "<app> installation completed";
+                 install_app.sh removes pending_install.json right after
+                 logging it, so a completed install is reported from the log
+                 alone (which stays until the next accepted install)
+      failed     pending exists but there was no log activity (setup.log
+                 mtime, else started_at) for more than 30 minutes → cleared
+                 here; the polling peer learns of the failure by /progress
+                 dropping back to {}
+    """
+    log = read_file(SETUP_LOG)
+    raw = read_file(PENDING_INSTALL)
+
+    if not raw:
+        # No lock: either the last install completed (its log remains, ending
+        # with the marker) or nothing is running.
+        app = completed_app(log)
+        if not app:
+            return None
+        return {"app": app, "started_at": log_started_at(log),
+                "log": log, "completed": True}
+
+    try:
+        pending = json.loads(raw)
+    except ValueError:
+        pending = {}
+    app = (pending.get("app") or "").strip() if isinstance(pending, dict) else ""
+    if not app:
+        clear_install(failed=True)  # unreadable record — drop it
+        return None
+
+    status = {"app": app, "started_at": int(pending.get("started_at") or 0)}
+    if log:
+        status["log"] = log
+    if completed_app(log) == app:
+        # Marker logged, lock removal not observed yet (tiny race) — done.
+        status["completed"] = True
+        return status
+
+    last = status["started_at"]
+    try:
+        last = max(last, int(os.stat(SETUP_LOG).st_mtime))
+    except OSError:
+        pass
+    if time.time() - last > INSTALL_STALL_SECS:
+        clear_install(failed=True)
+        return None
+    return status
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -261,7 +381,9 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(status, {"returncode": rc, "output": out, "script": path})
 
     def _do_install_app(self):
-        """Launch install_app.sh in the background and return immediately."""
+        """Accept one install at a time: refuse while one is running, record
+        the accepted request in pending_install.json immediately, then launch
+        install_app.sh in the background and return."""
         raw = self._body().decode("utf-8", "replace").strip()
         if not raw:
             return self._send(400, {"error": "empty body"})
@@ -274,10 +396,24 @@ class Handler(BaseHTTPRequestHandler):
         if not os.path.isfile(INSTALL_SCRIPT):
             return self._send(500, {"error": "install_app.sh not found"})
 
+        current = install_status()
+        if current and not current.get("completed"):
+            return self._send(409, {"error": "%s installation is in progress" % current["app"]})
+
+        name = app_name_from_request(req)
+        if not name:
+            return self._send(400, {"error": "cannot derive the app name"})
+
         ts = datetime.now().strftime("%d_%m_%y_%H_%M_%S")
         req_path = os.path.join(TMP_DIR, "install_request_%s.json" % ts)
         with open(req_path, "w") as fh:
             json.dump(req, fh)
+
+        # Take the lock the moment the request is accepted: archive the previous
+        # (completed) install's leftovers and record the new one.
+        clear_install()
+        with open(PENDING_INSTALL, "w") as fh:
+            json.dump({"app": name, "started_at": int(time.time())}, fh)
 
         try:
             subprocess.Popen(
@@ -289,13 +425,15 @@ class Handler(BaseHTTPRequestHandler):
                 start_new_session=True,  # survive the agent and this request
             )
         except Exception as exc:  # noqa: BLE001
+            clear_install(failed=True)  # release the lock — nothing is running
             return self._send(500, {"error": "failed to launch installer",
                                     "detail": str(exc)})
-        return self._send(200, {"status": "started"})
+        return self._send(200, {"status": "started", "app": name})
 
     def _do_progress(self):
-        """Return the live install log; empty when nothing is installing."""
-        return self._send_raw(200, read_file(SETUP_LOG), "text/plain; charset=utf-8")
+        """Return the current install status as JSON:
+        { "app", "started_at", "log"?, "completed"? } — {} when idle."""
+        return self._send(200, install_status() or {})
 
     def _do_supported(self):
         """Return the supported dependencies registry."""
