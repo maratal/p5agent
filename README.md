@@ -18,6 +18,7 @@ nothing to install. The idle process uses roughly 12–18 MB of RAM.
 | GET        | `/progress`    | yes  | any       | The live install log (`setup.log`). Empty when nothing is installing. Poll it (~every 5s) to follow an install. |
 | GET        | `/supported`   | yes  | any       | The `supported_deps.json` registry of installable dependencies. |
 | GET        | `/apps`        | yes  | any       | The `installed_apps.json` list of installed apps. |
+| POST       | `/certs`       | yes  | any       | Obtain or renew a Let's Encrypt certificate for a domain and point every installed app at it. |
 
 ### `/update`
 
@@ -40,6 +41,39 @@ is restricted to `P5AGENT_ALLOW_IP` (returns `403` from any other source IP).
 curl -X POST "https://<ip>:5005/command" \
      -H "Authorization: Bearer $TOKEN" \
      --data-binary $'systemctl restart myapp\nsystemctl is-active myapp'
+```
+
+### `/certs`
+
+Takes `{"domain": "chat.example.com"}` and runs `certs.sh domain <domain>`,
+which obtains a
+Let's Encrypt certificate for that name (or renews the existing one if it is
+due), writes `TLS_CERT_PATH` and `TLS_KEY_PATH` into every installed app's
+`/etc/<name>.env`, and restarts each service. Synchronous — certbot answers one
+challenge and is done — so the response carries the whole transcript.
+
+The domain must be a plain hostname; anything else is rejected with `400` before
+a root script is started. The name is also checked to resolve to this droplet
+first, because Let's Encrypt rate-limits failed attempts and a typo should not
+spend one.
+
+The certificates are read by each app's own user, granted through a shared
+`certaccess` group rather than by handing `/etc/letsencrypt` to one user —
+a host can run more than one TLS service, and a per-user `chgrp` takes the
+previous one's access away. ChatServer's standalone `install.sh` names the same
+group, so the two provisioning paths can share a droplet.
+
+Renewal is certbot's own systemd timer. `certs.sh` installs a deploy hook at
+`/etc/letsencrypt/renewal-hooks/deploy/p5agent-restart-apps.sh` that restarts
+every installed app, so a renewed certificate actually reaches them; the hook
+reads `installed_apps.json` at run time, so apps installed later are covered
+without rewriting it.
+
+```bash
+curl -X POST "https://<ip>:5005/certs" \
+     -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"domain":"chat.example.com"}'
 ```
 
 ### `/install-app`
@@ -147,6 +181,26 @@ certificate (for the droplet's IP) under `/opt/p5agent/certs`.
 | `supported_deps.json` | repo | Registry of installable dependencies: `name`, `display-name`, `icon-url`, and a `package-manager` (+ optional `package`) or `install-cmd`. Served by `/supported`. |
 | `setup.log` | data dir | Live install log; served by `/progress`. |
 | `installed_apps.json` | data dir | Installed apps (`name`, `product-name`, `path`, `port`, `dependencies`); served by `/apps`. |
+| `p5agent-restart-apps.sh` | `/etc/letsencrypt/renewal-hooks/deploy` | Restarts every installed app after a certificate renewal; written by `certs.sh`. |
+
+### Certificates
+
+`certs.sh` is the only place the agent makes a certificate — `install.sh` uses it
+for the agent's own listener, `install_app.sh` for each installed app, and
+`/certs` for the Let's Encrypt certificate that replaces those once a domain
+points at the droplet:
+
+```bash
+certs.sh self-signed --cert <path> --key <path> [--cn <name>] [--days <n>] \
+                     [--env <file>] [--owner <user>]
+certs.sh domain <domain>
+```
+
+Both modes print `TLS_CERT_PATH=` and `TLS_KEY_PATH=` on stdout and everything
+else on stderr, so a caller can `eval` the result rather than reconstructing the
+paths. `--env` rewrites the pair in an env file instead of appending a second
+one. An existing self-signed pair is reused, so re-installing an app does not
+throw away a certificate a domain is already using.
 
 To add a new installable dependency, add an entry to `supported_deps.json` —
 there is no per-package code. An entry either names a `package-manager` (`apt`,
@@ -191,6 +245,10 @@ in:
   reach the box;
 - the agent port (`5005`) — open to all hosts (per-endpoint source-IP
   enforcement is done inside the agent, only `/command` is IP-locked);
+- HTTP (`80`) — for the ACME http-01 challenge. Nothing listens on it between
+  challenges; it stays open because certbot's unattended renewal needs it too,
+  and a port opened only while someone is watching means a certificate that
+  expires when nobody is;
 - a port per installed app — re-opened on every run from the `port` of each
   entry in `installed_apps.json`.
 

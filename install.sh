@@ -62,15 +62,16 @@ ok "Agent code in place"
 # dir) so the agent always serves HTTPS on :5005.
 if [[ -z "$TLS_CERT" || -z "$TLS_KEY" ]]; then
     log "No TLS cert/key provided — generating a self-signed certificate"
+    # certs.sh is the only place this project makes certificates. It prints the
+    # paths it settled on, which is how they get back here without this script
+    # having to know where it puts them.
     CERT_DIR="$INSTALL_DIR/certs"
-    mkdir -p "$CERT_DIR"
-    IP=$(curl -s --max-time 10 http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address 2>/dev/null || hostname -I | awk '{print $1}')
-    openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
-        -keyout "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" \
-        -subj "/CN=$IP" -addext "subjectAltName=IP:$IP"
-    TLS_CERT="$CERT_DIR/cert.pem"
-    TLS_KEY="$CERT_DIR/key.pem"
-    ok "Self-signed certificate generated for $IP"
+    CERT_PATHS=$(bash "$INSTALL_DIR/certs.sh" self-signed \
+        --cert "$CERT_DIR/cert.pem" --key "$CERT_DIR/key.pem") \
+        || fail "Could not generate a self-signed certificate"
+    eval "$CERT_PATHS"
+    TLS_CERT="$TLS_CERT_PATH"
+    TLS_KEY="$TLS_KEY_PATH"
 fi
 
 # ── Configuration (root-only readable) ───────────────────────────────────────

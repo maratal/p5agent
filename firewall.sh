@@ -33,6 +33,13 @@ ufw default allow outgoing >/dev/null 2>&1 || true
 ufw allow 22/tcp comment "SSH" >/dev/null 2>&1 || true
 ufw allow "${PORT}/tcp" comment "p5agent" >/dev/null 2>&1 || true
 
+# Port 80 is for the ACME http-01 challenge — the only way certbot can prove
+# this host owns a domain without DNS credentials. Left open rather than opened
+# around each run, because certbot's unattended renewal needs it too: a port
+# that is only open while someone is watching means the certificate expires in
+# sixty days with nobody watching. Nothing listens on it between challenges.
+ufw allow 80/tcp comment "ACME http-01" >/dev/null 2>&1 || true
+
 # One port per installed app (the reset above cleared them; no-op on first
 # install). An entry with no port defaults to 443.
 if [[ -f "$INSTALLED" ]]; then
@@ -54,4 +61,4 @@ for a in apps:
 fi
 
 ufw --force enable >/dev/null 2>&1 || true
-ok "Firewall: default deny incoming; 22, ${PORT}, and app ports open"
+ok "Firewall: default deny incoming; 22, 80, ${PORT}, and app ports open"

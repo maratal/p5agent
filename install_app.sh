@@ -127,24 +127,18 @@ EOF
 }
 export -f db_password write_db_env
 
-# Generate a self-signed TLS cert for the droplet's IP (so generic apps can serve
-# HTTPS) and record its paths in /etc/<name>.env. Re-uses an existing cert.
+# Give the app a TLS certificate for the droplet's IP (so generic apps can serve
+# HTTPS) and record its paths in /etc/<name>.env.
+#
+# The work is certs.sh's — it is the only place this project makes certificates,
+# and the same script issues the Let's Encrypt certificate that replaces this one
+# once a domain points here. An existing pair is reused rather than replaced, so
+# re-installing an app does not throw away a certificate a domain is using.
 setup_tls() {  # uses $name
-    local cert_dir="/etc/${name}/certs" cert="/etc/${name}/certs/cert.pem" key="/etc/${name}/certs/key.pem"
-    local env_file="/etc/${name}.env" ip
-    mkdir -p "$cert_dir"
-    if [[ ! -f "$cert" || ! -f "$key" ]]; then
-        ip=$(curl -s --max-time 10 http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address 2>/dev/null \
-             || hostname -I | awk '{print $1}')
-        logline "Generating self-signed TLS certificate for ${ip:-the server}"
-        openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
-            -keyout "$key" -out "$cert" \
-            -subj "/CN=${ip:-localhost}" -addext "subjectAltName=IP:${ip:-127.0.0.1}" 2>&1 | stamp
-    fi
-    touch "$env_file"; chmod 600 "$env_file"
-    sed -i '/^TLS_CERT_PATH=/d;/^TLS_KEY_PATH=/d' "$env_file"
-    { echo "TLS_CERT_PATH=$cert"; echo "TLS_KEY_PATH=$key"; } >> "$env_file"
-    logline "Wrote TLS cert paths to $env_file"
+    bash "$HERE/certs.sh" self-signed \
+        --cert "/etc/${name}/certs/cert.pem" \
+        --key  "/etc/${name}/certs/key.pem" \
+        --env  "/etc/${name}.env" 2>&1 | stamp
 }
 
 # ── Read the request ─────────────────────────────────────────────────────────

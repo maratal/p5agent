@@ -43,6 +43,7 @@ cannot leak into access logs, proxies, or browser history:
 import hmac
 import json
 import os
+import re
 import ssl
 import subprocess
 import sys
@@ -69,6 +70,15 @@ TLS_KEY = os.environ.get("P5AGENT_TLS_KEY", "")
 # Files the agent serves/spawns. The install lifecycle (deps, clone, setup,
 # logging, progress) lives entirely in install_app.sh + supported_deps.json.
 INSTALL_SCRIPT = os.path.join(APP_DIR, "install_app.sh")
+CERTS_SCRIPT = os.path.join(APP_DIR, "certs.sh")
+# A hostname and nothing else. The domain reaches certs.sh as an argv element
+# rather than inside a shell string, so this is not the only thing standing
+# between a caller and the shell — but a name that cannot be a flag or a path is
+# worth insisting on before anything runs as root.
+DOMAIN_RE = re.compile(
+    r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+)
 SUPPORTED_DEPS = os.path.join(APP_DIR, "supported_deps.json")
 SETUP_LOG = os.path.join(DATA_DIR, "setup.log")
 INSTALLED_APPS = os.path.join(DATA_DIR, "installed_apps.json")
@@ -284,7 +294,7 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch()
 
     ROUTES = ("/update", "/command", "/install-app", "/progress",
-              "/supported", "/apps")
+              "/supported", "/apps", "/certs")
 
     def _dispatch(self):
         path = self._path()
@@ -308,6 +318,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/progress": self._do_progress,
                 "/supported": self._do_supported,
                 "/apps": self._do_apps,
+                "/certs": self._do_certs,
             }[path]()
         except Exception as exc:  # noqa: BLE001 - never leak a traceback as 500 HTML
             return self._send(500, {"error": "internal error", "detail": str(exc)})
@@ -442,6 +453,28 @@ class Handler(BaseHTTPRequestHandler):
     def _do_apps(self):
         """Return the installed apps list."""
         return self._send_raw(200, read_file(INSTALLED_APPS) or "[]", "application/json")
+
+    def _do_certs(self):
+        """Obtain or renew a Let's Encrypt certificate for a domain and point
+        every installed app at it.
+
+        Synchronous, unlike /install-app: certbot answers one challenge and is
+        done in seconds, so the caller can simply wait and read the output. The
+        work itself is in certs.sh — see it for the port 80 and renewal details.
+        """
+        raw = self._body().decode("utf-8", "replace").strip()
+        try:
+            req = json.loads(raw) if raw else {}
+        except ValueError:
+            return self._send(400, {"error": "body must be JSON"})
+        domain = str(req.get("domain", "")).strip().lower().rstrip(".")
+        if not DOMAIN_RE.match(domain):
+            return self._send(400, {"error": "a valid domain name is required"})
+        if not os.path.isfile(CERTS_SCRIPT):
+            return self._send(500, {"error": "certs.sh not found"})
+        rc, out = run(["bash", CERTS_SCRIPT, "domain", domain], cwd=APP_DIR)
+        return self._send(200 if rc == 0 else 500,
+                          {"returncode": rc, "output": out, "domain": domain})
 
 
 class Server(ThreadingHTTPServer):
