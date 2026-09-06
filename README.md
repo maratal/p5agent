@@ -18,7 +18,8 @@ nothing to install. The idle process uses roughly 12–18 MB of RAM.
 | GET        | `/progress`    | yes  | any       | The live install log (`setup.log`). Empty when nothing is installing. Poll it (~every 5s) to follow an install. |
 | GET        | `/supported`   | yes  | any       | The `supported_deps.json` registry of installable dependencies. |
 | GET        | `/apps`        | yes  | any       | The `installed_apps.json` list of installed apps. |
-| POST       | `/certs`       | yes  | any       | Obtain or renew a Let's Encrypt certificate for a domain and point every installed app at it. |
+| POST       | `/certs`       | yes  | any       | Start a Let's Encrypt run for a domain: obtain or renew, point every installed app at it, restart them. Returns once the job is spawned. |
+| GET        | `/certs-log`   | yes  | any       | The current (or last) certificate run: `{domain, log, finished, returncode}`. Poll it (~every 2s) to follow one. |
 
 ### `/update`
 
@@ -45,12 +46,18 @@ curl -X POST "https://<ip>:5005/command" \
 
 ### `/certs`
 
-Takes `{"domain": "chat.example.com"}` and runs `certs.sh domain <domain>`,
-which obtains a
-Let's Encrypt certificate for that name (or renews the existing one if it is
-due), writes `TLS_CERT_PATH` and `TLS_KEY_PATH` into every installed app's
-`/etc/<name>.env`, and restarts each service. Synchronous — certbot answers one
-challenge and is done — so the response carries the whole transcript.
+Takes `{"domain": "chat.example.com"}` and launches `certs.sh domain <domain>`,
+which obtains a Let's Encrypt certificate for that name (or renews the existing
+one if it is due), writes `TLS_CERT_PATH` and `TLS_KEY_PATH` into every installed
+app's `/etc/<name>.env`, and restarts each service.
+
+A job, not a request. Issuing a first certificate installs certbot before it does
+anything else, which takes minutes — longer than a caller will hold a connection
+open. Holding it open cost one run its result: the socket was closed underneath a
+job that had already succeeded, so the work landed and the reply did not. `/certs`
+returns `{"status":"started"}` and `/certs-log` carries the transcript, exactly as
+`/install-app` and `/progress` do for an install. A second run is refused with
+`409` while one is going.
 
 The domain must be a plain hostname; anything else is rejected with `400` before
 a root script is started. The name is also checked to resolve to this droplet
@@ -182,6 +189,8 @@ certificate (for the droplet's IP) under `/opt/p5agent/certs`.
 | `setup.log` | data dir | Live install log; served by `/progress`. |
 | `installed_apps.json` | data dir | Installed apps (`name`, `product-name`, `path`, `port`, `dependencies`); served by `/apps`. |
 | `p5agent-restart-apps.sh` | `/etc/letsencrypt/renewal-hooks/deploy` | Restarts every installed app after a certificate renewal; written by `certs.sh`. |
+| `certs.log` | data dir | The running (or last) certificate run's output; served by `/certs-log`. |
+| `certs_status.json` | data dir | That run's domain and start time. Its log's final marker line is what "finished" means. |
 
 ### Certificates
 

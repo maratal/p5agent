@@ -295,16 +295,30 @@ else
         if [[ -n "$owner" ]] && id "$owner" &>/dev/null; then
             usermod -aG "$CERT_GROUP" "$owner" 2>/dev/null || true
         fi
-        # systemctl returns as soon as the process is forked, and these units
-        # are Type=simple: an app that starts and dies a second later still
-        # exits 0 here. Reporting that as success is how a certificate change
-        # that took every app down got announced as working. Settle, then ask.
-        systemctl restart "$app" >&2 2>&1
-        sleep 2
-        if systemctl is-active --quiet "$app"; then
+        # --no-block, then poll. A blocking restart of a unit that fails and is
+        # restarted by systemd waits on its start job — up to 90s by default,
+        # per app — and that stall is what ran the caller's socket timeout out
+        # and lost the reply to a run that had actually done its work.
+        #
+        # Polling also answers the question systemctl cannot: these units are
+        # Type=simple, so a restart "succeeds" the moment the process is forked,
+        # and an app that dies a second later still looks fine. Wait for active,
+        # then look again, because a crash loop passes through active.
+        systemctl restart --no-block "$app" >&2 2>&1
+        state=""
+        for _ in $(seq 1 10); do
+            sleep 1
+            state=$(systemctl is-active "$app" 2>/dev/null)
+            [[ "$state" == "active" || "$state" == "failed" ]] && break
+        done
+        if [[ "$state" == "active" ]]; then
+            sleep 2
+            state=$(systemctl is-active "$app" 2>/dev/null)
+        fi
+        if [[ "$state" == "active" ]]; then
             ok "$app now serving $DOMAIN"
         else
-            printf '✗ %s did not stay up after the restart:\n' "$app" >&2
+            printf '✗ %s did not come back up (%s):\n' "$app" "${state:-unknown}" >&2
             journalctl -u "$app" -n 15 --no-pager >&2 2>/dev/null
             failed_apps="${failed_apps:+$failed_apps }$app"
         fi

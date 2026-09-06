@@ -71,6 +71,15 @@ TLS_KEY = os.environ.get("P5AGENT_TLS_KEY", "")
 # logging, progress) lives entirely in install_app.sh + supported_deps.json.
 INSTALL_SCRIPT = os.path.join(APP_DIR, "install_app.sh")
 CERTS_SCRIPT = os.path.join(APP_DIR, "certs.sh")
+# A certificate run is a job, not a request: issuing a first certificate installs
+# certbot before it does anything else, and the caller's socket times out long
+# before that finishes — losing the result of work that had already succeeded.
+# So /certs starts it and returns, /certs-log follows it, exactly as
+# /install-app and /progress do for an install.
+CERTS_LOG = os.path.join(DATA_DIR, "certs.log")
+CERTS_STATUS = os.path.join(DATA_DIR, "certs_status.json")
+# The last line the runner writes. Its presence is what "finished" means.
+CERTS_DONE = "[p5agent] certs finished rc="
 # A hostname and nothing else. The domain reaches certs.sh as an argv element
 # rather than inside a shell string, so this is not the only thing standing
 # between a caller and the shell — but a name that cannot be a flag or a path is
@@ -108,6 +117,33 @@ def run(cmd, cwd=None):
         return 124, out + "\n[p5agent] timed out after %ds\n" % CMD_TIMEOUT
     except Exception as exc:  # noqa: BLE001 - report any failure to the caller
         return 1, "[p5agent] failed to run %r: %s\n" % (cmd, exc)
+
+
+def certs_status():
+    """What the last certificate run is doing, or {} when there has never been
+    one. The log carries the answer: the runner appends a completion marker as
+    its final act, so its absence means the job is still going."""
+    raw = read_file(CERTS_STATUS)
+    if not raw:
+        return {}
+    try:
+        status = json.loads(raw)
+    except ValueError:
+        return {}
+    log = read_file(CERTS_LOG) or ""
+    status["log"] = log
+    marker = log.rfind(CERTS_DONE)
+    if marker == -1:
+        status["finished"] = False
+        status["returncode"] = None
+    else:
+        status["finished"] = True
+        tail = log[marker + len(CERTS_DONE):].strip().split()
+        try:
+            status["returncode"] = int(tail[0]) if tail else None
+        except ValueError:
+            status["returncode"] = None
+    return status
 
 
 def unique_script_path():
@@ -294,7 +330,7 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch()
 
     ROUTES = ("/update", "/command", "/install-app", "/progress",
-              "/supported", "/apps", "/certs")
+              "/supported", "/apps", "/certs", "/certs-log")
 
     def _dispatch(self):
         path = self._path()
@@ -319,9 +355,21 @@ class Handler(BaseHTTPRequestHandler):
                 "/supported": self._do_supported,
                 "/apps": self._do_apps,
                 "/certs": self._do_certs,
+                "/certs-log": self._do_certs_log,
             }[path]()
         except Exception as exc:  # noqa: BLE001 - never leak a traceback as 500 HTML
-            return self._send(500, {"error": "internal error", "detail": str(exc)})
+            try:
+                return self._send(500, {"error": "internal error", "detail": str(exc)})
+            except OSError as send_exc:
+                # The client hung up before we answered — a long job outliving
+                # the caller's timeout, most often. Writing the 500 fails the
+                # same way the first write did, and the pair of tracebacks says
+                # nothing about the original error. Log the one that matters.
+                sys.stderr.write(
+                    "[p5agent] request failed and the reply could not be sent "
+                    "(%s); original error: %s\n" % (send_exc, exc)
+                )
+                return None
 
     # ---- operations ------------------------------------------------------
     def _do_update(self):
@@ -455,12 +503,13 @@ class Handler(BaseHTTPRequestHandler):
         return self._send_raw(200, read_file(INSTALLED_APPS) or "[]", "application/json")
 
     def _do_certs(self):
-        """Obtain or renew a Let's Encrypt certificate for a domain and point
-        every installed app at it.
+        """Start a certificate run for a domain and return at once.
 
-        Synchronous, unlike /install-app: certbot answers one challenge and is
-        done in seconds, so the caller can simply wait and read the output. The
-        work itself is in certs.sh — see it for the port 80 and renewal details.
+        The work — certbot, wiring every installed app, restarting them — is in
+        certs.sh. It can take minutes on a droplet that has never had certbot
+        installed, which is longer than any caller will hold a connection open,
+        so this launches it detached and answers immediately. Follow it with
+        /certs-log.
         """
         raw = self._body().decode("utf-8", "replace").strip()
         try:
@@ -472,9 +521,43 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {"error": "a valid domain name is required"})
         if not os.path.isfile(CERTS_SCRIPT):
             return self._send(500, {"error": "certs.sh not found"})
-        rc, out = run(["bash", CERTS_SCRIPT, "domain", domain], cwd=APP_DIR)
-        return self._send(200 if rc == 0 else 500,
-                          {"returncode": rc, "output": out, "domain": domain})
+
+        current = certs_status()
+        if current and not current.get("finished"):
+            return self._send(409, {"error": "a certificate run for %s is already in progress"
+                                             % current.get("domain", "this upplet")})
+
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(CERTS_LOG, "w") as fh:
+            fh.write("[p5agent] starting certificate run for %s\n" % domain)
+        with open(CERTS_STATUS, "w") as fh:
+            json.dump({"domain": domain, "started_at": int(time.time())}, fh)
+
+        # The runner appends the completion marker whatever the script does, so
+        # a crash is still an ending rather than a log that simply stops.
+        runner = 'exec >>"$1" 2>&1; bash "$2" domain "$3"; printf "\\n%s%s\\n" "$4" "$?"'
+        try:
+            subprocess.Popen(
+                ["bash", "-c", runner, "p5agent-certs",
+                 CERTS_LOG, CERTS_SCRIPT, domain, CERTS_DONE],
+                cwd=APP_DIR,
+                env=dict(os.environ, HOME="/root", DEBIAN_FRONTEND="noninteractive"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,   # survive the agent and this request
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._send(500, {"error": "failed to start the certificate run",
+                                    "detail": str(exc)})
+        return self._send(200, {"status": "started", "domain": domain})
+
+    def _do_certs_log(self):
+        """The current (or last) certificate run: its domain, its output so far,
+        whether it is still going and what it exited with."""
+        status = certs_status()
+        if not status:
+            return self._send(200, {})
+        return self._send(200, status)
 
 
 class Server(ThreadingHTTPServer):
