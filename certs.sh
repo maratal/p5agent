@@ -123,12 +123,38 @@ write_env() {
     ok "TLS paths written to $file"
 }
 
-# The private key lives under archive/ and live/ holds symlinks into it, so both
-# directories have to be traversable by whoever runs the app.
+# Make the certificate readable by the group — the key itself, not just the path
+# to it.
+#
+# certbot writes privkey as 0600 root:root, and a group on a parent directory
+# grants traversal, never read on a file inside: an app walks the whole way to
+# the key and is refused at the last step. Both the directories and the key need
+# doing, and the key is the part that actually matters.
+#
+# A renewal inherits the mode and ownership of the key it replaces, so this holds
+# from here on rather than needing to be reapplied. That is also why a host whose
+# certificate predates this can look fine while a freshly issued one fails — the
+# old key carried old permissions forward.
 grant_cert_access() {
+    local domain="$1"
     getent group "$CERT_GROUP" >/dev/null || groupadd --system "$CERT_GROUP"
+
     chgrp "$CERT_GROUP" /etc/letsencrypt/live /etc/letsencrypt/archive
     chmod 750 /etc/letsencrypt/live /etc/letsencrypt/archive
+
+    local live="/etc/letsencrypt/live/$domain" arch="/etc/letsencrypt/archive/$domain"
+    for dir in "$live" "$arch"; do
+        [[ -d "$dir" ]] || continue
+        chgrp "$CERT_GROUP" "$dir"
+        chmod 750 "$dir"          # group needs x to reach the files inside
+    done
+    if compgen -G "$arch/privkey*.pem" >/dev/null; then
+        chgrp "$CERT_GROUP" "$arch"/privkey*.pem
+        chmod 640 "$arch"/privkey*.pem
+        ok "Private key readable by the $CERT_GROUP group"
+    else
+        printf '! no private key found under %s\n' "$arch" >&2
+    fi
 }
 
 # ── self-signed ──────────────────────────────────────────────────────────────
@@ -246,7 +272,7 @@ CERT="$LE_DIR/fullchain.pem"
 KEY="$LE_DIR/privkey.pem"
 [[ -f "$CERT" && -f "$KEY" ]] || fail "certbot reported success but $LE_DIR is not readable"
 
-grant_cert_access
+grant_cert_access "$DOMAIN"
 
 # The certbot package ships a systemd timer and enables it, but an upplet where
 # it was masked or never started would look fine for sixty days and then stop
@@ -257,6 +283,7 @@ if systemctl list-unit-files certbot.timer >/dev/null 2>&1; then
         || log "Could not enable certbot.timer — renewals will not run unattended"
 fi
 
+failed_apps=""
 APPS=$(installed_apps)
 if [[ -z "$APPS" ]]; then
     ok "No apps installed yet — the certificate is in place for the next one"
@@ -268,12 +295,24 @@ else
         if [[ -n "$owner" ]] && id "$owner" &>/dev/null; then
             usermod -aG "$CERT_GROUP" "$owner" 2>/dev/null || true
         fi
-        if systemctl restart "$app" >&2 2>&1; then
+        # systemctl returns as soon as the process is forked, and these units
+        # are Type=simple: an app that starts and dies a second later still
+        # exits 0 here. Reporting that as success is how a certificate change
+        # that took every app down got announced as working. Settle, then ask.
+        systemctl restart "$app" >&2 2>&1
+        sleep 2
+        if systemctl is-active --quiet "$app"; then
             ok "$app now serving $DOMAIN"
         else
-            printf '✗ %s failed to restart (journalctl -u %s)\n' "$app" "$app" >&2
+            printf '✗ %s did not stay up after the restart:\n' "$app" >&2
+            journalctl -u "$app" -n 15 --no-pager >&2 2>/dev/null
+            failed_apps="${failed_apps:+$failed_apps }$app"
         fi
     done <<< "$APPS"
+fi
+
+if [[ -n "${failed_apps:-}" ]]; then
+    fail "The certificate is in place, but these did not come back up: ${failed_apps}"
 fi
 
 ok "Done. $DOMAIN is live; certbot's timer handles renewal from here."
