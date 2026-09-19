@@ -20,6 +20,10 @@ HTTPS, so the PHP demo is a small server of its own and says so with
 | `php`    | `php server.php`         | nothing to build (no composer.json)        |
 | `java`   | `java -jar app.jar`      | `mvn package`, jar copied to `app.jar`     |
 
+Each also answers `GET /api/info` with JSON (`productName`, `version`,
+`runtime`) — what the Project5 dashboard polls to show the app's card as
+active.
+
 Every app uses its standard library only (Swift needs SwiftNIO for a server),
 listens on `$HOST:$PORT` (default `0.0.0.0:8080`), and serves HTTPS when
 `TLS_CERT_PATH` and `TLS_KEY_PATH` are set — which the installer does, with a

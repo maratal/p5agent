@@ -2,6 +2,7 @@
 // installer runs it with the java type's default "java -jar app.jar").
 //
 // GET shows a name form; POST answers "Hello, <name>!" in the middle of the page.
+// GET /api/info answers the product info a control panel polls for liveness.
 // Listens on $HOST:$PORT (default 0.0.0.0:8080) and serves HTTPS when the
 // installer has put TLS_CERT_PATH / TLS_KEY_PATH in the environment.
 import com.sun.net.httpserver.HttpExchange;
@@ -30,6 +31,7 @@ import javax.net.ssl.SSLContext;
 
 public class App {
     static final String RUNTIME = "Java";
+    static final String VERSION = "1.0.0";
     static final String FORM = "<h1>Hello World</h1><form method=\"post\">"
             + "<input name=\"name\" placeholder=\"Your name\" autofocus required>"
             + "<button type=\"submit\">Say hello</button></form>";
@@ -57,6 +59,21 @@ public class App {
             }
         }
         return "";
+    }
+
+    static void info(HttpExchange ex) throws IOException {
+        if (!"/api/info".equals(ex.getRequestURI().getPath())) {
+            handle(ex);   // "/api/info…" prefixes route here too; anything else is the page
+            return;
+        }
+        String json = "{\"productName\":\"Hello " + RUNTIME + "\",\"version\":\"" + VERSION
+                + "\",\"runtime\":\"Java " + System.getProperty("java.version") + "\"}";
+        byte[] out = json.getBytes(StandardCharsets.UTF_8);
+        ex.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+        ex.sendResponseHeaders(200, out.length);
+        try (OutputStream os = ex.getResponseBody()) {
+            os.write(out);
+        }
     }
 
     static void handle(HttpExchange ex) throws IOException {
@@ -124,6 +141,7 @@ public class App {
             server = HttpServer.create(addr, 0);
         }
         server.createContext("/", App::handle);
+        server.createContext("/api/info", App::info);
         server.setExecutor(Executors.newCachedThreadPool());
         server.start();
         System.out.println("Hello World (" + RUNTIME + ") listening on " + scheme + "://" + host + ":" + port);

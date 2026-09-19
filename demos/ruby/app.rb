@@ -2,13 +2,16 @@
 # library in Ruby 3.0, so this speaks just enough HTTP/1.1 itself).
 #
 # GET shows a name form; POST answers "Hello, <name>!" in the middle of the page.
+# GET /api/info answers the product info a control panel polls for liveness.
 # Listens on $HOST:$PORT (default 0.0.0.0:8080) and serves HTTPS when the
 # installer has put TLS_CERT_PATH / TLS_KEY_PATH in the environment.
 require 'socket'
 require 'openssl'
 require 'cgi'
+require 'json'
 
 RUNTIME = 'Ruby'
+VERSION = '1.0.0'
 TEMPLATE = File.read(File.join(__dir__, 'hello.html'), encoding: 'UTF-8')
 
 FORM = '<h1>Hello World</h1><form method="post">' \
@@ -25,11 +28,15 @@ end
 
 def handle(client)
   request_line = client.gets or return
-  method = request_line.split(' ').first
+  method, target = request_line.split(' ')
   headers = {}
   while (line = client.gets) && line != "\r\n" && line != "\n"
     k, v = line.split(':', 2)
     headers[k.strip.downcase] = v.to_s.strip if k
+  end
+  if method == 'GET' && target.to_s.split('?').first == '/api/info'
+    info = { productName: "Hello #{RUNTIME}", version: VERSION, runtime: "Ruby #{RUBY_VERSION}" }
+    return respond(client, info.to_json, 'application/json')
   end
   content = FORM
   if method == 'POST'
@@ -40,16 +47,20 @@ def handle(client)
     name = fields['name'].to_s.strip
     content = greeting(name.empty? ? 'World' : name)
   end
-  out = page(content).b
-  client.write("HTTP/1.1 200 OK\r\n" \
-               "Content-Type: text/html; charset=utf-8\r\n" \
-               "Content-Length: #{out.bytesize}\r\n" \
-               "Connection: close\r\n\r\n")
-  client.write(out)
+  respond(client, page(content), 'text/html')
 rescue StandardError => e
   warn "request failed: #{e.class}: #{e.message}"
 ensure
   client.close rescue nil
+end
+
+def respond(client, text, content_type)
+  out = text.b
+  client.write("HTTP/1.1 200 OK\r\n" \
+               "Content-Type: #{content_type}; charset=utf-8\r\n" \
+               "Content-Length: #{out.bytesize}\r\n" \
+               "Connection: close\r\n\r\n")
+  client.write(out)
 end
 
 host = ENV['HOST'].to_s.empty? ? '0.0.0.0' : ENV['HOST']

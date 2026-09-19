@@ -1,6 +1,7 @@
 // Hello World demo — Swift on SwiftNIO.
 //
 // GET shows a name form; POST answers "Hello, <name>!" in the middle of the page.
+// GET /api/info answers the product info a control panel polls for liveness.
 // Listens on $HOST:$PORT (default 0.0.0.0:8080) and serves HTTPS when the
 // installer has put TLS_CERT_PATH / TLS_KEY_PATH in the environment. The
 // installer runs the built "App" binary from the app directory, which is where
@@ -13,6 +14,7 @@ import NIOPosix
 import NIOSSL
 
 let runtimeName = "Swift"
+let version = "1.0.0"
 let template = (try? String(contentsOfFile: "hello.html", encoding: .utf8)) ?? "<main>{{content}}</main>"
 
 let form = "<h1>Hello World</h1><form method=\"post\">"
@@ -65,21 +67,26 @@ final class HelloHandler: ChannelInboundHandler {
         case .end:
             guard let h = head else { return }
             head = nil
+            if h.method == .GET && h.uri.split(separator: "?").first == "/api/info" {
+                let info = "{\"productName\":\"Hello \(runtimeName)\",\"version\":\"\(version)\",\"runtime\":\"Swift\"}"
+                respond(context: context, keepAlive: h.isKeepAlive, body: info, contentType: "application/json")
+                return
+            }
             var content = form
             if h.method == .POST {
                 let raw = body.readString(length: body.readableBytes) ?? ""
                 let name = formValue(raw, "name").trimmingCharacters(in: .whitespacesAndNewlines)
                 content = greeting(name.isEmpty ? "World" : name)
             }
-            respond(context: context, keepAlive: h.isKeepAlive, html: page(content))
+            respond(context: context, keepAlive: h.isKeepAlive, body: page(content), contentType: "text/html")
         }
     }
 
-    private func respond(context: ChannelHandlerContext, keepAlive: Bool, html: String) {
-        var buffer = context.channel.allocator.buffer(capacity: html.utf8.count)
-        buffer.writeString(html)
+    private func respond(context: ChannelHandlerContext, keepAlive: Bool, body: String, contentType: String) {
+        var buffer = context.channel.allocator.buffer(capacity: body.utf8.count)
+        buffer.writeString(body)
         var headers = HTTPHeaders()
-        headers.add(name: "Content-Type", value: "text/html; charset=utf-8")
+        headers.add(name: "Content-Type", value: "\(contentType); charset=utf-8")
         headers.add(name: "Content-Length", value: String(buffer.readableBytes))
         if !keepAlive { headers.add(name: "Connection", value: "close") }
         context.write(wrapOutboundOut(.head(HTTPResponseHead(version: .http1_1, status: .ok, headers: headers))), promise: nil)

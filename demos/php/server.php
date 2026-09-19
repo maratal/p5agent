@@ -3,10 +3,12 @@
 //
 // PHP's built-in web server (php -S) cannot speak TLS, so this is a small
 // server of its own: GET shows a name form; POST answers "Hello, <name>!" in the
-// middle of the page. Listens on $HOST:$PORT (default 0.0.0.0:8080) and serves
+// middle of the page; GET /api/info answers the product info a control panel
+// polls for liveness. Listens on $HOST:$PORT (default 0.0.0.0:8080) and serves
 // HTTPS when the installer has put TLS_CERT_PATH / TLS_KEY_PATH in the environment.
 
 const RUNTIME = 'PHP';
+const VERSION = '1.0.0';
 $template = file_get_contents(__DIR__ . '/hello.html');
 
 $form = '<h1>Hello World</h1><form method="post">'
@@ -53,9 +55,17 @@ while (true) {
     $requestLine = fgets($client);
     if ($requestLine === false) { fclose($client); continue; }
     $method = strtok($requestLine, ' ');
+    $target = (string)strtok(' ');
     $length = 0;
     while (($line = fgets($client)) !== false && trim($line) !== '') {
         if (stripos($line, 'content-length:') === 0) $length = (int)trim(substr($line, 15));
+    }
+    if ($method === 'GET' && strtok($target, '?') === '/api/info') {
+        $out = json_encode(['productName' => 'Hello ' . RUNTIME, 'version' => VERSION, 'runtime' => 'PHP ' . PHP_VERSION]);
+        fwrite($client, "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+            . 'Content-Length: ' . strlen($out) . "\r\nConnection: close\r\n\r\n" . $out);
+        fclose($client);
+        continue;
     }
     $content = $form;
     if ($method === 'POST') {
