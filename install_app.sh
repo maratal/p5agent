@@ -384,7 +384,7 @@ if [[ -n "$repo" || -n "$demo" ]]; then
 
         type_script="$SUPPORT/install_${app_type}_app.sh"
         if [[ -n "$app_type" && -f "$type_script" ]]; then
-            logline "No setup.sh/install.sh — running install_${app_type}_app.sh"
+            logline "No setup.sh/install.sh found in the repo — running default install_${app_type}_app.sh"
             ( cd "$app_dir" && APP_DIR="$app_dir" APP_NAME="$name" APP_PORT="$port" APP_CMD="$app_cmd" \
                 APP_SERVICES="$app_services" APP_USER="$app_user" \
                 runlog "bash '$type_script'" ) || fail "$name install failed (install_${app_type}_app.sh)"
