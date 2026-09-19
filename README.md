@@ -20,6 +20,7 @@ nothing to install. The idle process uses roughly 12–18 MB of RAM.
 | GET        | `/apps`        | yes  | any       | The `installed_apps.json` list of installed apps. |
 | POST       | `/certs`       | yes  | any       | Start a Let's Encrypt run for a domain: obtain or renew, point every installed app at it, restart them. Returns once the job is spawned. |
 | GET        | `/certs-log`   | yes  | any       | The current (or last) certificate run: `{domain, log, finished, returncode}`. Poll it (~every 2s) to follow one. |
+| GET        | `/info`        | yes  | any       | The upplet itself: OS, kernel, arch, uptime, memory, disk, this agent's commit, installed versions of the supported dependencies (plus certbot, ufw, git), and the firewall's rules. |
 
 ### `/update`
 

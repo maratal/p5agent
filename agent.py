@@ -19,6 +19,9 @@ root systemd service on port 5005 and exposes:
                       { "app", "started_at", "log"?, "completed"? } — {} when idle
     GET  /supported   the supported_deps.json registry
     GET  /apps        the installed_apps.json list
+    GET  /info        the upplet itself: OS, kernel, uptime, memory, disk, this
+                      agent's commit, installed versions of the supported
+                      dependencies, and the firewall's allow rules
 
 All endpoints except `/` require the shared secret token. `/command` is the only
 one restricted by source IP.
@@ -44,6 +47,7 @@ import hmac
 import json
 import os
 import re
+import shutil
 import ssl
 import subprocess
 import sys
@@ -282,6 +286,137 @@ def install_status():
     return status
 
 
+
+# ---- /info ---------------------------------------------------------------
+# Everything here is read, never changed, and each part fails on its own: a
+# missing tool leaves its field empty rather than failing the whole report.
+
+def _run(args, timeout=10):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _os_release():
+    fields = {}
+    for line in read_file("/etc/os-release").splitlines():
+        key, _, value = line.partition("=")
+        fields[key] = value.strip().strip('"')
+    return fields.get("PRETTY_NAME") or fields.get("NAME") or ""
+
+
+def _clean_version(pkg, version):
+    """A Debian package version, reduced to the upstream one people know:
+    "2:8.3+93" -> "8.3", "18.19.1+dfsg-6ubuntu5" -> "18.19.1". default-jdk
+    counts Java as "1.21"; that is Java 21."""
+    v = re.sub(r"^\d+:", "", version)
+    v = re.split(r"[+~-]", v, 1)[0]
+    if pkg == "default-jdk" and v.startswith("1."):
+        v = v[2:]
+    return v
+
+
+# Worth naming beyond the supported dependencies: what the agent itself runs on.
+EXTRA_PACKAGES = [("certbot", "Certbot", "certbot"), ("ufw", "ufw", "ufw"), ("git", "Git", "git")]
+
+
+def installed_packages():
+    """The supported dependencies (and a few of the agent's own tools) that are
+    installed, with versions — one dpkg-query for all of them."""
+    try:
+        registry = json.loads(read_file(SUPPORTED_DEPS) or "[]")
+    except ValueError:
+        registry = []
+    wanted = []   # (name, display, apt package or None)
+    for entry in registry:
+        name = entry.get("name", "")
+        pkg = entry.get("package") or (entry.get("name") if entry.get("package-manager") == "apt" else None)
+        wanted.append((name, entry.get("display-name") or name, pkg))
+    wanted += EXTRA_PACKAGES
+
+    apt = [pkg for _, _, pkg in wanted if pkg]
+    versions = {}
+    out = _run(["dpkg-query", "-W", "-f", "${Package}\t${db:Status-Abbrev}\t${Version}\n"] + apt)
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3 and parts[1].startswith("ii"):
+            versions[parts[0]] = parts[2]
+
+    found = []
+    for name, display, pkg in wanted:
+        if pkg and pkg in versions:
+            found.append({"name": name, "display": display, "version": _clean_version(pkg, versions[pkg]),
+                          "package": pkg, "package_version": versions[pkg]})
+        elif name == "swift" and shutil.which("swift"):
+            m = re.search(r"Swift version (\S+)", _run(["swift", "--version"]))
+            found.append({"name": name, "display": display, "version": m.group(1) if m else ""})
+    return found
+
+
+def firewall_rules():
+    """ufw's allow/deny rules, one per port — the IPv6 twin of a rule is folded
+    into it. None when ufw is not there."""
+    if not shutil.which("ufw"):
+        return None
+    out = _run(["ufw", "status"])
+    status = ""
+    rules, seen, table = [], set(), False
+    for line in out.splitlines():
+        if line.startswith("Status:"):
+            status = line.split(":", 1)[1].strip()
+        elif line.startswith("--"):
+            table = True
+        elif table and line.strip():
+            text, _, comment = line.partition("#")
+            cols = re.split(r"\s{2,}", text.strip())
+            if len(cols) < 3:
+                continue
+            to, action, source = (c.replace(" (v6)", "") for c in cols[:3])
+            if (to, action, source) in seen:
+                continue
+            seen.add((to, action, source))
+            rules.append({"to": to, "action": action, "from": source, "comment": comment.strip()})
+    return {"status": status, "rules": rules}
+
+
+def agent_version():
+    out = _run(["git", "-C", APP_DIR, "log", "-1", "--format=%h%x09%cI%x09%s"]).strip()
+    commit, _, rest = out.partition("\t")
+    date, _, subject = rest.partition("\t")
+    return {"commit": commit, "date": date, "subject": subject}
+
+
+def upplet_info():
+    uname = os.uname()
+    try:
+        uptime = int(float(read_file("/proc/uptime").split()[0]))
+    except (IndexError, ValueError):
+        uptime = None
+    mem = {}
+    for line in read_file("/proc/meminfo").splitlines():
+        key, _, value = line.partition(":")
+        if key in ("MemTotal", "MemAvailable"):
+            mem[key] = int(value.split()[0]) * 1024
+    try:
+        du = shutil.disk_usage("/")
+        disk = {"total": du.total, "used": du.used, "free": du.free}
+    except OSError:
+        disk = None
+    return {
+        "hostname": uname.nodename,
+        "os": _os_release(),
+        "kernel": uname.release,
+        "arch": uname.machine,
+        "uptime_seconds": uptime,
+        "memory": {"total": mem.get("MemTotal"), "available": mem.get("MemAvailable")},
+        "disk": disk,
+        "agent": agent_version(),
+        "packages": installed_packages(),
+        "firewall": firewall_rules(),
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "p5agent/1.0"
     protocol_version = "HTTP/1.1"
@@ -338,7 +473,7 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch()
 
     ROUTES = ("/update", "/command", "/install-app", "/progress",
-              "/supported", "/apps", "/certs", "/certs-log")
+              "/supported", "/apps", "/certs", "/certs-log", "/info")
 
     def _dispatch(self):
         path = self._path()
@@ -364,6 +499,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/apps": self._do_apps,
                 "/certs": self._do_certs,
                 "/certs-log": self._do_certs_log,
+                "/info": self._do_info,
             }[path]()
         except Exception as exc:  # noqa: BLE001 - never leak a traceback as 500 HTML
             try:
@@ -512,6 +648,10 @@ class Handler(BaseHTTPRequestHandler):
     def _do_apps(self):
         """Return the installed apps list."""
         return self._send_raw(200, read_file(INSTALLED_APPS) or "[]", "application/json")
+
+    def _do_info(self):
+        """Describe the upplet: system, this agent, packages, firewall."""
+        return self._send(200, upplet_info())
 
     def _do_certs(self):
         """Start a certificate run for a domain and return at once.
