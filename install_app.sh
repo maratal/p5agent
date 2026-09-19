@@ -2,7 +2,11 @@
 # install_app.sh <request.json>
 #
 # Installs an app: its dependencies (from supported_deps.json) and the app
-# itself (clone repo, then run setup.sh or install.sh). Run detached by the
+# itself (clone repo, then run setup.sh or install.sh). The app may live in a
+# subfolder of the repo ("path", e.g. src/server): the whole repo is cloned and
+# that folder is the app's directory from then on. A demo ("demo": true) is a
+# folder of this agent's own checkout instead — "path" names it (e.g.
+# demos/python) and it is copied, not cloned. Run detached by the
 # agent; it is the single owner of the install lifecycle.
 #
 # Everything is logged, line-by-line with timestamps, to $SETUP_LOG, which the
@@ -175,9 +179,20 @@ setup_tls() {  # uses $name
 jget() { python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2],'') or '')" "$REQ" "$1"; }
 repo=$(jget repo); key=$(jget key); branch=$(jget branch)
 name=$(jget name); product=$(jget product-name); port=$(jget port)
-app_type=$(jget app-type); app_cmd=$(jget app-cmd)
-[[ -n "$name" ]] || { base="${repo##*/}"; name="${base%.git}"; }
-target="$APPS_DIR/$name"
+app_type=$(jget app-type); app_cmd=$(jget app-cmd); path=$(jget path)
+# A demo is one of this repo's own demos/<type> apps: it is already on the
+# upplet (the agent runs from a checkout of the same repo), so it is copied
+# from here rather than cloned from anywhere.
+case "$(jget demo)" in True|true|1|yes) demo=1 ;; *) demo="" ;; esac
+# The app's own directory inside the repo. Relative, tidied of "./" and
+# surrounding slashes; anything climbing out of the repo is refused below.
+path="${path#./}"; path="${path#/}"; path="${path%/}"
+if [[ -z "$name" ]]; then
+    if [[ -n "$demo" ]]; then name="${path##*/}"; else base="${repo##*/}"; name="${base%.git}"; fi
+fi
+target="$APPS_DIR/$name"   # where the repo is cloned (a demo: copied)
+app_dir="$target${path:+/$path}"
+[[ -n "$demo" ]] && app_dir="$target"   # a demo's folder IS the copy
 
 mapfile -t DEPS < <(python3 -c "
 import json,re,sys
@@ -280,8 +295,18 @@ else
 fi
 
 # ── Install the app (clone + setup) ──────────────────────────────────────────
-if [[ -n "$repo" ]]; then
-    if [[ -d "$target/.git" ]]; then
+if [[ -n "$repo" || -n "$demo" ]]; then
+    if [[ -n "$demo" ]]; then
+        # Copied fresh every time: a re-install gets the demo as this agent
+        # version ships it, never a mix with what an earlier build left behind.
+        [[ -n "$path" ]] || fail "$name: a demo needs a path (e.g. demos/python)"
+        [[ "/$path/" != *"/../"* ]] || fail "$name: path '$path' leaves the repo"
+        [[ -d "$HERE/$path" ]] || fail "$name: demo '$path' not found in p5agent"
+        logline "$name installation began"
+        logline "Copying demo $path from p5agent"
+        rm -rf "$target"
+        runlog "mkdir -p '$target' && cp -a '$HERE/$path/.' '$target/'" || fail "$name: copying the demo failed"
+    elif [[ -d "$target/.git" ]]; then
         logline "$name already present at $target"
     else
         logline "$name installation began"
@@ -311,6 +336,12 @@ if [[ -n "$repo" ]]; then
         (( cloned )) || fail "$name clone failed (no branch or tag matching '$ref_in')"
     fi
 
+    if [[ -n "$path" && -z "$demo" ]]; then
+        [[ "/$path/" != *"/../"* ]] || fail "$name: path '$path' leaves the repo"
+        [[ -d "$app_dir" ]] || fail "$name: path '$path' not found in the repo"
+        logline "$name app directory: $path"
+    fi
+
     # Open the app's port in the firewall (everything else is denied by default).
     if [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )); then
         if command -v ufw >/dev/null 2>&1; then
@@ -321,7 +352,7 @@ if [[ -n "$repo" ]]; then
 
     setup=""
     for candidate in setup.sh install.sh; do
-        [[ -f "$target/$candidate" ]] && { setup="$target/$candidate"; break; }
+        [[ -f "$app_dir/$candidate" ]] && { setup="$app_dir/$candidate"; break; }
     done
     if [[ -n "$setup" ]]; then
         # The repo ships its own installer — it builds and sets up its service.
@@ -329,7 +360,7 @@ if [[ -n "$repo" ]]; then
         # can skip droplet-level provisioning the agent already did (firewall,
         # system upgrade, dependency install).
         logline "Running ${setup##*/}"
-        ( cd "$target" && P5AGENT=1 runlog "bash '$setup'" ) || fail "$name setup failed"
+        ( cd "$app_dir" && P5AGENT=1 runlog "bash '$setup'" ) || fail "$name setup failed"
     else
         # No repo installer. Create a dedicated non-root user to run the app as,
         # wire its database, generate a self-signed TLS cert, then run the per-type
@@ -354,7 +385,7 @@ if [[ -n "$repo" ]]; then
         type_script="$SUPPORT/install_${app_type}_app.sh"
         if [[ -n "$app_type" && -f "$type_script" ]]; then
             logline "No setup.sh/install.sh — running install_${app_type}_app.sh"
-            ( cd "$target" && APP_DIR="$target" APP_NAME="$name" APP_PORT="$port" APP_CMD="$app_cmd" \
+            ( cd "$app_dir" && APP_DIR="$app_dir" APP_NAME="$name" APP_PORT="$port" APP_CMD="$app_cmd" \
                 APP_SERVICES="$app_services" APP_USER="$app_user" \
                 runlog "bash '$type_script'" ) || fail "$name install failed (install_${app_type}_app.sh)"
         else
@@ -362,9 +393,9 @@ if [[ -n "$repo" ]]; then
         fi
 
         # Let the app user trigger its own redeploy if the repo ships those scripts.
-        if [[ -f "$target/refresh.sh" || -f "$target/update.sh" ]]; then
+        if [[ -f "$app_dir/refresh.sh" || -f "$app_dir/update.sh" ]]; then
             cat > "/etc/sudoers.d/$name" <<EOF
-$app_user ALL=(root) NOPASSWD: $target/refresh.sh, /usr/bin/systemd-run --collect $target/update.sh
+$app_user ALL=(root) NOPASSWD: $app_dir/refresh.sh, /usr/bin/systemd-run --collect $app_dir/update.sh
 EOF
             chmod 440 "/etc/sudoers.d/$name"
             logline "Configured sudoers for $app_user"
@@ -380,7 +411,7 @@ EOF
     fi
 
     # ── Record the installed app ─────────────────────────────────────────────
-    python3 - "$REQ" "$name" "$target" "$INSTALLED" <<'PY'
+    python3 - "$REQ" "$name" "$app_dir" "$INSTALLED" <<'PY'
 import json, os, sys
 req_path, name, target, installed = sys.argv[1:5]
 req = json.load(open(req_path))

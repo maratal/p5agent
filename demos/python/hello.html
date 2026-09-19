@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hello World · {{runtime}}</title>
+<style>
+  :root { color-scheme: light dark; --fg: #111; --bg: #fafafa; --muted: #777; --accent: #2563eb; --field: #fff; --line: #ddd; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg: #eee; --bg: #111; --muted: #888; --accent: #60a5fa; --field: #1b1b1b; --line: #333; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--fg);
+  }
+  main { text-align: center; padding: 16px; }
+  h1 { font-size: clamp(2rem, 6vw, 3.5rem); margin: 0 0 24px; font-weight: 600; word-break: break-word; }
+  form { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+  input, button { font: inherit; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--line); }
+  input { background: var(--field); color: var(--fg); min-width: 220px; }
+  button { background: var(--accent); border-color: var(--accent); color: #fff; cursor: pointer; }
+  a { color: var(--accent); }
+  footer { position: fixed; bottom: 16px; color: var(--muted); font-size: 0.85rem; }
+</style>
+</head>
+<body>
+<main>{{content}}</main>
+<footer>Hello World demo · {{runtime}}</footer>
+</body>
+</html>

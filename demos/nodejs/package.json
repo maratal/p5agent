@@ -1,0 +1,10 @@
+{
+  "name": "hello-nodejs",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Hello World demo for p5agent (Node.js, no dependencies)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

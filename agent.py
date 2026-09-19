@@ -165,11 +165,19 @@ def read_file(path):
         return ""
 
 
+def is_demo(req):
+    """A demo is a folder of the agent's own checkout ("path"), not a repo."""
+    return req.get("demo") in (True, "true", "1", 1, "yes")
+
+
 def app_name_from_request(req):
-    """The app's install name: explicit "name", else the repo basename."""
+    """The app's install name: explicit "name", else the repo basename (a
+    demo: its folder's name)."""
     name = (req.get("name") or "").strip()
     if name:
         return name
+    if is_demo(req):
+        return (req.get("path") or "").strip().strip("/").rsplit("/", 1)[-1]
     base = (req.get("repo") or "").rstrip("/").rsplit("/", 1)[-1]
     return base[:-4] if base.endswith(".git") else base
 
@@ -450,7 +458,10 @@ class Handler(BaseHTTPRequestHandler):
             req = json.loads(raw)
         except ValueError:
             return self._send(400, {"error": "body must be JSON"})
-        if not (req.get("repo") or "").strip():
+        if is_demo(req):
+            if not (req.get("path") or "").strip():
+                return self._send(400, {"error": "path is required for a demo"})
+        elif not (req.get("repo") or "").strip():
             return self._send(400, {"error": "repo is required"})
         if not os.path.isfile(INSTALL_SCRIPT):
             return self._send(500, {"error": "install_app.sh not found"})

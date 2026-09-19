@@ -100,6 +100,7 @@ curl -X POST "https://<ip>:5005/install-app" \
        "repo": "https://github.com/user/app.git",
        "key": "<token-for-private-repo>",
        "branch": "main",
+       "path": "",
        "name": "app",
        "product-name": "My App",
        "app-type": "swift",
@@ -109,15 +110,24 @@ curl -X POST "https://<ip>:5005/install-app" \
      }'
 ```
 
-Only `repo` is required. `install_app.sh` then, logging every step to
-`setup.log` with per-line timestamps:
+Only `repo` is required — or, for one of the agent's own demos, `"demo": true`
+with `path` (e.g. `"path": "demos/python"`) and no `repo`: the demo is copied
+from the agent's checkout into `/opt/<name>` instead of cloned, so it installs
+at the agent's own version (`branch` and `key` are ignored).
+
+`install_app.sh` then, logging every step to `setup.log` with per-line
+timestamps:
 
 1. **Installs dependencies.** Each name is looked up in `supported_deps.json`
    and installed via its `package-manager` (apt) or `install-cmd`. No
    dependencies → nothing installed. Each is logged as
    `<name> installation began … <name> installation completed`.
 2. **Clones the repo** into `/opt/<name>` (the key is embedded for a private
-   clone and never echoed back).
+   clone and never echoed back). With `path` set (e.g. `demos/python`), the app
+   lives in that folder of the repo: the whole repo is still cloned, and every
+   later step — `setup.sh`/`install.sh`, the builder, the service, the path
+   recorded in `installed_apps.json` — works from `/opt/<name>/<path>`. A path
+   that is missing from the repo, or climbs out of it, fails the install.
 3. **Sets the app up.** If the repo ships a `setup.sh` or `install.sh`, that is
    run (it builds the app and configures its own service). Otherwise the generic
    path: it creates a dedicated non-root user to run the app, wires its database
