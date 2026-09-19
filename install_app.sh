@@ -127,6 +127,34 @@ EOF
 }
 export -f db_password write_db_env
 
+# Hand the app the management token, so a control panel can drive the app's own
+# refresh/update endpoints the way it drives the agent — same secret, presented
+# as a bearer token. Without it an app either has no way to authenticate the
+# panel or needs the token placed by hand, which is easy to forget and looks
+# exactly like a broken button.
+#
+# Written after the install, not before: an app that ships its own installer
+# writes /etc/<name>.env itself with a truncating redirect, taking anything
+# already there with it.
+write_mgmt_token() {  # uses $name
+    local env_file="/etc/${name}.env" app_user
+    if [[ -z "${P5AGENT_TOKEN:-}" ]]; then
+        logline "No P5AGENT_TOKEN in the environment — skipping MGMT_TOKEN for $name"
+        return 0
+    fi
+    touch "$env_file"; chmod 600 "$env_file"
+    sed -i '/^MGMT_TOKEN=/d' "$env_file"
+    echo "MGMT_TOKEN=$P5AGENT_TOKEN" >> "$env_file"
+    # sed -i replaces the file rather than editing it, so hand it back to
+    # whoever runs the app — otherwise the service loses its own environment
+    # file at the next start.
+    app_user=$(grep -oP '^User=\K.*' "/etc/systemd/system/${name}.service" 2>/dev/null || true)
+    if [[ -n "$app_user" ]] && id "$app_user" &>/dev/null; then
+        chown "${app_user}:${app_user}" "$env_file"
+    fi
+    logline "Wrote MGMT_TOKEN to $env_file"
+}
+
 # Give the app a TLS certificate for the droplet's IP (so generic apps can serve
 # HTTPS) and record its paths in /etc/<name>.env.
 #
@@ -341,6 +369,14 @@ EOF
             chmod 440 "/etc/sudoers.d/$name"
             logline "Configured sudoers for $app_user"
         fi
+    fi
+
+    # ── Management token ─────────────────────────────────────────────────────
+    # The app is installed and its env file is final, so the token can go in and
+    # the service can be restarted with it in the running environment.
+    write_mgmt_token
+    if [[ -f "/etc/systemd/system/${name}.service" ]]; then
+        runlog "systemctl restart '$name'" || logline "Could not restart $name after writing MGMT_TOKEN"
     fi
 
     # ── Record the installed app ─────────────────────────────────────────────

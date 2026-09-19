@@ -189,6 +189,7 @@ certificate (for the droplet's IP) under `/opt/p5agent/certs`.
 | `setup.log` | data dir | Live install log; served by `/progress`. |
 | `installed_apps.json` | data dir | Installed apps (`name`, `product-name`, `path`, `port`, `dependencies`); served by `/apps`. |
 | `p5agent-restart-apps.sh` | `/etc/letsencrypt/renewal-hooks/deploy` | Restarts every installed app after a certificate renewal; written by `certs.sh`. |
+| `MGMT_TOKEN` | `/etc/<name>.env` | The agent's own token, handed to each installed app at install so a panel can authenticate to the app's management endpoints. |
 | `certs.log` | data dir | The running (or last) certificate run's output; served by `/certs-log`. |
 | `certs_status.json` | data dir | That run's domain and start time. Its log's final marker line is what "finished" means. |
 
