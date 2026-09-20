@@ -22,14 +22,17 @@ root systemd service on port 5005 and exposes:
                       (systemctl is-active) and "backup" (a rollback is possible)
     POST /app         one installed app's lifecycle, via app_ops.sh — restricted to
                       P5AGENT_ALLOW_IP:
-                      {"op": start|stop|backup|rollback|uninstall, "name": ...,
-                       "drop_db": bool (uninstall)} -> {returncode, output}
+                      {"op": start|stop|backup|update|rollback|uninstall, "name": ...,
+                       "drop_db": bool (uninstall)} -> {returncode, output};
+                      update runs in the background -> {"status": "started"}
+    GET  /app-log     the current (or last) app update:
+                      {name, started_at, log, finished, returncode} — {} if none
     GET  /info        the upplet itself: OS, kernel, uptime, memory, disk, this
                       agent's commit, installed versions of the supported
                       dependencies, and the firewall's rules
 
-All endpoints except `/` require the shared secret token. `/command` is the only
-one restricted by source IP.
+All endpoints except `/` require the shared secret token. `/command` and `/app`
+are also restricted by source IP.
 
 Configuration is read from the environment (see /etc/p5agent.env):
 
@@ -102,7 +105,12 @@ SETUP_LOG = os.path.join(DATA_DIR, "setup.log")
 INSTALLED_APPS = os.path.join(DATA_DIR, "installed_apps.json")
 APPS_DIR = os.environ.get("P5AGENT_APPS_DIR", "/opt")      # where install_app.sh puts apps
 APP_OPS_SCRIPT = os.path.join(APP_DIR, "app_ops.sh")
-APP_OPS = ("start", "stop", "backup", "rollback", "uninstall")
+APP_OPS = ("start", "stop", "backup", "update", "rollback", "uninstall")
+# An update is a job like a certificate run: a rebuild can take far longer than
+# a request may stay open, so /app starts it and /app-log follows it.
+APP_UPDATE_LOG = os.path.join(DATA_DIR, "app_update.log")
+APP_UPDATE_STATUS = os.path.join(DATA_DIR, "app_update_status.json")
+APP_UPDATE_DONE = "[p5agent] update finished rc="
 # The install lock/status record, written the moment /install-app accepts a
 # request: {"app": <name>, "started_at": <unix ts>}. While it exists no second
 # install is accepted. install_app.sh removes it right after logging the
@@ -131,30 +139,45 @@ def run(cmd, cwd=None):
         return 1, "[p5agent] failed to run %r: %s\n" % (cmd, exc)
 
 
-def certs_status():
-    """What the last certificate run is doing, or {} when there has never been
-    one. The log carries the answer: the runner appends a completion marker as
-    its final act, so its absence means the job is still going."""
-    raw = read_file(CERTS_STATUS)
+def job_status(status_file, log_file, done_marker):
+    """What the last background job (a certificate run, an app update) is doing,
+    or {} when there has never been one. The log carries the answer: the runner
+    appends a completion marker as its final act, so its absence means the job
+    is still going."""
+    raw = read_file(status_file)
     if not raw:
         return {}
     try:
         status = json.loads(raw)
     except ValueError:
         return {}
-    log = read_file(CERTS_LOG) or ""
+    log = read_file(log_file) or ""
     status["log"] = log
-    marker = log.rfind(CERTS_DONE)
+    marker = log.rfind(done_marker)
     if marker == -1:
         status["finished"] = False
         status["returncode"] = None
     else:
         status["finished"] = True
-        tail = log[marker + len(CERTS_DONE):].strip().split()
+        tail = log[marker + len(done_marker):].strip().split()
         try:
             status["returncode"] = int(tail[0]) if tail else None
         except ValueError:
             status["returncode"] = None
+    return status
+
+
+def certs_status():
+    return job_status(CERTS_STATUS, CERTS_LOG, CERTS_DONE)
+
+
+def app_update_status():
+    """As certs_status, with the completion marker left out of the log: the
+    update's own last line already says how it went."""
+    status = job_status(APP_UPDATE_STATUS, APP_UPDATE_LOG, APP_UPDATE_DONE)
+    if status.get("finished"):
+        log = status["log"]
+        status["log"] = log[:log.rfind(APP_UPDATE_DONE)].rstrip("\n") + "\n"
     return status
 
 
@@ -476,8 +499,10 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch()
 
     ROUTES = ("/update", "/command", "/install-app", "/progress",
-              "/supported", "/apps", "/certs", "/certs-log", "/info", "/app")
-    IP_RESTRICTED = ("/command", "/app")
+              "/supported", "/apps", "/certs", "/certs-log", "/info", "/app",
+              "/app-log")
+    # TEMPORARY: /app is open to any source IP for now — restore ("/command", "/app").
+    IP_RESTRICTED = ("/command",)
 
     def _dispatch(self):
         path = self._path()
@@ -505,6 +530,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/certs-log": self._do_certs_log,
                 "/info": self._do_info,
                 "/app": self._do_app,
+                "/app-log": self._do_app_log,
             }[path]()
         except Exception as exc:  # noqa: BLE001 - never leak a traceback as 500 HTML
             try:
@@ -682,11 +708,45 @@ class Handler(BaseHTTPRequestHandler):
         current = install_status()
         if current and not current.get("completed") and current.get("app") == name:
             return self._send(409, {"error": "%s is being installed" % name})
+        updating = app_update_status()
+        if updating and not updating.get("finished"):
+            if op == "update" or updating.get("name") == name:
+                return self._send(409, {"error": "%s is being updated" % updating.get("name")})
+        if op == "update":
+            return self._start_app_update(name)
         cmd = ["bash", APP_OPS_SCRIPT, op, name]
         if op == "uninstall" and req.get("drop_db") is True:
             cmd.append("--drop-db")
         rc, out = run(cmd)
         return self._send(200 if rc == 0 else 500, {"returncode": rc, "output": out})
+
+    def _start_app_update(self, name):
+        """Launch `app_ops.sh update <name>` detached and return at once;
+        /app-log follows it."""
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(APP_UPDATE_LOG, "w") as fh:
+            fh.write("")
+        with open(APP_UPDATE_STATUS, "w") as fh:
+            json.dump({"name": name, "started_at": int(time.time())}, fh)
+        # The runner appends the completion marker whatever the script does.
+        runner = 'exec >>"$1" 2>&1; bash "$2" update "$3"; printf "\\n%s%s\\n" "$4" "$?"'
+        try:
+            subprocess.Popen(
+                ["bash", "-c", runner, "p5agent-app-update",
+                 APP_UPDATE_LOG, APP_OPS_SCRIPT, name, APP_UPDATE_DONE],
+                cwd=APP_DIR,
+                env=dict(os.environ, HOME="/root", DEBIAN_FRONTEND="noninteractive"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,   # survive the agent and this request
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._send(500, {"error": "failed to start the update", "detail": str(exc)})
+        return self._send(200, {"status": "started", "name": name})
+
+    def _do_app_log(self):
+        """The current (or last) app update: {name, log, finished, returncode}."""
+        return self._send(200, app_update_status())
 
     def _do_info(self):
         """Describe the upplet: system, this agent, packages, firewall."""

@@ -18,7 +18,8 @@ nothing to install. The idle process uses roughly 12–18 MB of RAM.
 | GET        | `/progress`    | yes  | any        | The live install log (`setup.log`). Empty when nothing is installing. Poll it (~every 5s) to follow an install. |
 | GET        | `/supported`   | yes  | any        | The `supported_deps.json` registry of installable dependencies. |
 | GET        | `/apps`        | yes  | any        | The `installed_apps.json` list of installed apps, each with `service` (its `systemctl is-active` state) and `backup` (whether `<apps dir>/<name>_backup` exists). |
-| POST       | `/app`         | yes  | restricted | Run an operation on one installed app through `app_ops.sh`: `start`, `stop`, `backup`, `rollback` or `uninstall`. Answers when it is done. |
+| POST       | `/app`         | yes  | restricted | Run an operation on one installed app through `app_ops.sh`: `start`, `stop`, `backup`, `update`, `rollback` or `uninstall`. Answers when it is done — except `update`, which runs in the background. |
+| GET        | `/app-log`     | yes  | any        | The current (or last) app update: `{name, started_at, log, finished, returncode}`. Poll it (~every 2s) to follow one. |
 | POST       | `/certs`       | yes  | any        | Start a Let's Encrypt run for a domain: obtain or renew, point every installed app at it, restart them. Returns once the job is spawned. |
 | GET        | `/certs-log`   | yes  | any        | The current (or last) certificate run: `{domain, log, finished, returncode}`. Poll it (~every 2s) to follow one. |
 | GET        | `/info`        | yes  | any        | The upplet itself: OS, kernel, arch, uptime, memory, disk, this agent's commit, installed versions of the supported dependencies, and the firewall's rules. |
@@ -51,15 +52,18 @@ curl -X POST "https://<ip>:5005/command" \
 Takes `{"op": "<op>", "name": "<app>"}` (plus `"drop_db": true` for an
 uninstall that should also delete the app's database) and runs
 `app_ops.sh <op> <name> [--drop-db]`. Responds `{returncode, output}` — 200 on
-success, 500 on failure — or 409 while that app is being installed. Like
+success, 500 on failure — or 409 while that app is being installed or updated.
+`update` instead starts in the background and answers `{"status": "started"}`
+at once (409 while another update is running); follow it with `/app-log`. Like
 `/command`, it is restricted to `P5AGENT_ALLOW_IP` (`403` from any other source IP).
 
 | Op | What it does |
 |----|--------------|
 | `start` / `stop` | `systemctl start <name>` / `systemctl stop <name>`. |
+| `update` | Backs the app up (as `backup`), then updates it. When the app's folder has its own `update.sh`, that runs (with `P5AGENT=1`) and does the whole job. Otherwise the standard update: the new code — `git fetch` + reset of the app's branch (a private repo's token is in the remote URL the install cloned with), or a fresh copy of a demo — then the install's build again: the repo's `setup.sh`/`install.sh`, else `app_support/install_<type>_app.sh`. A failure leaves the backup for Rollback Update. |
 | `backup` | Copies `<apps dir>/<name>` to `<apps dir>/<name>_backup`. An existing backup is first renamed to `<name>_backup_deleted` and deleted only once the new copy succeeds; if the copy fails, it is renamed back. The dashboard runs it before every update. |
 | `rollback` | Needs `<name>_backup`: stops the app, deletes `<name>`, renames `<name>_backup` to `<name>` and starts it. |
-| `uninstall` | Stops and removes the service, the app's folder and all its `<name>_backup*` folders, its sudoers file, the user, its firewall port (unless another app, SSH or the agent uses it) and its `installed_apps.json` entry. The database and `/etc/<name>.env` are kept — so a reinstall picks them up — unless `drop_db` is set. |
+| `uninstall` | Stops and removes the service, the app's folder and all its `<name>_backup*` folders (every deleted folder is logged), its sudoers file, the user, its firewall port (unless another app, SSH or the agent uses it) and its `installed_apps.json` entry. The database and `/etc/<name>.env` are kept — so a reinstall picks them up — unless `drop_db` is set. |
 
 ```bash
 curl -X POST "https://<ip>:5005/app" -H "Authorization: Bearer $TOKEN" \
@@ -215,13 +219,15 @@ certificate (for the droplet's IP) under `/opt/p5agent/certs`.
 | `agent.py` | repo | The HTTP agent. |
 | `update.sh` | repo | Restarts the service to apply a pulled update. |
 | `install_app.sh` | repo | Backgrounded app installer (deps + clone + setup). |
-| `app_ops.sh` | repo | Start, stop, back up, roll back or uninstall one installed app; run by `/app`. |
+| `app_support/common.sh` | repo | Helpers shared by `install_app.sh` and `app_ops.sh` (`create_service`). |
+| `app_ops.sh` | repo | Start, stop, back up, update, roll back or uninstall one installed app; run by `/app`. |
 | `install_swift.sh` | repo | Dedicated Swift installer; referenced by the `swift` entry's `install-cmd`. |
 | `app_support/install_<type>_app.sh` | repo | Standard minimal builder per app type (swift, nodejs, python, ruby, go, php, java), used when a cloned repo has no `setup.sh`/`install.sh`. It builds the app and creates its systemd service. |
 | `app_support/wire_<dbtype>.sh` | repo | Per-database-type wiring (postgresql, mysql, mariadb, sqlite): creates the app's database/user and writes `/etc/<name>.env` (loaded by the service). Used for repos with no installer of their own. |
 | `supported_deps.json` | repo | Registry of installable dependencies: `name`, `display-name`, `icon-url`, and a `package-manager` (+ optional `package`) or `install-cmd`. Served by `/supported`. |
 | `setup.log` | data dir | Live install log; served by `/progress`. |
-| `installed_apps.json` | data dir | Installed apps (`name`, `product-name`, `path`, `port`, `dependencies`); served by `/apps`. |
+| `installed_apps.json` | data dir | Installed apps (`name`, `product-name`, `path`, `port`, `dependencies`, and for updates `app-type`, `app-cmd`, `demo`, `source`); served by `/apps`. |
+| `app_update.log`, `app_update_status.json` | data dir | The current (or last) app update; served by `/app-log`. |
 | `p5agent-restart-apps.sh` | `/etc/letsencrypt/renewal-hooks/deploy` | Restarts every installed app after a certificate renewal; written by `certs.sh`. |
 | `MGMT_TOKEN` | `/etc/<name>.env` | The agent's own token, handed to each installed app at install so a panel can authenticate to the app's management endpoints. |
 | `certs.log` | data dir | The running (or last) certificate run's output; served by `/certs-log`. |

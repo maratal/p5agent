@@ -5,10 +5,15 @@
 #
 #   start | stop   systemctl start/stop the app's service
 #   backup         copy the app's folder (/opt/<name>) to /opt/<name>_backup,
-#                  replacing any older backup — taken before an update
+#                  replacing any older backup
+#   update         back up, then update: the app's own refresh.sh + update.sh
+#                  when it has them; otherwise fetch the new code (git, or a
+#                  fresh copy of a demo) and rebuild it the way it was
+#                  installed — its repo's setup.sh/install.sh, else the
+#                  standard builder for its type
 #   rollback       put /opt/<name>_backup back in place of /opt/<name> and
 #                  start the app again (the backup is used up)
-#   uninstall      stop and remove the app: its service, folder and backup,
+#   uninstall      stop and remove the app: its service, folder and backups,
 #                  certificate dir, sudoers entry, user, firewall port and its
 #                  installed_apps.json entry. The database and /etc/<name>.env
 #                  (which holds its credentials) stay unless --drop-db is given,
@@ -18,6 +23,8 @@
 # Output is the transcript the dashboard shows; the exit code is the result.
 set -uo pipefail
 
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SUPPORT="$HERE/app_support"
 DATA_DIR="${P5AGENT_DATA_DIR:-/var/lib/p5agent}"
 APPS_DIR="${P5AGENT_APPS_DIR:-/opt}"
 INSTALLED="$DATA_DIR/installed_apps.json"
@@ -30,10 +37,12 @@ fail() { printf '\033[1;31m✗ %s\033[0m\n' "$*"; exit 1; }
 
 op="${1:-}"; name="${2:-}"; drop_db=""
 [[ "${3:-}" == "--drop-db" ]] && drop_db=1
-[[ -n "$op" && -n "$name" ]] || fail "usage: app_ops.sh <start|stop|backup|rollback|uninstall> <name> [--drop-db]"
+[[ -n "$op" && -n "$name" ]] || fail "usage: app_ops.sh <start|stop|backup|update|rollback|uninstall> <name> [--drop-db]"
 
-# The app's installed_apps.json entry, as "port<TAB>db-type" — or nothing when
-# there is no such app. The name is checked here, before any path is built from it.
+# The app's installed_apps.json entry, as port, db-type, app-dir, app-type,
+# app-cmd, demo and source separated by US (\x1f: tabs would merge empty
+# fields) — or nothing when there is no such app. The name is checked here, before any path is built from it. Apps
+# installed before the last four fields were recorded have them empty.
 entry=$(python3 - "$INSTALLED" "$name" <<'PY'
 import json, sys
 try:
@@ -44,31 +53,31 @@ for a in apps:
     if a.get("name") == sys.argv[2]:
         deps = [str(d).split()[0].lower() for d in (a.get("dependencies") or [])]
         db = next((d for d in deps if d in ("postgresql", "mysql", "mariadb", "sqlite")), "")
-        print("%s\t%s" % (a.get("port", ""), db))
+        print("\x1f".join(str(v) for v in (
+            a.get("port", ""), db, a.get("path", ""), a.get("app-type", ""),
+            a.get("app-cmd", ""), "1" if a.get("demo") else "", a.get("source", ""))))
         break
 PY
 )
 [[ -n "$entry" ]] || fail "No installed app named '$name'"
-IFS=$'\t' read -r port db_type <<< "$entry"
+IFS=$'\x1f' read -r port db_type app_dir app_type app_cmd demo source <<< "$entry"
 
 target="$APPS_DIR/$name"
 backup="${target}_backup"
 deleted="${backup}_deleted"
+app_dir="${app_dir:-$target}"   # the app's own folder: the repo root or a subfolder of it
 
-case "$op" in
-start|stop)
-    log "systemctl $op $name"
-    systemctl "$op" "$name" || fail "Could not $op $name (journalctl -u $name)"
-    state=$(systemctl is-active "$name" 2>/dev/null || true)
-    ok "$name is ${state:-unknown}"
-    ;;
+remove_dir() {  # remove_dir <dir> — delete it and say so
+    [[ -d "$1" ]] || return 0
+    if rm -rf "$1"; then ok "Deleted $1"; else warn "Could not delete $1"; fi
+}
 
-backup)
+# Copy the app's folder to <app>_backup. The previous backup is set aside, not
+# deleted, until the new one is complete: a failed copy puts it back, so there
+# is always one to roll back to. A run cut short can leave only
+# <app>_backup_deleted — then it is the previous backup and is taken back first.
+make_backup() {
     [[ -d "$target" ]] || fail "$target not found"
-    # The previous backup is set aside, not deleted, until the new one is
-    # complete: a failed copy puts it back, so there is always one to roll
-    # back to. A run cut short can leave only <app>_backup_deleted — then it is
-    # the previous backup and is taken back first.
     if [[ -d "$deleted" && ! -d "$backup" ]]; then
         mv "$deleted" "$backup"
     fi
@@ -88,6 +97,108 @@ backup)
         ok "Previous backup deleted"
     fi
     ok "Backed up to $backup ($(du -sh "$backup" 2>/dev/null | cut -f1))"
+}
+
+# The app type, for an app installed before it was recorded: from the files
+# that mark each kind of project.
+guess_app_type() {
+    local d="$1"
+    if   [[ -f "$d/Package.swift" ]]; then echo swift
+    elif [[ -f "$d/package.json" ]]; then echo nodejs
+    elif [[ -f "$d/go.mod" ]] || compgen -G "$d/*.go" >/dev/null; then echo go
+    elif [[ -f "$d/Gemfile" ]] || compgen -G "$d/*.rb" >/dev/null; then echo ruby
+    elif [[ -f "$d/composer.json" ]] || compgen -G "$d/*.php" >/dev/null; then echo php
+    elif [[ -f "$d/pom.xml" || -f "$d/build.gradle" ]] || compgen -G "$d/*.java" >/dev/null; then echo java
+    elif [[ -f "$d/requirements.txt" || -f "$d/pyproject.toml" ]] || compgen -G "$d/*.py" >/dev/null; then echo python
+    fi
+}
+
+# One setting of the app's existing systemd unit (User, Wants, ExecStart).
+unit_value() {
+    grep -oP "^$1=\K.*" "/etc/systemd/system/${name}.service" 2>/dev/null | head -1
+}
+
+case "$op" in
+start|stop)
+    log "systemctl $op $name"
+    systemctl "$op" "$name" || fail "Could not $op $name (journalctl -u $name)"
+    state=$(systemctl is-active "$name" 2>/dev/null || true)
+    ok "$name is ${state:-unknown}"
+    ;;
+
+backup)
+    make_backup
+    ;;
+
+update)
+    # Refuse before touching anything when there is nothing to update from.
+    if [[ ! -f "$app_dir/update.sh" ]]; then
+        if [[ -n "$demo" ]]; then
+            [[ -n "$source" && "/$source/" != *"/../"* && -d "$HERE/$source" ]] \
+                || fail "Cannot tell which demo $name was copied from — reinstall it once to make it updatable"
+        elif [[ ! -d "$target/.git" ]]; then
+            # A demo installed before demos were recorded as such lands here too.
+            fail "$target is neither a git checkout nor a known demo — reinstall $name once to make it updatable"
+        fi
+    fi
+
+    make_backup
+
+    # The app's own scripts come first: they know how the app is built. Its
+    # refresh.sh (fetch the new code) runs before its update.sh, so the update
+    # that runs is the new one — bash reads a script as it goes, and an
+    # update.sh that fetches over itself is rewritten mid-read.
+    if [[ -f "$app_dir/update.sh" ]]; then
+        if [[ -f "$app_dir/refresh.sh" ]]; then
+            log "Running the app's own refresh.sh"
+            ( cd "$app_dir" && P5AGENT=1 bash ./refresh.sh ) \
+                || fail "refresh.sh failed — nothing has been changed"
+        fi
+        log "Running the app's own update.sh"
+        ( cd "$app_dir" && P5AGENT=1 bash ./update.sh ) \
+            || fail "update.sh failed — Rollback Update restores the previous version"
+        ok "$name updated"
+        exit 0
+    fi
+
+    # Otherwise the standard update: the new code, then the install's build.
+    if [[ -n "$demo" ]]; then
+        log "Copying demo $source from p5agent"
+        find "$target" -mindepth 1 -delete && cp -a "$HERE/$source/." "$target/" \
+            || fail "Copying the demo failed — Rollback Update restores the previous version"
+    else
+        git_() { git -c safe.directory="$target" -C "$target" "$@"; }
+        branch=$(git_ symbolic-ref --short -q HEAD) \
+            || fail "$name is pinned to $(git_ describe --tags 2>/dev/null || echo a fixed commit) — there is no branch to fetch newer code from"
+        log "Fetching the latest $branch"
+        git_ fetch --depth 1 origin "$branch" && git_ reset --hard FETCH_HEAD \
+            || fail "Fetching $branch failed"
+        ok "Now at $(git_ log -1 --pretty='%h %s')"
+    fi
+
+    setup=""
+    for candidate in setup.sh install.sh; do
+        [[ -f "$app_dir/$candidate" ]] && { setup="$app_dir/$candidate"; break; }
+    done
+    if [[ -n "$setup" ]]; then
+        log "Running ${setup##*/}"
+        ( cd "$app_dir" && P5AGENT=1 bash "$setup" ) \
+            || fail "${setup##*/} failed — Rollback Update restores the previous version"
+    else
+        app_type="${app_type:-$(guess_app_type "$app_dir")}"
+        builder="$SUPPORT/install_${app_type}_app.sh"
+        [[ -n "$app_type" && -f "$builder" ]] || fail "No builder for app type '${app_type:-?}'"
+        app_cmd="${app_cmd:-$(unit_value ExecStart | sed 's|^/usr/bin/env ||')}"
+        # shellcheck source=app_support/common.sh
+        source "$SUPPORT/common.sh"
+        log "Rebuilding with install_${app_type}_app.sh"
+        ( cd "$app_dir" && APP_DIR="$app_dir" APP_NAME="$name" APP_PORT="$port" APP_CMD="$app_cmd" \
+            APP_SERVICES="$(unit_value Wants)" APP_USER="$(unit_value User)" bash "$builder" ) \
+            || fail "The rebuild failed — Rollback Update restores the previous version"
+    fi
+    systemctl restart "$name" 2>/dev/null || true
+    state=$(systemctl is-active "$name" 2>/dev/null || true)
+    ok "$name updated — its service is ${state:-unknown}"
     ;;
 
 rollback)
@@ -110,8 +221,7 @@ uninstall)
     systemctl daemon-reload
     systemctl reset-failed "$name" 2>/dev/null || true
 
-    log "Removing $target"
-    rm -rf "$target"
+    remove_dir "$target"
     # Every backup folder it left: <app>_backup, <app>_backup_deleted and any
     # other <app>_backup* — but never the folder of another installed app whose
     # name happens to start the same way.
@@ -127,9 +237,9 @@ PY
     for dir in "$target"_backup*; do
         [[ -d "$dir" ]] || continue
         grep -qxF "$(basename "$dir")" <<< "$others" && continue
-        rm -rf "$dir" && ok "Removed $dir"
+        remove_dir "$dir"
     done
-    rm -rf "/etc/${name}"                 # its certificate dir
+    remove_dir "/etc/${name}"             # its certificate dir
     rm -f "/etc/sudoers.d/${name}"
 
     # The port, unless another app uses it too — or it is SSH or the agent's.
@@ -161,7 +271,7 @@ PY
                 mysql -e "DROP DATABASE IF EXISTS \`$name\`; DROP USER IF EXISTS '$name'@'localhost';" \
                     && ok "Database dropped" || warn "Could not drop the database" ;;
             sqlite)
-                rm -rf "/var/lib/${name}" && ok "SQLite data removed" ;;
+                remove_dir "/var/lib/${name}" ;;
             *)
                 ok "No database to drop" ;;
         esac
