@@ -18,7 +18,12 @@ root systemd service on port 5005 and exposes:
     GET  /progress    current install status as JSON:
                       { "app", "started_at", "log"?, "completed"? } — {} when idle
     GET  /supported   the supported_deps.json registry
-    GET  /apps        the installed_apps.json list
+    GET  /apps        the installed_apps.json list, each app with "service"
+                      (systemctl is-active) and "backup" (a rollback is possible)
+    POST /app         one installed app's lifecycle, via app_ops.sh — restricted to
+                      P5AGENT_ALLOW_IP:
+                      {"op": start|stop|backup|rollback|uninstall, "name": ...,
+                       "drop_db": bool (uninstall)} -> {returncode, output}
     GET  /info        the upplet itself: OS, kernel, uptime, memory, disk, this
                       agent's commit, installed versions of the supported
                       dependencies, and the firewall's rules
@@ -29,7 +34,7 @@ one restricted by source IP.
 Configuration is read from the environment (see /etc/p5agent.env):
 
     P5AGENT_TOKEN     shared secret required on every privileged request
-    P5AGENT_ALLOW_IP  comma-separated client IPs allowed to call /command (default: 127.0.0.1)
+    P5AGENT_ALLOW_IP  comma-separated client IPs allowed to call /command and /app (default: 127.0.0.1)
     P5AGENT_PORT      listen port                        (default: 5005)
     P5AGENT_DATA_DIR  runtime state dir                  (default: /var/lib/p5agent)
     P5AGENT_TMP_DIR   where command scripts are written  (default: /tmp)
@@ -95,6 +100,9 @@ DOMAIN_RE = re.compile(
 SUPPORTED_DEPS = os.path.join(APP_DIR, "supported_deps.json")
 SETUP_LOG = os.path.join(DATA_DIR, "setup.log")
 INSTALLED_APPS = os.path.join(DATA_DIR, "installed_apps.json")
+APPS_DIR = os.environ.get("P5AGENT_APPS_DIR", "/opt")      # where install_app.sh puts apps
+APP_OPS_SCRIPT = os.path.join(APP_DIR, "app_ops.sh")
+APP_OPS = ("start", "stop", "backup", "rollback", "uninstall")
 # The install lock/status record, written the moment /install-app accepts a
 # request: {"app": <name>, "started_at": <unix ts>}. While it exists no second
 # install is accepted. install_app.sh removes it right after logging the
@@ -468,7 +476,8 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch()
 
     ROUTES = ("/update", "/command", "/install-app", "/progress",
-              "/supported", "/apps", "/certs", "/certs-log", "/info")
+              "/supported", "/apps", "/certs", "/certs-log", "/info", "/app")
+    IP_RESTRICTED = ("/command", "/app")
 
     def _dispatch(self):
         path = self._path()
@@ -478,12 +487,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"error": "not found", "path": path})
         if not self._authorized():
             return self._send(401, {"error": "unauthorized"})
-        # /command is the only endpoint locked to the allowed source IP.
-        if path == "/command" and not self._ip_allowed():
+        # Running commands and app operations are locked to the allowed source IP.
+        if path in self.IP_RESTRICTED and not self._ip_allowed():
             def _mask_ip(ip):
                 return ip[:2] + "*" * max(0, len(ip) - 4) + ip[-2:] if len(ip) > 4 else ip
             return self._send(403, {"error": "forbidden",
-                                    "detail": "/command is restricted to %s" % ", ".join(_mask_ip(ip) for ip in sorted(ALLOW_IP))})
+                                    "detail": "%s is restricted to %s" % (path, ", ".join(_mask_ip(ip) for ip in sorted(ALLOW_IP)))})
         try:
             return {
                 "/update": self._do_update,
@@ -495,6 +504,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/certs": self._do_certs,
                 "/certs-log": self._do_certs_log,
                 "/info": self._do_info,
+                "/app": self._do_app,
             }[path]()
         except Exception as exc:  # noqa: BLE001 - never leak a traceback as 500 HTML
             try:
@@ -641,8 +651,42 @@ class Handler(BaseHTTPRequestHandler):
         return self._send_raw(200, read_file(SUPPORTED_DEPS) or "[]", "application/json")
 
     def _do_apps(self):
-        """Return the installed apps list."""
-        return self._send_raw(200, read_file(INSTALLED_APPS) or "[]", "application/json")
+        """Return the installed apps list, each with its service state and
+        whether a backup to roll back to exists."""
+        try:
+            apps = json.loads(read_file(INSTALLED_APPS) or "[]")
+        except ValueError:
+            apps = []
+        for app in apps if isinstance(apps, list) else []:
+            name = str(app.get("name") or "")
+            if not name:
+                continue
+            _, state = run(["systemctl", "is-active", name])
+            app["service"] = state.strip() or "unknown"
+            app["backup"] = os.path.isdir(os.path.join(APPS_DIR, name + "_backup"))
+        return self._send(200, apps)
+
+    def _do_app(self):
+        """Run one lifecycle operation on one installed app (app_ops.sh checks
+        the name against installed_apps.json before touching anything)."""
+        try:
+            req = json.loads(self._body().decode("utf-8", "replace") or "{}")
+        except ValueError:
+            return self._send(400, {"error": "body must be JSON"})
+        op = str(req.get("op") or "")
+        name = str(req.get("name") or "")
+        if op not in APP_OPS:
+            return self._send(400, {"error": "op must be one of " + ", ".join(APP_OPS)})
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name):
+            return self._send(400, {"error": "a valid app name is required"})
+        current = install_status()
+        if current and not current.get("completed") and current.get("app") == name:
+            return self._send(409, {"error": "%s is being installed" % name})
+        cmd = ["bash", APP_OPS_SCRIPT, op, name]
+        if op == "uninstall" and req.get("drop_db") is True:
+            cmd.append("--drop-db")
+        rc, out = run(cmd)
+        return self._send(200 if rc == 0 else 500, {"returncode": rc, "output": out})
 
     def _do_info(self):
         """Describe the upplet: system, this agent, packages, firewall."""

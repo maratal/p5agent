@@ -9,18 +9,19 @@ nothing to install. The idle process uses roughly 12–18 MB of RAM.
 
 ## Endpoints
 
-| Method     | Path           | Auth | Source IP | Purpose |
-|------------|----------------|------|-----------|---------|
-| GET        | `/`            | no   | any       | Liveness probe. Returns `{"status":"ok"}`. |
-| GET / POST | `/update`      | yes  | any       | `git pull` this checkout, then run its `update.sh`. |
-| GET / POST | `/command`     | yes  | allowed IP | Save the request body to `/tmp/command_<dd_mm_yy_hh_mm_ss>.sh`, make it executable, and run it as **root**. |
-| POST       | `/install-app` | yes  | any       | Launch `install_app.sh` in the background to install an app + dependencies. Returns once the job is spawned. |
-| GET        | `/progress`    | yes  | any       | The live install log (`setup.log`). Empty when nothing is installing. Poll it (~every 5s) to follow an install. |
-| GET        | `/supported`   | yes  | any       | The `supported_deps.json` registry of installable dependencies. |
-| GET        | `/apps`        | yes  | any       | The `installed_apps.json` list of installed apps. |
-| POST       | `/certs`       | yes  | any       | Start a Let's Encrypt run for a domain: obtain or renew, point every installed app at it, restart them. Returns once the job is spawned. |
-| GET        | `/certs-log`   | yes  | any       | The current (or last) certificate run: `{domain, log, finished, returncode}`. Poll it (~every 2s) to follow one. |
-| GET        | `/info`        | yes  | any       | The upplet itself: OS, kernel, arch, uptime, memory, disk, this agent's commit, installed versions of the supported dependencies, and the firewall's rules. |
+| Method     | Path           | Auth | Source IP  | Purpose |
+|------------|----------------|------|------------|---------|
+| GET        | `/`            | no   | any        | Liveness probe. Returns `{"status":"ok"}`. |
+| GET / POST | `/update`      | yes  | any        | `git pull` this checkout, then run its `update.sh`. |
+| GET / POST | `/command`     | yes  | restricted | Save the request body to `/tmp/command_<dd_mm_yy_hh_mm_ss>.sh`, make it executable, and run it as **root**. |
+| POST       | `/install-app` | yes  | any        | Launch `install_app.sh` in the background to install an app + dependencies. Returns once the job is spawned. |
+| GET        | `/progress`    | yes  | any        | The live install log (`setup.log`). Empty when nothing is installing. Poll it (~every 5s) to follow an install. |
+| GET        | `/supported`   | yes  | any        | The `supported_deps.json` registry of installable dependencies. |
+| GET        | `/apps`        | yes  | any        | The `installed_apps.json` list of installed apps, each with `service` (its `systemctl is-active` state) and `backup` (whether `<apps dir>/<name>_backup` exists). |
+| POST       | `/app`         | yes  | restricted | Run an operation on one installed app through `app_ops.sh`: `start`, `stop`, `backup`, `rollback` or `uninstall`. Answers when it is done. |
+| POST       | `/certs`       | yes  | any        | Start a Let's Encrypt run for a domain: obtain or renew, point every installed app at it, restart them. Returns once the job is spawned. |
+| GET        | `/certs-log`   | yes  | any        | The current (or last) certificate run: `{domain, log, finished, returncode}`. Poll it (~every 2s) to follow one. |
+| GET        | `/info`        | yes  | any        | The upplet itself: OS, kernel, arch, uptime, memory, disk, this agent's commit, installed versions of the supported dependencies, and the firewall's rules. |
 
 ### `/update`
 
@@ -43,6 +44,26 @@ is restricted to `P5AGENT_ALLOW_IP` (returns `403` from any other source IP).
 curl -X POST "https://<ip>:5005/command" \
      -H "Authorization: Bearer $TOKEN" \
      --data-binary $'systemctl restart myapp\nsystemctl is-active myapp'
+```
+
+### `/app`
+
+Takes `{"op": "<op>", "name": "<app>"}` (plus `"drop_db": true` for an
+uninstall that should also delete the app's database) and runs
+`app_ops.sh <op> <name> [--drop-db]`. Responds `{returncode, output}` — 200 on
+success, 500 on failure — or 409 while that app is being installed. Like
+`/command`, it is restricted to `P5AGENT_ALLOW_IP` (`403` from any other source IP).
+
+| Op | What it does |
+|----|--------------|
+| `start` / `stop` | `systemctl start <name>` / `systemctl stop <name>`. |
+| `backup` | Copies `<apps dir>/<name>` to `<apps dir>/<name>_backup`. An existing backup is first renamed to `<name>_backup_deleted` and deleted only once the new copy succeeds; if the copy fails, it is renamed back. The dashboard runs it before every update. |
+| `rollback` | Needs `<name>_backup`: stops the app, deletes `<name>`, renames `<name>_backup` to `<name>` and starts it. |
+| `uninstall` | Stops and removes the service, the app's folder and all its `<name>_backup*` folders, its sudoers file, the user, its firewall port (unless another app, SSH or the agent uses it) and its `installed_apps.json` entry. The database and `/etc/<name>.env` are kept — so a reinstall picks them up — unless `drop_db` is set. |
+
+```bash
+curl -X POST "https://<ip>:5005/app" -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" -d '{"op": "stop", "name": "chat"}'
 ```
 
 ### `/certs`
@@ -162,7 +183,7 @@ Authorization: Bearer <TOKEN>
 ```
 
 The token is compared in constant time. If no token is configured, the agent
-rejects every privileged request with `401`. `/command` additionally requires
+rejects every privileged request with `401`. `/command` and `/app` additionally require
 the request to originate from `P5AGENT_ALLOW_IP`.
 
 ## Configuration
@@ -173,10 +194,11 @@ to `/etc/p5agent.env`, mode 600):
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `P5AGENT_TOKEN` | *(empty)* | Shared secret required on privileged endpoints. |
-| `P5AGENT_ALLOW_IP` | `127.0.0.1` | Client IP allowed to call `/command`. |
+| `P5AGENT_ALLOW_IP` | `127.0.0.1` | Client IPs allowed to call `/command` and `/app`. |
 | `P5AGENT_PORT` | `5005` | Listen port. |
 | `P5AGENT_BIND` | `0.0.0.0` | Listen address. |
 | `P5AGENT_DATA_DIR` | `/var/lib/p5agent` | Runtime state: `setup.log`, `installed_apps.json`. |
+| `P5AGENT_APPS_DIR` | `/opt` | Where installed apps live (`<dir>/<name>`, and `<dir>/<name>_backup`). |
 | `P5AGENT_TMP_DIR` | `/tmp` | Where `/command` scripts and archived install logs go. |
 | `P5AGENT_TIMEOUT` | `1800` | Max seconds any command may run. |
 | `P5AGENT_TLS_CERT` | *(empty)* | TLS certificate (PEM). If unset, install.sh generates a self-signed one. |
@@ -193,6 +215,7 @@ certificate (for the droplet's IP) under `/opt/p5agent/certs`.
 | `agent.py` | repo | The HTTP agent. |
 | `update.sh` | repo | Restarts the service to apply a pulled update. |
 | `install_app.sh` | repo | Backgrounded app installer (deps + clone + setup). |
+| `app_ops.sh` | repo | Start, stop, back up, roll back or uninstall one installed app; run by `/app`. |
 | `install_swift.sh` | repo | Dedicated Swift installer; referenced by the `swift` entry's `install-cmd`. |
 | `app_support/install_<type>_app.sh` | repo | Standard minimal builder per app type (swift, nodejs, python, ruby, go, php, java), used when a cloned repo has no `setup.sh`/`install.sh`. It builds the app and creates its systemd service. |
 | `app_support/wire_<dbtype>.sh` | repo | Per-database-type wiring (postgresql, mysql, mariadb, sqlite): creates the app's database/user and writes `/etc/<name>.env` (loaded by the service). Used for repos with no installer of their own. |
@@ -273,7 +296,7 @@ in:
 - a port per installed app — re-opened on every run from the `port` of each
   entry in `installed_apps.json`.
 
-Every other port is closed. (`P5AGENT_ALLOW_IP` only governs who may call `/command`)
+Every other port is closed. (`P5AGENT_ALLOW_IP` only governs who may call `/command` and `/app`)
 
 ```bash
 systemctl status p5agent     # service state
@@ -289,4 +312,4 @@ boundary are what protect it:
   commands are never sent in cleartext.
 - Keep `P5AGENT_TOKEN` long and secret; it is the entire access control.
 - Set `P5AGENT_ALLOW_IP` to the dashboard's IP so `/command` (raw root commands)
-  is reachable only from there; it defaults to localhost.
+  and `/app` (app start/stop/rollback/uninstall) are reachable only from there; it defaults to localhost.
