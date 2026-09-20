@@ -385,6 +385,11 @@ PY
     logline "Recorded $name in installed_apps.json"
 fi
 
+# ── What is running now ──────────────────────────────────────────────────────
+if [[ -f "/etc/systemd/system/${name}.service" ]]; then
+    app_version_line "$name" "$port" | stamp
+fi
+
 # ── Done ─────────────────────────────────────────────────────────────────────
 # This MUST be the log's last line: it is the agent's completion marker —
 # /progress reports completed=true when the log ends with it. Logging it

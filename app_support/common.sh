@@ -60,3 +60,36 @@ EOF
     systemctl restart "${APP_NAME}" || echo "service ${APP_NAME} failed to start (journalctl -u ${APP_NAME})"
 }
 export -f create_service
+
+# Ask the app itself what it is now running: its /api/info, which every app the
+# dashboard shows serves (productName, version). Printed at the end of an
+# install, an update and a rollback, so the log says which version ended up
+# running rather than only that something restarted. The service has just been
+# (re)started, so it is given a few seconds to come up. Prints the line and
+# returns 0 when the app answered, 1 when it did not — a silent app is not a
+# failed operation, only an unknown version, and the caller marks it as such.
+app_version_line() {  # app_version_line <name> <port>
+    local name="$1" port="${2:-}" body="" scheme
+    [[ "$port" =~ ^[0-9]+$ ]] || { echo "No port on record for $name — cannot ask it for its version"; return 1; }
+    command -v curl >/dev/null 2>&1 || { echo "curl is not installed — cannot ask $name for its version"; return 1; }
+    local attempt
+    for (( attempt = 0; attempt < 10; attempt++ )); do
+        for scheme in https http; do
+            body=$(curl -fsSk --max-time 3 "$scheme://127.0.0.1:$port/api/info" 2>/dev/null) && [[ -n "$body" ]] && break 2
+        done
+        body=""
+        sleep 1
+    done
+    [[ -n "$body" ]] || { echo "$name did not answer /api/info — its version is unknown"; return 1; }
+    python3 - "$name" "$body" <<'PY'
+import json, sys
+try:
+    info = json.loads(sys.argv[2])
+except Exception:
+    info = {}
+product = info.get("productName") or sys.argv[1]
+version = info.get("version")
+print("%s %s is running" % (product, version) if version else "%s is running (it reports no version)" % product)
+PY
+}
+export -f app_version_line

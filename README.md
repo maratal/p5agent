@@ -60,9 +60,9 @@ at once (409 while another update is running); follow it with `/app-log`. Like
 | Op | What it does |
 |----|--------------|
 | `start` / `stop` | `systemctl start <name>` / `systemctl stop <name>`. |
-| `update` | Backs the app up (as `backup`), then updates it. When the app's folder has its own `update.sh`, that runs (with `P5AGENT=1`) and does the whole job. Otherwise the standard update: the new code — `git fetch` + reset of the app's branch (a private repo's token is in the remote URL the install cloned with), or a fresh copy of a demo — then the install's build again: the repo's `setup.sh`/`install.sh`, else `app_support/install_<type>_app.sh`. A failure leaves the backup for Rollback Update. |
+| `update` | Backs the app up (as `backup`), then updates it. When the app's folder has its own `update.sh`, that runs (with `P5AGENT=1`) and does the whole job. Otherwise the standard update: the new code — `git fetch` + reset of the app's branch (a private repo's token is in the remote URL the install cloned with), or a fresh copy of a demo — then the install's build again: the repo's `setup.sh`/`install.sh`, else `app_support/install_<type>_app.sh`. A failure leaves the backup for Rollback Update. Ends by asking the app's own `/api/info` what is running now and logging its version. |
 | `backup` | Copies `<apps dir>/<name>` to `<apps dir>/<name>_backup`. An existing backup is first renamed to `<name>_backup_deleted` and deleted only once the new copy succeeds; if the copy fails, it is renamed back. The dashboard runs it before every update. |
-| `rollback` | Needs `<name>_backup`: stops the app, deletes `<name>`, renames `<name>_backup` to `<name>` and starts it. |
+| `rollback` | Needs `<name>_backup`: stops the app, deletes `<name>`, renames `<name>_backup` to `<name>` and starts it, then logs the version its `/api/info` reports. |
 | `uninstall` | Stops and removes the service, the app's folder and all its `<name>_backup*` folders (every deleted folder is logged), its sudoers file, the user, its firewall port (unless another app, SSH or the agent uses it) and its `installed_apps.json` entry. The database and `/etc/<name>.env` are kept — so a reinstall picks them up — unless `drop_db` is set. |
 
 ```bash
@@ -219,7 +219,7 @@ certificate (for the droplet's IP) under `/opt/p5agent/certs`.
 | `agent.py` | repo | The HTTP agent. |
 | `update.sh` | repo | Restarts the service to apply a pulled update. |
 | `install_app.sh` | repo | Backgrounded app installer (deps + clone + setup). |
-| `app_support/common.sh` | repo | Helpers shared by `install_app.sh` and `app_ops.sh` (`create_service`). |
+| `app_support/common.sh` | repo | Helpers shared by `install_app.sh` and `app_ops.sh`: `create_service`, and `app_version_line` (asks the app's `/api/info` which version is running — logged at the end of an install, an update and a rollback). |
 | `app_ops.sh` | repo | Start, stop, back up, update, roll back or uninstall one installed app; run by `/app`. |
 | `install_swift.sh` | repo | Dedicated Swift installer; referenced by the `swift` entry's `install-cmd`. |
 | `app_support/install_<type>_app.sh` | repo | Standard minimal builder per app type (swift, nodejs, python, ruby, go, php, java), used when a cloned repo has no `setup.sh`/`install.sh`. It builds the app and creates its systemd service. |

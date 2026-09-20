@@ -30,6 +30,9 @@ APPS_DIR="${P5AGENT_APPS_DIR:-/opt}"
 INSTALLED="$DATA_DIR/installed_apps.json"
 AGENT_PORT="${P5AGENT_PORT:-5005}"
 
+# shellcheck source=app_support/common.sh
+source "$SUPPORT/common.sh"   # create_service (a rebuild) + app_version_line
+
 log()  { printf '\033[1;34m→ %s\033[0m\n' "$*"; }
 ok()   { printf '\033[1;32m✓ %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m! %s\033[0m\n' "$*"; }
@@ -66,6 +69,12 @@ target="$APPS_DIR/$name"
 backup="${target}_backup"
 deleted="${backup}_deleted"
 app_dir="${app_dir:-$target}"   # the app's own folder: the repo root or a subfolder of it
+
+# What the app reports as running now, at the end of an update or a rollback.
+report_version() {
+    local line
+    if line=$(app_version_line "$name" "$port"); then ok "$line"; else warn "$line"; fi
+}
 
 remove_dir() {  # remove_dir <dir> — delete it and say so
     [[ -d "$1" ]] || return 0
@@ -158,6 +167,7 @@ update)
         ( cd "$app_dir" && P5AGENT=1 bash ./update.sh ) \
             || fail "update.sh failed — Rollback Update restores the previous version"
         ok "$name updated"
+        report_version
         exit 0
     fi
 
@@ -189,8 +199,6 @@ update)
         builder="$SUPPORT/install_${app_type}_app.sh"
         [[ -n "$app_type" && -f "$builder" ]] || fail "No builder for app type '${app_type:-?}'"
         app_cmd="${app_cmd:-$(unit_value ExecStart | sed 's|^/usr/bin/env ||')}"
-        # shellcheck source=app_support/common.sh
-        source "$SUPPORT/common.sh"
         log "Rebuilding with install_${app_type}_app.sh"
         ( cd "$app_dir" && APP_DIR="$app_dir" APP_NAME="$name" APP_PORT="$port" APP_CMD="$app_cmd" \
             APP_SERVICES="$(unit_value Wants)" APP_USER="$(unit_value User)" bash "$builder" ) \
@@ -199,6 +207,7 @@ update)
     systemctl restart "$name" 2>/dev/null || true
     state=$(systemctl is-active "$name" 2>/dev/null || true)
     ok "$name updated — its service is ${state:-unknown}"
+    report_version
     ;;
 
 rollback)
@@ -211,6 +220,7 @@ rollback)
     log "Starting $name"
     systemctl start "$name" || fail "$name did not start (journalctl -u $name)"
     ok "$name rolled back to the version before its last update"
+    report_version
     ;;
 
 uninstall)
