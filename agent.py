@@ -21,7 +21,7 @@ root systemd service on port 5005 and exposes:
     GET  /apps        the installed_apps.json list
     GET  /info        the upplet itself: OS, kernel, uptime, memory, disk, this
                       agent's commit, installed versions of the supported
-                      dependencies, and the firewall's allow rules
+                      dependencies, and the firewall's rules
 
 All endpoints except `/` require the shared secret token. `/command` is the only
 one restricted by source IP.
@@ -317,13 +317,9 @@ def _clean_version(pkg, version):
     return v
 
 
-# Worth naming beyond the supported dependencies: what the agent itself runs on.
-EXTRA_PACKAGES = [("certbot", "Certbot", "certbot"), ("ufw", "ufw", "ufw"), ("git", "Git", "git")]
-
-
 def installed_packages():
-    """The supported dependencies (and a few of the agent's own tools) that are
-    installed, with versions — one dpkg-query for all of them."""
+    """The supported dependencies that are installed, with versions — one
+    dpkg-query for all of them."""
     try:
         registry = json.loads(read_file(SUPPORTED_DEPS) or "[]")
     except ValueError:
@@ -333,7 +329,6 @@ def installed_packages():
         name = entry.get("name", "")
         pkg = entry.get("package") or (entry.get("name") if entry.get("package-manager") == "apt" else None)
         wanted.append((name, entry.get("display-name") or name, pkg))
-    wanted += EXTRA_PACKAGES
 
     apt = [pkg for _, _, pkg in wanted if pkg]
     versions = {}
