@@ -22,11 +22,12 @@ root systemd service on port 5005 and exposes:
                       (systemctl is-active) and "backup" (a rollback is possible)
     POST /app         one installed app's lifecycle, via app_ops.sh — restricted to
                       P5AGENT_ALLOW_IP:
-                      {"op": start|stop|backup|update|rollback|uninstall, "name": ...,
-                       "drop_db": bool (uninstall)} -> {returncode, output};
-                      update runs in the background -> {"status": "started"}
-    GET  /app-log     the current (or last) app update:
-                      {name, started_at, log, finished, returncode} — {} if none
+                      {"op": start|stop|backup|update|rollback|uninstall|nginx, "name": ...,
+                       "drop_db": bool (uninstall), "port": int (nginx: the
+                       app's new private port, 0 = pick one)} -> {returncode, output};
+                      update and nginx run in the background -> {"status": "started"}
+    GET  /app-log     the current (or last) app job — an update or an nginx wire:
+                      {name, op, started_at, log, finished, returncode} — {} if none
     GET  /info        the upplet itself: OS, kernel, uptime, memory, disk, this
                       agent's commit, installed versions of the supported
                       dependencies, and the firewall's rules
@@ -105,7 +106,9 @@ SETUP_LOG = os.path.join(DATA_DIR, "setup.log")
 INSTALLED_APPS = os.path.join(DATA_DIR, "installed_apps.json")
 APPS_DIR = os.environ.get("P5AGENT_APPS_DIR", "/opt")      # where install_app.sh puts apps
 APP_OPS_SCRIPT = os.path.join(APP_DIR, "app_ops.sh")
-APP_OPS = ("start", "stop", "backup", "update", "rollback", "uninstall")
+APP_OPS = ("start", "stop", "backup", "update", "rollback", "uninstall", "nginx")
+# The ops that run as a background job, one at a time, followed through /app-log.
+APP_JOBS = ("update", "nginx")
 # An update is a job like a certificate run: a rebuild can take far longer than
 # a request may stay open, so /app starts it and /app-log follows it.
 APP_UPDATE_LOG = os.path.join(DATA_DIR, "app_update.log")
@@ -710,30 +713,37 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(409, {"error": "%s is being installed" % name})
         updating = app_update_status()
         if updating and not updating.get("finished"):
-            if op == "update" or updating.get("name") == name:
-                return self._send(409, {"error": "%s is being updated" % updating.get("name")})
+            if op in APP_JOBS or updating.get("name") == name:
+                return self._send(409, {"error": "%s is being %s" % (
+                    updating.get("name"), "set up behind Nginx" if updating.get("op") == "nginx" else "updated")})
         if op == "update":
-            return self._start_app_update(name)
+            return self._start_app_job(name, "update")
+        if op == "nginx":
+            port = req.get("port")
+            # 0: nginx.sh picks the port.
+            if not isinstance(port, int) or isinstance(port, bool) or not (port == 0 or 1024 <= port <= 65535):
+                return self._send(400, {"error": "port must be 0 or a number from 1024 to 65535"})
+            return self._start_app_job(name, "nginx", ["--port", str(port)])
         cmd = ["bash", APP_OPS_SCRIPT, op, name]
         if op == "uninstall" and req.get("drop_db") is True:
             cmd.append("--drop-db")
         rc, out = run(cmd)
         return self._send(200 if rc == 0 else 500, {"returncode": rc, "output": out})
 
-    def _start_app_update(self, name):
-        """Launch `app_ops.sh update <name>` detached and return at once;
-        /app-log follows it."""
+    def _start_app_job(self, name, op, extra=()):
+        """Launch `app_ops.sh <op> <name> [extra]` detached and return at once;
+        /app-log follows it (its status says which op)."""
         os.makedirs(DATA_DIR, exist_ok=True)
         with open(APP_UPDATE_LOG, "w") as fh:
             fh.write("")
         with open(APP_UPDATE_STATUS, "w") as fh:
-            json.dump({"name": name, "started_at": int(time.time())}, fh)
+            json.dump({"name": name, "op": op, "started_at": int(time.time())}, fh)
         # The runner appends the completion marker whatever the script does.
-        runner = 'exec >>"$1" 2>&1; bash "$2" update "$3"; printf "\\n%s%s\\n" "$4" "$?"'
+        runner = 'exec >>"$1" 2>&1; bash "$2" "$5" "$3" "${@:6}"; printf "\\n%s%s\\n" "$4" "$?"'
         try:
             subprocess.Popen(
-                ["bash", "-c", runner, "p5agent-app-update",
-                 APP_UPDATE_LOG, APP_OPS_SCRIPT, name, APP_UPDATE_DONE],
+                ["bash", "-c", runner, "p5agent-app-job",
+                 APP_UPDATE_LOG, APP_OPS_SCRIPT, name, APP_UPDATE_DONE, op] + list(extra),
                 cwd=APP_DIR,
                 env=dict(os.environ, HOME="/root", DEBIAN_FRONTEND="noninteractive"),
                 stdout=subprocess.DEVNULL,
@@ -741,8 +751,8 @@ class Handler(BaseHTTPRequestHandler):
                 start_new_session=True,   # survive the agent and this request
             )
         except Exception as exc:  # noqa: BLE001
-            return self._send(500, {"error": "failed to start the update", "detail": str(exc)})
-        return self._send(200, {"status": "started", "name": name})
+            return self._send(500, {"error": "failed to start " + op, "detail": str(exc)})
+        return self._send(200, {"status": "started", "name": name, "op": op})
 
     def _do_app_log(self):
         """The current (or last) app update: {name, log, finished, returncode}."""

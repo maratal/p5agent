@@ -13,6 +13,9 @@
 #                  standard builder for its type
 #   rollback       put /opt/<name>_backup back in place of /opt/<name> and
 #                  start the app again (the backup is used up)
+#   nginx          put Nginx in front of the app (nginx.sh wire): the app moves
+#                  to --port <n> (0 = pick one) over plain HTTP on 127.0.0.1, Nginx serves its
+#                  old port over HTTPS plus port 80
 #   uninstall      stop and remove the app: its service, folder and backups,
 #                  certificate dir, sudoers entry, user, firewall port and its
 #                  installed_apps.json entry. The database and /etc/<name>.env
@@ -38,9 +41,10 @@ ok()   { printf '\033[1;32m✓ %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m! %s\033[0m\n' "$*"; }
 fail() { printf '\033[1;31m✗ %s\033[0m\n' "$*"; exit 1; }
 
-op="${1:-}"; name="${2:-}"; drop_db=""
+op="${1:-}"; name="${2:-}"; drop_db=""; new_port=""
 [[ "${3:-}" == "--drop-db" ]] && drop_db=1
-[[ -n "$op" && -n "$name" ]] || fail "usage: app_ops.sh <start|stop|backup|update|rollback|uninstall> <name> [--drop-db]"
+[[ "${3:-}" == "--port" ]] && new_port="${4:-}"
+[[ -n "$op" && -n "$name" ]] || fail "usage: app_ops.sh <start|stop|backup|update|rollback|uninstall|nginx> <name> [--drop-db | --port <n>]"
 
 # The app's installed_apps.json entry, as port, db-type, app-dir, app-type,
 # app-cmd, demo and source separated by US (\x1f: tabs would merge empty
@@ -58,12 +62,13 @@ for a in apps:
         db = next((d for d in deps if d in ("postgresql", "mysql", "mariadb", "sqlite")), "")
         print("\x1f".join(str(v) for v in (
             a.get("port", ""), db, a.get("path", ""), a.get("app-type", ""),
-            a.get("app-cmd", ""), "1" if a.get("demo") else "", a.get("source", ""))))
+            a.get("app-cmd", ""), "1" if a.get("demo") else "", a.get("source", ""),
+            a.get("public-port", ""))))
         break
 PY
 )
 [[ -n "$entry" ]] || fail "No installed app named '$name'"
-IFS=$'\x1f' read -r port db_type app_dir app_type app_cmd demo source <<< "$entry"
+IFS=$'\x1f' read -r port db_type app_dir app_type app_cmd demo source public_port <<< "$entry"
 
 target="$APPS_DIR/$name"
 backup="${target}_backup"
@@ -137,6 +142,12 @@ start|stop)
 
 backup)
     make_backup
+    ;;
+
+nginx)
+    [[ -n "$new_port" ]] || fail "nginx needs --port <the app's new port>"
+    bash "$HERE/nginx.sh" wire "$name" "$new_port"
+    exit $?
     ;;
 
 update)
@@ -251,8 +262,10 @@ PY
     done
     remove_dir "/etc/${name}"             # its certificate dir
     rm -f "/etc/sudoers.d/${name}"
+    bash "$HERE/nginx.sh" unwire "$name" || warn "Could not remove $name's Nginx site"
 
-    # The port, unless another app uses it too — or it is SSH or the agent's.
+    # The port the app is reached on (Nginx's, when it is behind it), unless another app uses it too — or it is SSH or the agent's.
+    port="${public_port:-$port}"
     if [[ "$port" =~ ^[0-9]+$ && "$port" != 22 && "$port" != "$AGENT_PORT" ]] && command -v ufw >/dev/null 2>&1; then
         shared=$(python3 - "$INSTALLED" "$name" "$port" <<'PY'
 import json, sys
@@ -260,7 +273,7 @@ try:
     apps = json.load(open(sys.argv[1]))
 except Exception:
     apps = []
-print(any(str(a.get("port")) == sys.argv[3] and a.get("name") != sys.argv[2] for a in apps))
+print(any(sys.argv[3] in (str(a.get("port")), str(a.get("public-port"))) and a.get("name") != sys.argv[2] for a in apps))
 PY
 )
         if [[ "$shared" == "True" ]]; then

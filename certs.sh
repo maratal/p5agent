@@ -86,6 +86,23 @@ host_ip() {
     printf '%s' "$ip"
 }
 
+# The apps Nginx serves (nginx.sh wire): their entry has a "public-port". They
+# speak plain HTTP behind it, so the certificate goes to Nginx, not to them.
+proxied_apps() {
+    [[ -f "$INSTALLED" ]] || return 0
+    python3 -c "
+import json, sys
+try:
+    apps = json.load(open(sys.argv[1]))
+except Exception:
+    apps = []
+for a in apps:
+    n = str(a.get('name', '')).strip()
+    if n and a.get('public-port'):
+        print(n)
+" "$INSTALLED" 2>/dev/null
+}
+
 # The names of the apps installed on this upplet, one per line.
 installed_apps() {
     [[ -f "$INSTALLED" ]] || return 0
@@ -216,6 +233,18 @@ if ! command -v certbot >/dev/null 2>&1; then
     apt-get -qq install -y certbot >/dev/null || fail "Could not install certbot"
 fi
 
+# Who answers the http-01 challenge on port 80: certbot's own server, unless
+# Nginx holds the port (nginx.sh wire) — then Nginx serves certbot's files from
+# the webroot, which also keeps the site up during the challenge.
+ACME_WEBROOT="/var/www/p5-acme"
+if [[ -L /etc/nginx/sites-enabled/p5-acme.conf ]] && systemctl is-active --quiet nginx; then
+    mkdir -p "$ACME_WEBROOT"
+    AUTH=(--webroot -w "$ACME_WEBROOT")
+    ok "Nginx holds port 80 — the challenge is answered from $ACME_WEBROOT"
+else
+    AUTH=(--standalone)
+fi
+
 # The http-01 challenge is answered on port 80. firewall.sh opens it on new
 # upplets; an upplet provisioned before that still has it closed, and certbot
 # would fail with a timeout that says nothing about the firewall.
@@ -248,6 +277,8 @@ for a in apps:
 " "$INSTALLED" | while read -r app; do
     systemctl restart "$app" 2>/dev/null || true
 done
+# Apps behind Nginx get the certificate from it.
+systemctl is-active --quiet nginx && systemctl reload nginx 2>/dev/null || true
 HOOKEOF
 chmod +x "$HOOK"
 ok "Renewal hook installed at $HOOK"
@@ -258,11 +289,11 @@ if [[ -d "$LE_DIR" ]]; then
     # Not --force-renewal: a certificate with weeks left is not reissued just
     # because someone clicked the menu item, and reissues count against a weekly
     # limit. Nothing to renew is a success, not a failure.
-    certbot renew --cert-name "$DOMAIN" --standalone --non-interactive >&2 \
+    certbot renew --cert-name "$DOMAIN" "${AUTH[@]}" --non-interactive >&2 \
         || fail "Renewal failed for $DOMAIN"
 else
     log "Requesting a certificate for $DOMAIN"
-    certbot certonly --standalone --non-interactive --agree-tos \
+    certbot certonly "${AUTH[@]}" --non-interactive --agree-tos \
         --register-unsafely-without-email -d "$DOMAIN" >&2 \
         || fail "Could not obtain a certificate for $DOMAIN"
     ok "Certificate obtained for $DOMAIN"
@@ -283,6 +314,13 @@ if systemctl list-unit-files certbot.timer >/dev/null 2>&1; then
         || log "Could not enable certbot.timer — renewals will not run unattended"
 fi
 
+# Apps behind Nginx: Nginx serves the certificate, they keep speaking HTTP.
+PROXIED=$(proxied_apps)
+if [[ -n "$PROXIED" ]]; then
+    bash "$(dirname "$0")/nginx.sh" certs "$CERT" "$KEY" >&2 \
+        || fail "The certificate is in place, but Nginx did not take it"
+fi
+
 failed_apps=""
 APPS=$(installed_apps)
 if [[ -z "$APPS" ]]; then
@@ -290,6 +328,10 @@ if [[ -z "$APPS" ]]; then
 else
     while read -r app; do
         [[ -n "$app" ]] || continue
+        if grep -qxF "$app" <<< "$PROXIED"; then
+            ok "$app is served by Nginx — now with $DOMAIN"
+            continue
+        fi
         owner=$(app_user "$app")
         write_env "/etc/${app}.env" "$CERT" "$KEY" "$owner"
         if [[ -n "$owner" ]] && id "$owner" &>/dev/null; then

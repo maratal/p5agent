@@ -41,7 +41,8 @@ ufw allow "${PORT}/tcp" comment "p5agent" >/dev/null 2>&1 || true
 ufw allow 80/tcp comment "ACME http-01" >/dev/null 2>&1 || true
 
 # One port per installed app (the reset above cleared them; no-op on first
-# install). An entry with no port defaults to 443.
+# install). An entry with no port defaults to 443. An app behind Nginx is
+# reached on its public-port; its own port is private and stays closed.
 if [[ -f "$INSTALLED" ]]; then
     while IFS=$'\t' read -r aname aport; do
         [[ "$aport" =~ ^[0-9]+$ ]] || continue
@@ -54,7 +55,7 @@ try:
 except Exception:
     apps = []
 for a in apps:
-    p = str(a.get('port', '')).strip() or '443'
+    p = str(a.get('public-port', '') or a.get('port', '')).strip() or '443'
     n = str(a.get('name', 'app')).strip() or 'app'
     print('%s\t%s' % (n, p))
 " "$INSTALLED")
