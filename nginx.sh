@@ -38,7 +38,8 @@ ACME_SITE="p5-acme.conf"
 CERT_DIR="/etc/nginx/p5"
 
 log()  { printf '\033[1;34m→ %s\033[0m\n' "$*"; }
-ok()   { printf '\033[1;32m✓ %s\033[0m\n' "$*"; }
+ok()   { printf '✓ %s\n' "$*"; }                       # a step done: plain
+done_() { printf '\033[1;32m✓ %s\033[0m\n' "$*"; }        # the outcome: green
 warn() { printf '\033[1;33m! %s\033[0m\n' "$*"; }
 fail() { printf '\033[1;31m✗ %s\033[0m\n' "$*"; exit 1; }
 
@@ -319,10 +320,20 @@ PY
     switch_renewal_to_webroot "$cert"
     rm -rf "$bak"
 
-    if curl -sk -o /dev/null --max-time 5 "https://127.0.0.1:$public/"; then
-        ok "Done — https on port $public reaches $name through Nginx"
+    # Through Nginx to the app, not just to Nginx: any answer counts except
+    # the 502/503/504 Nginx gives when it cannot reach the app behind it.
+    local code=""
+    for _ in $(seq 1 5); do
+        code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "https://127.0.0.1:$public/" 2>/dev/null)
+        [[ "$code" =~ ^[1-4][0-9][0-9]$|^50[01]$ ]] && break
+        sleep 1
+    done
+    if [[ "$code" =~ ^[1-4][0-9][0-9]$|^50[01]$ ]]; then
+        done_ "Done — https on port $public reaches $name through Nginx (HTTP $code)"
+    elif [[ "$code" =~ ^50[234]$ ]]; then
+        warn "Nginx answers on $public, but cannot reach $name behind it (HTTP $code)"
     else
-        warn "Nginx is running, but https://127.0.0.1:$public did not answer yet"
+        warn "Nginx is running, but https://127.0.0.1:$public did not answer"
     fi
 }
 
