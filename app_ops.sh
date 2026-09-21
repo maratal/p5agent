@@ -15,7 +15,8 @@
 #                  start the app again (the backup is used up)
 #   nginx          put Nginx in front of the app (nginx.sh wire): the app moves
 #                  to --port <n> (0 = pick one) over plain HTTP on 127.0.0.1, Nginx serves its
-#                  old port over HTTPS plus port 80
+#                  old port over HTTPS plus port 80; [--bots] [--fail2ban]
+#                  turn bot protection on (left out: off)
 #   uninstall      stop and remove the app: its service, folder and backups,
 #                  certificate dir, sudoers entry, user, firewall port and its
 #                  installed_apps.json entry. The database and /etc/<name>.env
@@ -41,9 +42,9 @@ ok()   { printf '\033[1;32m✓ %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m! %s\033[0m\n' "$*"; }
 fail() { printf '\033[1;31m✗ %s\033[0m\n' "$*"; exit 1; }
 
-op="${1:-}"; name="${2:-}"; drop_db=""; new_port=""
+op="${1:-}"; name="${2:-}"; drop_db=""; new_port=""; nginx_flags=()
 [[ "${3:-}" == "--drop-db" ]] && drop_db=1
-[[ "${3:-}" == "--port" ]] && new_port="${4:-}"
+[[ "${3:-}" == "--port" ]] && new_port="${4:-}" && nginx_flags=("${@:5}")   # --bots --fail2ban
 [[ -n "$op" && -n "$name" ]] || fail "usage: app_ops.sh <start|stop|backup|update|rollback|uninstall|nginx> <name> [--drop-db | --port <n>]"
 
 # The app's installed_apps.json entry, as port, db-type, app-dir, app-type,
@@ -146,7 +147,7 @@ backup)
 
 nginx)
     [[ -n "$new_port" ]] || fail "nginx needs --port <the app's new port>"
-    bash "$HERE/nginx.sh" wire "$name" "$new_port"
+    bash "$HERE/nginx.sh" wire "$name" "$new_port" "${nginx_flags[@]}"
     exit $?
     ;;
 

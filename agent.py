@@ -24,7 +24,8 @@ root systemd service on port 5005 and exposes:
                       P5AGENT_ALLOW_IP:
                       {"op": start|stop|backup|update|rollback|uninstall|nginx, "name": ...,
                        "drop_db": bool (uninstall), "port": int (nginx: the
-                       app's new private port, 0 = pick one)} -> {returncode, output};
+                       app's new private port, 0 = pick one), "bots": bool,
+                       "fail2ban": bool (nginx: bot protection, on or off)} -> {returncode, output};
                       update and nginx run in the background -> {"status": "started"}
     GET  /app-log     the current (or last) app job — an update or an nginx wire:
                       {name, op, started_at, log, finished, returncode} — {} if none
@@ -723,7 +724,13 @@ class Handler(BaseHTTPRequestHandler):
             # 0: nginx.sh picks the port.
             if not isinstance(port, int) or isinstance(port, bool) or not (port == 0 or 1024 <= port <= 65535):
                 return self._send(400, {"error": "port must be 0 or a number from 1024 to 65535"})
-            return self._start_app_job(name, "nginx", ["--port", str(port)])
+            # Bot protection is set on every run: a flag left out turns it off.
+            flags = ["--port", str(port)]
+            if req.get("bots") is True:
+                flags.append("--bots")
+                if req.get("fail2ban") is True:
+                    flags.append("--fail2ban")
+            return self._start_app_job(name, "nginx", flags)
         cmd = ["bash", APP_OPS_SCRIPT, op, name]
         if op == "uninstall" and req.get("drop_db") is True:
             cmd.append("--drop-db")

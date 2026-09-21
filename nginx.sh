@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # nginx.sh — puts Nginx in front of installed apps.
 #
-#   nginx.sh wire <name> <app-port>   move the app to <app-port> (plain HTTP,
+#   nginx.sh wire <name> <app-port> [--bots] [--fail2ban]
+#                                     move the app to <app-port> (plain HTTP,
 #                                     loopback only) and let Nginx serve its old
 #                                     port over HTTPS, plus port 80. 0 picks the
 #                                     port: the app's current private one on a
-#                                     re-wire, else the first free from 5656
+#                                     re-wire, else the first free from 5656.
+#                                     --bots / --fail2ban: see "Bot protection"
+#                                     below; leaving a flag out on a re-run
+#                                     turns that protection off again
 #   nginx.sh certs <cert> <key>       point every Nginx-served app at this
 #                                     certificate and reload (run by certs.sh)
 #   nginx.sh unwire <name>            drop the app's Nginx site (run by uninstall)
@@ -22,6 +26,20 @@
 #
 # Wiring is all-or-nothing: the app's unit, env file and entry are saved first,
 # and put back if Nginx does not come up.
+#
+# Bot protection — per app, recorded in its entry as "nginx-bots" and
+# "nginx-fail2ban", and rebuilt from those records on every run, so a flag
+# left out is protection taken away:
+#
+#   --bots       rate limit (10 req/s per IP, bursts of 40 → 429), scanner
+#                probes (/.env, /.git, /wp-admin, …) and self-declared
+#                crawlers/scanners (GPTBot, AhrefsBot, sqlmap, …) closed
+#                unanswered (444). The dashboard's IP and this host are exempt.
+#   --fail2ban   (needs --bots) ban an IP for an hour after 20 of those
+#                429/444 answers in a minute.
+#
+# The shared pieces — conf.d/p5-bots.conf, snippets/p5-bots.conf and the
+# fail2ban jail — exist only while some app uses them.
 
 set -uo pipefail
 
@@ -36,6 +54,30 @@ SITES="/etc/nginx/sites-available"
 ENABLED="/etc/nginx/sites-enabled"
 ACME_SITE="p5-acme.conf"
 CERT_DIR="/etc/nginx/p5"
+BOTS_HTTP="/etc/nginx/conf.d/p5-bots.conf"         # http{} level: zones and maps
+BOTS_SNIPPET="/etc/nginx/snippets/p5-bots.conf"    # included by an app's server{}
+JAIL="/etc/fail2ban/jail.d/p5-nginx.conf"
+JAIL_FILTER="/etc/fail2ban/filter.d/p5-nginx.conf"
+
+# Bot protection settings — one place, read by the configs below and by
+# show_bot_settings, so what the log says is what Nginx and fail2ban apply.
+BOT_RATE=10                 # requests per second per IP, sustained
+BOT_BURST=40                # extra requests let through at once (a page load)
+BOT_PATHS="wp-admin wp-login.php wp-content wp-includes xmlrpc.php phpmyadmin pma myadmin cgi-bin vendor/phpunit boaform hnap1"
+BOT_DOTFILES="env git svn hg aws htaccess htpasswd ds_store"
+BOT_AGENTS="gptbot chatgpt-user claudebot anthropic-ai ccbot bytespider perplexitybot amazonbot google-extended meta-externalagent ahrefsbot semrushbot mj12bot dotbot petalbot blexbot dataforseobot masscan zgrab nikto sqlmap nmap nuclei wpscan dirbuster gobuster ffuf"
+F2B_MAXRETRY=20             # refused requests (429/444) ...
+F2B_FINDTIME=60             # ... within this many seconds ...
+F2B_BANTIME=3600            # ... ban the IP for this many seconds
+
+# a|b|c from a space-separated list, regex-escaping dots.
+alt() { local x; x=$(printf '%s' "$*" | sed 's/\./\\./g'); printf '%s' "${x// /|}"; }
+
+# The dashboard's address(es): its probes must never be limited or banned.
+TRUSTED_IPS="127.0.0.1 ::1"
+if [[ -f /etc/p5agent.env ]]; then
+    TRUSTED_IPS="$TRUSTED_IPS $(sed -n 's/^P5AGENT_ALLOW_IP=//p' /etc/p5agent.env | head -n1 | tr ',' ' ')"
+fi
 
 log()  { printf '\033[1;34m→ %s\033[0m\n' "$*"; }
 ok()   { printf '✓ %s\n' "$*"; }                       # a step done: plain
@@ -62,6 +104,130 @@ except Exception:
 for a in apps:
     print("%s\t%s\t%s" % (a.get("name", ""), a.get("port", "") or "443", a.get("public-port", "")))
 PY
+}
+
+# Whether any app has <field> set, with <name>'s value replaced by <value>
+# (1, 0, or "drop" for an app on its way out). Prints 1 or 0.
+any_app_flag() {
+    python3 - "$INSTALLED" "$1" "${2:-}" "${3:-}" <<'PY'
+import json, sys
+path, field, name, value = sys.argv[1:5]
+try:
+    apps = json.load(open(path))
+except Exception:
+    apps = []
+flags = {a.get("name"): bool(a.get(field)) for a in apps if a.get("public-port")}
+if name:
+    if value == "drop":
+        flags.pop(name, None)
+    else:
+        flags[name] = value == "1"
+print(1 if any(flags.values()) else 0)
+PY
+}
+
+# The http-level half of bot protection, present while any app uses it (an
+# app's site that includes the snippet needs these zones and maps to exist).
+sync_bots_conf() {  # sync_bots_conf [<name> <1|0|drop>]
+    if [[ "$(any_app_flag nginx-bots "${1:-}" "${2:-}")" != 1 ]]; then
+        rm -f "$BOTS_HTTP" "$BOTS_SNIPPET"
+        return 0
+    fi
+    local ip geo=""
+    for ip in $TRUSTED_IPS; do geo+="    $ip 1;"$'\n'; done
+    cat > "$BOTS_HTTP" <<CONF
+# Written by p5agent's nginx.sh (bot protection) — edits here are lost.
+geo \$p5_trusted {
+    default 0;
+$geo}
+# Trusted clients get an empty key, which limit_req does not count.
+map \$p5_trusted \$p5_limit_key {
+    1 "";
+    default \$binary_remote_addr;
+}
+limit_req_zone \$p5_limit_key zone=p5_req:10m rate=${BOT_RATE}r/s;
+# Crawlers and scanners that say what they are. Browsers, apps and plain
+# HTTP libraries are not on it.
+map "\$p5_trusted:\$http_user_agent" \$p5_bad_agent {
+    default 0;
+    "~^1:" 0;
+    "~*($(alt $BOT_AGENTS))" 1;
+}
+CONF
+    mkdir -p "$(dirname "$BOTS_SNIPPET")"
+    cat > "$BOTS_SNIPPET" <<CONF
+# Written by p5agent's nginx.sh (bot protection) — edits here are lost.
+limit_req zone=p5_req burst=$BOT_BURST nodelay;
+limit_req_status 429;
+if (\$p5_bad_agent) { return 444; }
+# What scanners try on every host: secrets, VCS folders, WordPress, admin kits.
+location ~* (^/($(alt $BOT_PATHS))|/\.($(alt $BOT_DOTFILES))) {
+    return 444;
+}
+CONF
+}
+
+# The fail2ban jail, present while any app asks for it. The package stays once
+# installed; only the jail comes and goes.
+sync_fail2ban() {  # sync_fail2ban [<name> <1|0|drop>]
+    if [[ "$(any_app_flag nginx-fail2ban "${1:-}" "${2:-}")" != 1 ]]; then
+        if [[ -f "$JAIL" ]]; then
+            rm -f "$JAIL" "$JAIL_FILTER"
+            systemctl reload fail2ban 2>/dev/null || systemctl restart fail2ban 2>/dev/null || true
+            ok "fail2ban off — the p5-nginx jail is removed"
+        else
+            ok "fail2ban off — no IPs are banned"
+        fi
+        return 0
+    fi
+    if ! command -v fail2ban-client >/dev/null 2>&1; then
+        log "Installing fail2ban"
+        DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 -qq install -y fail2ban >/dev/null 2>&1 || true
+        command -v fail2ban-client >/dev/null 2>&1 || { warn "fail2ban did not install — no bans"; return 0; }
+    fi
+    cat > "$JAIL_FILTER" <<'CONF'
+# Written by p5agent's nginx.sh — requests Nginx refused as a bot (444) or
+# rate-limited (429), from its combined access log (fail2ban removes the
+# [timestamp] before matching, so the pattern skips over where it was).
+[Definition]
+failregex = ^<HOST> \S+ \S+ .*?"[^"]*" (?:444|429) 
+ignoreregex =
+CONF
+    cat > "$JAIL" <<CONF
+# Written by p5agent's nginx.sh — edits here are lost.
+[p5-nginx]
+enabled  = true
+filter   = p5-nginx
+logpath  = /var/log/nginx/access.log
+backend  = auto
+maxretry = $F2B_MAXRETRY
+findtime = $F2B_FINDTIME
+bantime  = $F2B_BANTIME
+ignoreip = $TRUSTED_IPS
+CONF
+    systemctl enable fail2ban >/dev/null 2>&1 || true
+    if fail2ban-client -t >/dev/null 2>&1; then
+        systemctl restart fail2ban 2>/dev/null || true
+        ok "fail2ban on — jail p5-nginx, reading /var/log/nginx/access.log:"
+        detail "Ban:        an IP for ${F2B_BANTIME}s after $F2B_MAXRETRY refused requests (429/444) within ${F2B_FINDTIME}s"
+        detail "Never ban:  $TRUSTED_IPS"
+    else
+        fail2ban-client -t 2>&1 | tail -5
+        rm -f "$JAIL" "$JAIL_FILTER"
+        warn "fail2ban rejected the jail — left off"
+    fi
+}
+
+detail() { printf '    %s\n' "$*"; }
+
+# Everything bot protection does, as configured — printed on every run.
+show_bot_settings() {
+    ok "Bot protection on — $SITES/$(site_of "$1") includes $BOTS_SNIPPET:"
+    detail "Rate limit: $BOT_RATE requests/s per IP, bursts of $BOT_BURST; over it → 429"
+    detail "Paths closed unanswered (444): $(printf '/%s ' $BOT_PATHS)"
+    detail "Dotfiles closed unanswered (444): $(printf '/.%s ' $BOT_DOTFILES)"
+    detail "User agents closed unanswered (444): ${BOT_AGENTS// /, }"
+    detail "Exempt from rate limit and agent list: $TRUSTED_IPS"
 }
 
 reload_nginx() {
@@ -167,7 +333,8 @@ pick_port() {
 
 # ── wire ─────────────────────────────────────────────────────────────────────
 do_wire() {
-    local name="$1" new_port="$2"
+    local name="$1" new_port="$2" bots="$3" f2b="$4"
+    [[ "$bots" == 1 || "$f2b" != 1 ]] || fail "fail2ban bans what bot protection refuses — turn bot protection on too"
     local row cur_port public
     row=$(apps_table | awk -F'\t' -v n="$name" '$1 == n')
     [[ -n "$row" ]] || fail "No installed app named '$name'"
@@ -236,6 +403,7 @@ $(listen6 "$public ssl default_server")
     ssl_certificate_key $key;
     ssl_protocols TLSv1.2 TLSv1.3;
     client_max_body_size 100m;
+$([[ "$bots" == 1 ]] && printf '    include %s;' "$BOTS_SNIPPET")
     location / {
         proxy_pass http://127.0.0.1:$new_port;
         proxy_http_version 1.1;
@@ -250,6 +418,7 @@ $(listen6 "$public ssl default_server")
 }
 CONF
     ln -sf "$SITES/$(site_of "$name")" "$ENABLED/$(site_of "$name")"
+    sync_bots_conf "$name" "$bots"
     write_acme_site
     if ! nginx -t >/dev/null 2>&1; then
         nginx -t
@@ -276,14 +445,16 @@ CONF
         touch "$env"; chmod 600 "$env"
     fi
     printf 'PORT=%s\nHOST=127.0.0.1\n' "$new_port" >> "$env"
-    python3 - "$INSTALLED" "$name" "$new_port" "$public" <<'PY'
+    python3 - "$INSTALLED" "$name" "$new_port" "$public" "$bots" "$f2b" <<'PY'
 import json, sys
-path, name, port, public = sys.argv[1:5]
+path, name, port, public, bots, f2b = sys.argv[1:7]
 apps = json.load(open(path))
 for a in apps:
     if a.get("name") == name:
         a["port"] = port
         a["public-port"] = public
+        a["nginx-bots"] = bots == "1"
+        a["nginx-fail2ban"] = f2b == "1"
 json.dump(apps, open(path, "w"), indent=2)
 PY
     systemctl daemon-reload
@@ -320,6 +491,13 @@ PY
     switch_renewal_to_webroot "$cert"
     rm -rf "$bak"
 
+    if [[ "$bots" == 1 ]]; then
+        show_bot_settings "$name"
+    else
+        ok "Bot protection off — no rate limit, no paths or agents refused"
+    fi
+    sync_fail2ban
+
     # Through Nginx to the app, not just to Nginx: any answer counts except
     # the 502/503/504 Nginx gives when it cannot reach the app behind it.
     local code=""
@@ -350,6 +528,7 @@ restore() {
     else
         rm -f "$SITES/$(site_of "$name")" "$ENABLED/$(site_of "$name")"
     fi
+    sync_bots_conf
     write_acme_site
     systemctl daemon-reload
     # Nginx may hold the port the app wants back — it goes first when it has nothing else to serve.
@@ -379,13 +558,25 @@ do_unwire() {
     local name="$1" site; site="$(site_of "$name")"
     [[ -f "$SITES/$site" || -L "$ENABLED/$site" ]] || return 0
     rm -f "$SITES/$site" "$ENABLED/$site"
+    sync_bots_conf "$name" drop
+    sync_fail2ban "$name" drop
     write_acme_site
     if command -v nginx >/dev/null 2>&1; then reload_nginx >/dev/null 2>&1 || true; fi
     ok "Removed $name's Nginx site"
 }
 
 case "${1:-}" in
-    wire)   [[ $# -eq 3 ]] || fail "usage: nginx.sh wire <name> <app-port>"; do_wire "$2" "$3" ;;
+    wire)
+        [[ $# -ge 3 ]] || fail "usage: nginx.sh wire <name> <app-port> [--bots] [--fail2ban]"
+        bots=0 f2b=0
+        for flag in "${@:4}"; do
+            case "$flag" in
+                --bots) bots=1 ;;
+                --fail2ban) f2b=1 ;;
+                *) fail "Unknown option: $flag" ;;
+            esac
+        done
+        do_wire "$2" "$3" "$bots" "$f2b" ;;
     certs)  [[ $# -eq 3 ]] || fail "usage: nginx.sh certs <cert> <key>"; do_certs "$2" "$3" ;;
     unwire) [[ $# -eq 2 ]] || fail "usage: nginx.sh unwire <name>"; do_unwire "$2" ;;
     *) sed -n '2,20p' "$0"; exit 2 ;;
