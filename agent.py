@@ -9,7 +9,9 @@ root systemd service on port 5005 and exposes:
     GET  /            liveness probe (no token required)
     *    /update      git-pull this checkout, then run update.sh
     *    /command     save the request to /tmp/command_<dd_mm_yy_hh_mm_ss>.sh and
-                      run it as root — restricted to P5AGENT_ALLOW_IP
+                      run it as root — restricted to P5AGENT_ALLOW_IP.
+                      Built-in alias, answered without running a script:
+                        token --print | -p         the management token
     *    /install-app  spawn install_app.sh in the background to install an app
                       and its dependencies; returns 200 once the job is launched.
                       One install runs at a time: the request is recorded in
@@ -627,6 +629,9 @@ class Handler(BaseHTTPRequestHandler):
         if not text.strip():
             return self._send(400, {"error": "empty command body"})
 
+        if self._token_alias(text):
+            return
+
         if not text.startswith("#!"):
             text = "#!/usr/bin/env bash\n" + text
 
@@ -638,6 +643,24 @@ class Handler(BaseHTTPRequestHandler):
         rc, out = run([path], cwd=TMP_DIR)
         status = 200 if rc == 0 else 500
         return self._send(status, {"returncode": rc, "output": out, "script": path})
+
+    # Any single `token …` line is the alias's, even a wrong one: falling
+    # through to bash would leave whatever was typed after it in /tmp.
+    TOKEN_ALIAS = re.compile(r"^\s*token(?:[ \t]+([^\n]*?))?\s*$")
+
+    def _token_alias(self, text):
+        """Built-in Run Command alias, answered here without a script (so the
+        token never lands in a file under /tmp):
+            token --print | -p    the management token
+        Returns True when it answered, False when `text` is not the alias."""
+        m = self.TOKEN_ALIAS.match(text)
+        if not m:
+            return False
+        if (m.group(1) or "").strip() in ("--print", "-p"):
+            self._send(200, {"returncode": 0, "output": TOKEN + "\n"})
+        else:
+            self._send(500, {"returncode": 2, "output": "usage: token --print | -p\n"})
+        return True
 
     def _do_install_app(self):
         """Accept one install at a time: refuse while one is running, record
