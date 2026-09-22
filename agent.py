@@ -10,8 +10,10 @@ root systemd service on port 5005 and exposes:
     *    /update      git-pull this checkout, then run update.sh
     *    /command     save the request to /tmp/command_<dd_mm_yy_hh_mm_ss>.sh and
                       run it as root — restricted to P5AGENT_ALLOW_IP.
-                      Built-in alias, answered without running a script:
+                      Built-in aliases, answered without running a script:
                         token --print | -p         the management token
+                        agent --allow | -a <ip>    add <ip> to P5AGENT_ALLOW_IP
+                        agent --remove | -r <ip>   take <ip> off P5AGENT_ALLOW_IP
     *    /install-app  spawn install_app.sh in the background to install an app
                       and its dependencies; returns 200 once the job is launched.
                       One install runs at a time: the request is recorded in
@@ -60,6 +62,7 @@ cannot leak into access logs, proxies, or browser history:
 """
 
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -79,6 +82,54 @@ TOKEN = os.environ.get("P5AGENT_TOKEN", "")
 APP_DIR = os.path.dirname(os.path.realpath(__file__))
 APP_NAME = os.path.basename(APP_DIR)
 ALLOW_IP = {ip.strip() for ip in os.environ.get("P5AGENT_ALLOW_IP", "127.0.0.1").split(",") if ip.strip()}
+ENV_FILE = os.environ.get("P5AGENT_ENV_FILE", "/etc/p5agent.env")
+
+
+def change_allow_ip(text, remove=False, caller=None):
+    """`agent --allow | --remove <ip>`: add one address to P5AGENT_ALLOW_IP or
+    take one off — in effect at once, and written to ENV_FILE so it survives a
+    restart. The address the request came from (`caller`) cannot be removed:
+    that would shut the one asking out of Run Command. Returns (rc, output)."""
+    try:
+        ip = str(ipaddress.ip_address(text.strip()))
+    except ValueError:
+        return 2, "Not an IP address: %s\n" % text
+    allowed = [a.strip() for a in os.environ.get("P5AGENT_ALLOW_IP", "").split(",") if a.strip()] or sorted(ALLOW_IP)
+    if remove:
+        if ip not in ALLOW_IP:
+            return 0, "%s is not on the list\n" % ip
+        if ip == caller:
+            return 1, "Not removed: %s is the address this request came from\n" % ip
+        allowed = [a for a in allowed if a != ip]
+    else:
+        if ip in ALLOW_IP:
+            return 0, "%s is already allowed\n" % ip
+        allowed.append(ip)
+    value = ",".join(allowed)
+    try:
+        with open(ENV_FILE) as fh:
+            lines = fh.read().splitlines()
+    except FileNotFoundError:
+        lines = []
+    lines = [l for l in lines if not l.startswith("P5AGENT_ALLOW_IP=")] + ["P5AGENT_ALLOW_IP=" + value]
+    try:
+        tmp = ENV_FILE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+        os.replace(tmp, ENV_FILE)
+    except OSError as exc:
+        return 1, "Not saved: %s\n" % exc
+    if remove:
+        ALLOW_IP.discard(ip)
+    else:
+        ALLOW_IP.add(ip)
+    # Scripts the agent runs (firewall.sh) read it from the environment first.
+    os.environ["P5AGENT_ALLOW_IP"] = value
+    return 0, "%s %s — Run Command is now accepted from %s\n" % (
+        ip, "removed" if remove else "added", ", ".join(allowed) or "nowhere")
+
+
 BIND = os.environ.get("P5AGENT_BIND", "0.0.0.0")
 PORT = int(os.environ.get("P5AGENT_PORT", "5005"))
 DATA_DIR = os.environ.get("P5AGENT_DATA_DIR", "/var/lib/p5agent")
@@ -629,7 +680,7 @@ class Handler(BaseHTTPRequestHandler):
         if not text.strip():
             return self._send(400, {"error": "empty command body"})
 
-        if self._token_alias(text):
+        if self._alias(text):
             return
 
         if not text.startswith("#!"):
@@ -644,22 +695,34 @@ class Handler(BaseHTTPRequestHandler):
         status = 200 if rc == 0 else 500
         return self._send(status, {"returncode": rc, "output": out, "script": path})
 
-    # Any single `token …` line is the alias's, even a wrong one: falling
-    # through to bash would leave whatever was typed after it in /tmp.
-    TOKEN_ALIAS = re.compile(r"^\s*token(?:[ \t]+([^\n]*?))?\s*$")
+    # Built-in Run Command aliases, answered here without a script. Any single
+    # line starting with an alias name is the alias's, even a wrong one:
+    # falling through to bash would leave whatever was typed in /tmp.
+    ALIAS = re.compile(r"^\s*(token|agent)(?:[ \t]+([^\n]*?))?\s*$")
+    ALIAS_USAGE = {
+        "token": "usage: token --print | -p\n",
+        "agent": "usage: agent --allow | -a <ip>\n       agent --remove | -r <ip>\n",
+    }
 
-    def _token_alias(self, text):
-        """Built-in Run Command alias, answered here without a script (so the
-        token never lands in a file under /tmp):
-            token --print | -p    the management token
-        Returns True when it answered, False when `text` is not the alias."""
-        m = self.TOKEN_ALIAS.match(text)
+    def _alias(self, text):
+        """Answer a built-in alias:
+            token --print | -p      the management token
+            agent --allow | -a <ip>  add <ip> to P5AGENT_ALLOW_IP — the
+                                     addresses Run Command is accepted from
+            agent --remove | -r <ip> take <ip> off it
+        Returns True when it answered, False when `text` is not an alias."""
+        m = self.ALIAS.match(text)
         if not m:
             return False
-        if (m.group(1) or "").strip() in ("--print", "-p"):
+        name, args = m.group(1), (m.group(2) or "").split()
+        if name == "token" and args in (["--print"], ["-p"]):
             self._send(200, {"returncode": 0, "output": TOKEN + "\n"})
+        elif name == "agent" and len(args) == 2 and args[0] in ("--allow", "-a", "--remove", "-r"):
+            rc, out = change_allow_ip(args[1], remove=args[0] in ("--remove", "-r"),
+                                      caller=self.client_address[0])
+            self._send(200 if rc == 0 else 500, {"returncode": rc, "output": out})
         else:
-            self._send(500, {"returncode": 2, "output": "usage: token --print | -p\n"})
+            self._send(500, {"returncode": 2, "output": self.ALIAS_USAGE[name]})
         return True
 
     def _do_install_app(self):
