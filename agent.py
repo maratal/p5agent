@@ -20,8 +20,7 @@ root systemd service on port 5005 and exposes:
     GET  /supported   the supported_deps.json registry
     GET  /apps        the installed_apps.json list, each app with "service"
                       (systemctl is-active) and "backup" (a rollback is possible)
-    POST /app         one installed app's lifecycle, via app_ops.sh — restricted to
-                      P5AGENT_ALLOW_IP:
+    POST /app         one installed app's lifecycle, via app_ops.sh:
                       {"op": start|stop|backup|update|rollback|uninstall|nginx, "name": ...,
                        "drop_db": bool (uninstall), "port": int (nginx: the
                        app's new private port, 0 = pick one), "bots": bool,
@@ -31,7 +30,6 @@ root systemd service on port 5005 and exposes:
                       {name, op, started_at, log, finished, returncode} — {} if none
     GET  /firewall    the firewall table as ufw has it (firewall.sh --plan): each
                       port with the addresses it is open to, built-in ones marked
-                      — restricted to P5AGENT_ALLOW_IP
     POST /firewall    {"rules": [{port, proto, from: [addr…]} | {raw}]} — bring ufw
                       to that table (only the difference), in the background
     GET  /firewall-log the current (or last) firewall run: {log, finished, returncode}
@@ -45,7 +43,7 @@ are also restricted by source IP.
 Configuration is read from the environment (see /etc/p5agent.env):
 
     P5AGENT_TOKEN     shared secret required on every privileged request
-    P5AGENT_ALLOW_IP  comma-separated client IPs allowed to call /command and /app (default: 127.0.0.1)
+    P5AGENT_ALLOW_IP  comma-separated client IPs allowed to call /command (default: 127.0.0.1)
     P5AGENT_PORT      listen port                        (default: 5005)
     P5AGENT_DATA_DIR  runtime state dir                  (default: /var/lib/p5agent)
     P5AGENT_TMP_DIR   where command scripts are written  (default: /tmp)
@@ -525,8 +523,9 @@ class Handler(BaseHTTPRequestHandler):
     ROUTES = ("/update", "/command", "/install-app", "/progress",
               "/supported", "/apps", "/certs", "/certs-log", "/info", "/app",
               "/app-log", "/firewall", "/firewall-log")
-    # TEMPORARY: /app is open to any source IP for now — restore ("/command", "/app").
-    IP_RESTRICTED = ("/command", "/firewall")
+    # Only running arbitrary commands is locked to the allowed source IP; every
+    # other operation needs just the token.
+    IP_RESTRICTED = ("/command",)
 
     def _dispatch(self):
         path = self._path()
@@ -536,7 +535,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"error": "not found", "path": path})
         if not self._authorized():
             return self._send(401, {"error": "unauthorized"})
-        # Running commands and app operations are locked to the allowed source IP.
+        # Running commands is locked to the allowed source IP.
         if path in self.IP_RESTRICTED and not self._ip_allowed():
             def _mask_ip(ip):
                 return ip[:2] + "*" * max(0, len(ip) - 4) + ip[-2:] if len(ip) > 4 else ip
