@@ -12,6 +12,7 @@ root systemd service on port 5005 and exposes:
                       run it as root — restricted to P5AGENT_ALLOW_IP.
                       Built-in aliases, answered without running a script:
                         token --print | -p         the management token
+                        agent --print | -p         the P5AGENT_ALLOW_IP list
                         agent --allow | -a <ip>    add <ip> to P5AGENT_ALLOW_IP
                         agent --remove | -r <ip>   take <ip> off P5AGENT_ALLOW_IP
     *    /install-app  spawn install_app.sh in the background to install an app
@@ -701,14 +702,16 @@ class Handler(BaseHTTPRequestHandler):
     ALIAS = re.compile(r"^\s*(token|agent)(?:[ \t]+([^\n]*?))?\s*$")
     ALIAS_USAGE = {
         "token": "usage: token --print | -p\n",
-        "agent": "usage: agent --allow | -a <ip>\n       agent --remove | -r <ip>\n",
+        "agent": "usage: agent --print | -p\n       agent --allow | -a <ip>\n"
+                 "       agent --remove | -r <ip>\n",
     }
 
     def _alias(self, text):
         """Answer a built-in alias:
             token --print | -p      the management token
-            agent --allow | -a <ip>  add <ip> to P5AGENT_ALLOW_IP — the
-                                     addresses Run Command is accepted from
+            agent --print | -p       P5AGENT_ALLOW_IP — the addresses Run
+                                     Command is accepted from
+            agent --allow | -a <ip>  add <ip> to it
             agent --remove | -r <ip> take <ip> off it
         Returns True when it answered, False when `text` is not an alias."""
         m = self.ALIAS.match(text)
@@ -717,6 +720,8 @@ class Handler(BaseHTTPRequestHandler):
         name, args = m.group(1), (m.group(2) or "").split()
         if name == "token" and args in (["--print"], ["-p"]):
             self._send(200, {"returncode": 0, "output": TOKEN + "\n"})
+        elif name == "agent" and args in (["--print"], ["-p"]):
+            self._send(200, {"returncode": 0, "output": ", ".join(sorted(ALLOW_IP)) + "\n"})
         elif name == "agent" and len(args) == 2 and args[0] in ("--allow", "-a", "--remove", "-r"):
             rc, out = change_allow_ip(args[1], remove=args[0] in ("--remove", "-r"),
                                       caller=self.client_address[0])
