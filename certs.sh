@@ -249,7 +249,7 @@ fi
 # upplets; an upplet provisioned before that still has it closed, and certbot
 # would fail with a timeout that says nothing about the firewall.
 if command -v ufw >/dev/null 2>&1; then
-    ufw allow 80/tcp comment "ACME http-01" >/dev/null 2>&1 || true
+    bash "$(dirname "$0")/firewall.sh" >/dev/null 2>&1 || true   # 80 is one of its managed rules
     ok "Port 80 open for the ACME challenge"
 fi
 

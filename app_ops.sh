@@ -265,25 +265,6 @@ PY
     rm -f "/etc/sudoers.d/${name}"
     bash "$HERE/nginx.sh" unwire "$name" || warn "Could not remove $name's Nginx site"
 
-    # The port the app is reached on (Nginx's, when it is behind it), unless another app uses it too — or it is SSH or the agent's.
-    port="${public_port:-$port}"
-    if [[ "$port" =~ ^[0-9]+$ && "$port" != 22 && "$port" != "$AGENT_PORT" ]] && command -v ufw >/dev/null 2>&1; then
-        shared=$(python3 - "$INSTALLED" "$name" "$port" <<'PY'
-import json, sys
-try:
-    apps = json.load(open(sys.argv[1]))
-except Exception:
-    apps = []
-print(any(sys.argv[3] in (str(a.get("port")), str(a.get("public-port"))) and a.get("name") != sys.argv[2] for a in apps))
-PY
-)
-        if [[ "$shared" == "True" ]]; then
-            ok "Port $port stays open — another app uses it"
-        else
-            ufw delete allow "${port}/tcp" >/dev/null 2>&1 && ok "Closed port $port" || warn "No firewall rule for port $port"
-        fi
-    fi
-
     if [[ -n "$drop_db" ]]; then
         case "$db_type" in
             postgresql)
@@ -319,6 +300,14 @@ except Exception:
     apps = []
 json.dump([a for a in apps if a.get("name") != name], open(path, "w"), indent=2)
 PY
+    # Its ports close now that it is gone from installed_apps.json — the one it
+    # was reached on and, behind Nginx, its private one. --close leaves a port
+    # open that another app still uses.
+    if command -v ufw >/dev/null 2>&1; then
+        for p in ${public_port:-} $port; do
+            [[ "$p" =~ ^[0-9]+$ ]] && bash "$HERE/firewall.sh" --close "$p/tcp"
+        done
+    fi
     ok "$name uninstalled"
     ;;
 

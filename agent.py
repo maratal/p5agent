@@ -29,6 +29,12 @@ root systemd service on port 5005 and exposes:
                       update and nginx run in the background -> {"status": "started"}
     GET  /app-log     the current (or last) app job — an update or an nginx wire:
                       {name, op, started_at, log, finished, returncode} — {} if none
+    GET  /firewall    the firewall table as ufw has it (firewall.sh --plan): each
+                      port with the addresses it is open to, built-in ones marked
+                      — restricted to P5AGENT_ALLOW_IP
+    POST /firewall    {"rules": [{port, proto, from: [addr…]} | {raw}]} — bring ufw
+                      to that table (only the difference), in the background
+    GET  /firewall-log the current (or last) firewall run: {log, finished, returncode}
     GET  /info        the upplet itself: OS, kernel, uptime, memory, disk, this
                       agent's commit, installed versions of the supported
                       dependencies, and the firewall's rules
@@ -103,6 +109,12 @@ DOMAIN_RE = re.compile(
     r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
 )
 SUPPORTED_DEPS = os.path.join(APP_DIR, "supported_deps.json")
+# Firewall Settings: ufw is the record, firewall.sh edits it; a save is a short
+# job, followed like a certificate run.
+FIREWALL_SCRIPT = os.path.join(APP_DIR, "firewall.sh")
+FIREWALL_LOG = os.path.join(DATA_DIR, "firewall.log")
+FIREWALL_STATUS = os.path.join(DATA_DIR, "firewall_status.json")
+FIREWALL_DONE = "[p5agent] firewall finished rc="
 SETUP_LOG = os.path.join(DATA_DIR, "setup.log")
 INSTALLED_APPS = os.path.join(DATA_DIR, "installed_apps.json")
 APPS_DIR = os.environ.get("P5AGENT_APPS_DIR", "/opt")      # where install_app.sh puts apps
@@ -173,6 +185,14 @@ def job_status(status_file, log_file, done_marker):
 
 def certs_status():
     return job_status(CERTS_STATUS, CERTS_LOG, CERTS_DONE)
+
+
+def firewall_status():
+    status = job_status(FIREWALL_STATUS, FIREWALL_LOG, FIREWALL_DONE)
+    if status.get("finished"):
+        log = status["log"]
+        status["log"] = log[:log.rfind(FIREWALL_DONE)].rstrip("\n") + "\n"
+    return status
 
 
 def app_update_status():
@@ -504,9 +524,9 @@ class Handler(BaseHTTPRequestHandler):
 
     ROUTES = ("/update", "/command", "/install-app", "/progress",
               "/supported", "/apps", "/certs", "/certs-log", "/info", "/app",
-              "/app-log")
+              "/app-log", "/firewall", "/firewall-log")
     # TEMPORARY: /app is open to any source IP for now — restore ("/command", "/app").
-    IP_RESTRICTED = ("/command",)
+    IP_RESTRICTED = ("/command", "/firewall")
 
     def _dispatch(self):
         path = self._path()
@@ -535,6 +555,8 @@ class Handler(BaseHTTPRequestHandler):
                 "/info": self._do_info,
                 "/app": self._do_app,
                 "/app-log": self._do_app_log,
+                "/firewall": self._do_firewall,
+                "/firewall-log": self._do_firewall_log,
             }[path]()
         except Exception as exc:  # noqa: BLE001 - never leak a traceback as 500 HTML
             try:
@@ -817,6 +839,61 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(500, {"error": "failed to start the certificate run",
                                     "detail": str(exc)})
         return self._send(200, {"status": "started", "domain": domain})
+
+    def _do_firewall(self):
+        """GET: the rule table. POST: save the user's rules and apply them —
+        started here, followed through /firewall-log."""
+        if not os.path.isfile(FIREWALL_SCRIPT):
+            return self._send(500, {"error": "firewall.sh not found"})
+        if self.command == "GET":
+            rc, out = run(["bash", FIREWALL_SCRIPT, "--plan"])
+            try:
+                table = json.loads(out.strip().splitlines()[-1]) if rc == 0 else None
+            except (ValueError, IndexError):
+                table = None
+            if table is None:
+                return self._send(500, {"error": "could not read the firewall rules", "output": out})
+            fw = firewall_rules()
+            table["ufw"] = fw["status"] if fw else None
+            return self._send(200, table)
+
+        try:
+            req = json.loads(self._body().decode("utf-8", "replace") or "{}")
+        except ValueError:
+            return self._send(400, {"error": "body must be JSON"})
+        if not isinstance(req.get("rules"), list):
+            return self._send(400, {"error": "rules must be a list"})
+        current = firewall_status()
+        if current and not current.get("finished"):
+            return self._send(409, {"error": "the firewall is being updated"})
+
+        os.makedirs(DATA_DIR, exist_ok=True)
+        # The table travels in a temporary file the runner removes when done.
+        request = os.path.join(TMP_DIR, "firewall_request_%s.json" % datetime.now().strftime("%d_%m_%y_%H_%M_%S"))
+        with open(request, "w") as fh:
+            json.dump({"rules": req["rules"]}, fh)
+        with open(FIREWALL_LOG, "w") as fh:
+            fh.write("")
+        with open(FIREWALL_STATUS, "w") as fh:
+            json.dump({"started_at": int(time.time())}, fh)
+        runner = 'exec >>"$1" 2>&1; bash "$2" --set "$3"; rc=$?; rm -f "$3"; printf "\\n%s%s\\n" "$4" "$rc"'
+        try:
+            subprocess.Popen(
+                ["bash", "-c", runner, "p5agent-firewall",
+                 FIREWALL_LOG, FIREWALL_SCRIPT, request, FIREWALL_DONE],
+                cwd=APP_DIR,
+                env=dict(os.environ, HOME="/root"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,   # survive the agent and this request
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._send(500, {"error": "failed to start the firewall update", "detail": str(exc)})
+        return self._send(200, {"status": "started"})
+
+    def _do_firewall_log(self):
+        """The current (or last) firewall run: {log, finished, returncode}."""
+        return self._send(200, firewall_status())
 
     def _do_certs_log(self):
         """The current (or last) certificate run: its domain, its output so far,

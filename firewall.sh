@@ -1,17 +1,30 @@
 #!/usr/bin/env bash
-# Configure UFW for p5agent — the single source of the firewall rule set, shared
-# by install.sh and update.sh.
+# The upplet's firewall (ufw) — a whitelist: deny all incoming, always, then
+# allow listed ports. ufw itself is the record: its rules persist on disk and
+# are what the dashboard's Firewall Settings shows and edits. Nothing here
+# resets ufw; it is only ever changed rule by rule.
 #
-# Policy (deliberately permissive): deny incoming by default, then open
-#   - SSH (22) to all (so admins and the DigitalOcean console can always get in)
-#   - the agent port to all (the agent enforces per-endpoint source IP itself)
-#   - one port per installed app (read from installed_apps.json)
-# A reset clears stray rules; the rules above are re-added on every run.
+#   firewall.sh                 ensure: deny incoming by default; open each
+#                               built-in port that has no rule yet (anyone may
+#                               reach it); enable. Never removes a rule — a
+#                               restriction set in Firewall Settings stays.
+#   firewall.sh --plan          print the table as JSON: ufw's rules grouped by
+#                               port, built-in ports marked, nothing changed
+#   firewall.sh --set <file>    bring ufw to the table in <file>
+#                               ({"rules": [{port, proto, from, raw?}]}) — only
+#                               the difference is applied, removals first, so
+#                               a changing rule is briefly closed, never open
+#   firewall.sh --close <port>[/tcp|udp]
+#                               remove every rule for that port — unless it is
+#                               still a built-in port (an app uses it)
+#
+# Built-in ports: SSH (22), the agent (5005), 80 (ACME http-01, Nginx's
+# redirect) and each installed app's port — its public-port when it is behind
+# Nginx. They can be restricted to addresses but not removed. Any list of
+# addresses always includes the dashboard's (P5AGENT_ALLOW_IP): it drives the
+# agent and probes every app.
 
-set -euo pipefail
-
-log() { printf '\033[1;34m→ %s\033[0m\n' "$*"; }
-ok()  { printf '\033[1;32m✓ %s\033[0m\n' "$*"; }
+set -uo pipefail
 
 [[ "$(id -u)" -eq 0 ]] || { echo "firewall.sh must be run as root" >&2; exit 1; }
 command -v ufw >/dev/null 2>&1 || { echo "ufw not found — cannot configure the firewall" >&2; exit 1; }
@@ -24,42 +37,203 @@ getenvval() {  # value of KEY: from the environment, else from $ENV_FILE
 }
 PORT="$(getenvval P5AGENT_PORT)";          PORT="${PORT:-5005}"
 DATA_DIR="$(getenvval P5AGENT_DATA_DIR)";   DATA_DIR="${DATA_DIR:-/var/lib/p5agent}"
-INSTALLED="$DATA_DIR/installed_apps.json"
 
-log "Configuring UFW (deny incoming by default; open 22, ${PORT}, app ports)"
-ufw --force reset >/dev/null 2>&1 || true
-ufw default deny incoming >/dev/null 2>&1 || true
-ufw default allow outgoing >/dev/null 2>&1 || true
-ufw allow 22/tcp comment "SSH" >/dev/null 2>&1 || true
-ufw allow "${PORT}/tcp" comment "p5agent" >/dev/null 2>&1 || true
+case "${1:-}" in
+    ""|--plan|--set|--close) ;;
+    *) echo "usage: firewall.sh [--plan | --set <file> | --close <port>[/proto]]" >&2; exit 2 ;;
+esac
 
-# Port 80 is for the ACME http-01 challenge — the only way certbot can prove
-# this host owns a domain without DNS credentials. Left open rather than opened
-# around each run, because certbot's unattended renewal needs it too: a port
-# that is only open while someone is watching means the certificate expires in
-# sixty days with nobody watching. Nothing listens on it between challenges.
-ufw allow 80/tcp comment "ACME http-01" >/dev/null 2>&1 || true
+exec python3 - "$DATA_DIR/installed_apps.json" "$PORT" "$(getenvval P5AGENT_ALLOW_IP)" "$@" <<'PY'
+import ipaddress, json, re, subprocess, sys
 
-# One port per installed app (the reset above cleared them; no-op on first
-# install). An entry with no port defaults to 443. An app behind Nginx is
-# reached on its public-port; its own port is private and stays closed.
-if [[ -f "$INSTALLED" ]]; then
-    while IFS=$'\t' read -r aname aport; do
-        [[ "$aport" =~ ^[0-9]+$ ]] || continue
-        ufw allow "${aport}/tcp" comment "$aname" >/dev/null 2>&1 || true
-        log "Opened app port $aport ($aname)"
-    done < <(python3 -c "
-import json, sys
-try:
-    apps = json.load(open(sys.argv[1]))
-except Exception:
-    apps = []
-for a in apps:
-    p = str(a.get('public-port', '') or a.get('port', '')).strip() or '443'
-    n = str(a.get('name', 'app')).strip() or 'app'
-    print('%s\t%s' % (n, p))
-" "$INSTALLED")
-fi
+installed, agent_port, allow_ip = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+args = sys.argv[4:]
+mode = args[0] if args else "ensure"
+dashboard = [ip.strip() for ip in allow_ip.split(",") if ip.strip() and ip.strip() not in ("127.0.0.1", "::1")]
 
-ufw --force enable >/dev/null 2>&1 || true
-ok "Firewall: default deny incoming; 22, 80, ${PORT}, and app ports open"
+def say(mark, text):
+    colour = {"→": "\033[1;34m", "✗": "\033[1;31m", "!": "\033[1;33m"}.get(mark)
+    print(("%s%s %s\033[0m" % (colour, mark, text)) if colour else "%s %s" % (mark, text), flush=True)
+
+def fail(text):
+    say("✗", text)
+    sys.exit(1)
+
+def ufw(*a):
+    p = subprocess.run(["ufw"] + list(a), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return p.returncode, p.stdout.strip()
+
+def src(text):
+    """An address or network as ufw would compare it; 'any' for anyone."""
+    text = str(text).strip()
+    if text in ("", "any", "Anywhere"):
+        return "any"
+    net = ipaddress.ip_network(text, strict=False)   # ValueError on garbage
+    return str(net.network_address) if net.num_addresses == 1 else str(net)
+
+def show(port, proto, source):
+    return "%s/%s from %s" % (port, proto, "anywhere" if source == "any" else source)
+
+# ── Built-in ports ────────────────────────────────────────────────────────────
+def builtin():
+    rows = {(22, "tcp"): "SSH", (agent_port, "tcp"): "p5agent", (80, "tcp"): "ACME http-01 / Nginx"}
+    try:
+        apps = json.load(open(installed))
+    except Exception:
+        apps = []
+    for a in apps:
+        p = str(a.get("public-port") or a.get("port") or "443").strip()
+        if p.isdigit():
+            k = (int(p), "tcp")
+            label = str(a.get("name") or "app") + (" (nginx)" if a.get("public-port") else "")
+            rows[k] = rows[k] + ", " + label if k in rows else label
+    return rows
+
+# ── What ufw has ──────────────────────────────────────────────────────────────
+# ufw prints a comment quoted ('SSH'); an unquoted one is read the same way.
+COMMENT = r"(?: comment (?:'(.*)'|(\S+)))?$"
+SIMPLE = re.compile(r"^allow (\d+)/(tcp|udp)" + COMMENT)
+FROM = re.compile(r"^allow from (\S+) to any port (\d+) proto (tcp|udp)" + COMMENT)
+
+def current():
+    """{(port, proto): {"from": set, "label": str}} and the rules this cannot
+    read (ranges, limit, deny, …) as their ufw text."""
+    rc, out = ufw("show", "added")
+    groups, raw = {}, []
+    for line in out.splitlines():
+        if not line.startswith("ufw "):
+            continue
+        rule = line[4:].strip()
+        m, f = SIMPLE.match(rule), FROM.match(rule)
+        if m:
+            k, s, label = (int(m.group(1)), m.group(2)), "any", m.group(3) or m.group(4) or ""
+        elif f:
+            try:
+                k, s, label = (int(f.group(2)), f.group(3)), src(f.group(1)), f.group(4) or f.group(5) or ""
+            except ValueError:
+                raw.append(rule)
+                continue
+        else:
+            raw.append(rule)
+            continue
+        g = groups.setdefault(k, {"from": set(), "label": label})
+        g["from"].add(s)
+        g["label"] = g["label"] or label
+    return groups, raw
+
+def add(k, s, label):
+    a = ["allow", "%s/%s" % k] if s == "any" else ["allow", "from", s, "to", "any", "port", str(k[0]), "proto", k[1]]
+    rc, msg = ufw(*(a + ["comment", label or "custom"]))
+    say("✓" if rc == 0 else "!", ("Opened %s — %s" % (show(k[0], k[1], s), label or "custom")) if rc == 0 else "Could not open %s: %s" % (show(k[0], k[1], s), msg))
+
+def delete(k, s):
+    a = ["allow", "%s/%s" % k] if s == "any" else ["allow", "from", s, "to", "any", "port", str(k[0]), "proto", k[1]]
+    rc, msg = ufw("--force", "delete", *a)
+    say("✓" if rc == 0 else "!", ("Closed %s" % show(k[0], k[1], s)) if rc == 0 else "Could not close %s: %s" % (show(k[0], k[1], s), msg))
+
+def floor():
+    ufw("default", "deny", "incoming")
+    ufw("default", "allow", "outgoing")
+    say("✓", "Default: deny all incoming, allow outgoing")
+
+def ensure_builtin(groups):
+    for k, label in builtin().items():
+        if k not in groups:
+            add(k, "any", label)
+            groups[k] = {"from": {"any"}, "label": label}
+
+def enable():
+    rc, msg = ufw("--force", "enable")
+    if rc != 0:
+        fail("Could not enable the firewall: %s" % msg)
+    say("✓", "Firewall active: only the listed ports accept incoming connections")
+
+# ── plan ──────────────────────────────────────────────────────────────────────
+if mode == "--plan":
+    groups, raw = current()
+    rows, bi = [], builtin()
+    for k in list(bi) + sorted(k for k in groups if k not in bi):
+        g = groups.get(k, {"from": {"any"}, "label": ""})   # a built-in port with no rule yet opens to anyone
+        sources = sorted(s for s in g["from"] if s != "any")
+        rows.append({"port": k[0], "proto": k[1],
+                     "from": [] if "any" in g["from"] else sources,
+                     "label": bi.get(k) or g["label"] or "custom", "managed": k in bi})
+    for r in raw:
+        rows.append({"raw": r, "label": "added by hand", "managed": False})
+    print(json.dumps({"rules": rows, "agent_port": agent_port, "dashboard": dashboard}))
+    sys.exit(0)
+
+# ── close ─────────────────────────────────────────────────────────────────────
+if mode == "--close":
+    spec = (args[1] if len(args) > 1 else "").split("/")
+    if not spec[0].isdigit():
+        fail("usage: firewall.sh --close <port>[/tcp|udp]")
+    k = (int(spec[0]), spec[1] if len(spec) > 1 else "tcp")
+    if k in builtin():
+        say("✓", "Port %s/%s stays open — %s still uses it" % (k[0], k[1], builtin()[k]))
+        sys.exit(0)
+    groups, _ = current()
+    for s in sorted(groups.get(k, {"from": set()})["from"]):
+        delete(k, s)
+    sys.exit(0)
+
+# ── set ───────────────────────────────────────────────────────────────────────
+if mode == "--set":
+    try:
+        posted = json.load(open(args[1]))
+        rules = posted["rules"]
+        assert isinstance(rules, list)
+    except Exception:
+        fail("The request is not a rule list")
+    bi = builtin()
+    wanted, raw_kept = {}, set()
+    for r in rules:
+        if r.get("raw"):
+            raw_kept.add(str(r["raw"]))
+            continue
+        try:
+            k = (int(r.get("port")), str(r.get("proto") or "tcp").lower())
+        except (TypeError, ValueError):
+            fail("Not a port: %r" % r.get("port"))
+        if not 1 <= k[0] <= 65535 or k[1] not in ("tcp", "udp"):
+            fail("Not a valid port/protocol: %s/%s" % k)
+        try:
+            sources = {src(a) for a in (r.get("from") or []) if str(a).strip()}
+        except ValueError as exc:
+            fail("Not an IP address or network: %s" % exc)
+        if sources:
+            if k == (agent_port, "tcp") and not dashboard:
+                fail("P5AGENT_ALLOW_IP is not set, so the agent port cannot be restricted "
+                     "without locking the dashboard out")
+            sources |= {src(ip) for ip in dashboard}    # the dashboard is always on a list
+        wanted[k] = sources or {"any"}
+
+    groups, raw = current()
+    floor()
+    # Built-in ports cannot be removed: one missing from the request is left as it is.
+    for k in bi:
+        if k not in wanted and k in groups:
+            wanted[k] = set(groups[k]["from"])
+    # Removals first — a changing rule is briefly closed, never briefly open.
+    for r in raw:
+        if r not in raw_kept:
+            rc, msg = ufw("--force", "delete", *re.sub(r" comment .*$", "", r).split())
+            say("✓" if rc == 0 else "!", ("Removed %s" % r) if rc == 0 else "Could not remove %s: %s" % (r, msg))
+    for k in sorted(groups):
+        for s in sorted(groups[k]["from"] - wanted.get(k, set())):
+            delete(k, s)
+    for k in sorted(wanted):
+        label = bi.get(k) or (groups.get(k) or {}).get("label") or "custom"
+        for s in sorted(wanted[k] - (groups.get(k) or {"from": set()})["from"]):
+            add(k, s, label)
+    ensure_builtin({k: {"from": v} for k, v in wanted.items()})
+    enable()
+    sys.exit(0)
+
+# ── ensure (install, update, app and Nginx changes) ───────────────────────────
+say("→", "Checking the firewall")
+groups, _ = current()
+floor()
+ensure_builtin(groups)
+enable()
+PY

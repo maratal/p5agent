@@ -287,14 +287,6 @@ if [[ -n "$repo" || -n "$demo" ]]; then
         logline "$name app directory: $path"
     fi
 
-    # Open the app's port in the firewall (everything else is denied by default).
-    if [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )); then
-        if command -v ufw >/dev/null 2>&1; then
-            logline "Opening firewall port $port for $name"
-            runlog "ufw allow '$port/tcp' comment '$name'"
-        fi
-    fi
-
     setup=""
     for candidate in setup.sh install.sh; do
         [[ -f "$app_dir/$candidate" ]] && { setup="$app_dir/$candidate"; break; }
@@ -383,6 +375,14 @@ os.makedirs(os.path.dirname(installed), exist_ok=True)
 json.dump(apps, open(installed, "w"), indent=2)
 PY
     logline "Recorded $name in installed_apps.json"
+
+    # Open the app's port: firewall.sh opens every port installed_apps.json
+    # (now listing this app) names that has no rule yet — an existing one, such
+    # as a restriction from Firewall Settings, is left as it is.
+    if command -v ufw >/dev/null 2>&1; then
+        logline "Opening firewall port $port for $name"
+        runlog "bash '$HERE/firewall.sh'" || logline "Firewall update failed"
+    fi
 fi
 
 # ── What is running now ──────────────────────────────────────────────────────

@@ -481,10 +481,12 @@ PY
     fi
     ok "Nginx serves $name on port $public"
 
+    # The entry now has public-port: firewall.sh opens it and 80 if they have no
+    # rule yet (a restriction from Firewall Settings stays), and the private
+    # port is closed outright.
     if command -v ufw >/dev/null 2>&1; then
-        ufw allow "$public/tcp" comment "$name (nginx)" >/dev/null 2>&1 || true
-        ufw allow 80/tcp comment "ACME http-01" >/dev/null 2>&1 || true
-        ufw delete allow "$new_port/tcp" >/dev/null 2>&1 || true
+        bash "$HERE/firewall.sh" >/dev/null 2>&1 || true
+        bash "$HERE/firewall.sh" --close "$new_port/tcp" >/dev/null 2>&1 || true
         ok "Firewall: $public and 80 open, $new_port closed"
     fi
 
