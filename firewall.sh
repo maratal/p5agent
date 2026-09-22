@@ -21,8 +21,8 @@
 # Built-in ports: SSH (22), the agent (5005), 80 (ACME http-01, Nginx's
 # redirect) and each installed app's port — its public-port when it is behind
 # Nginx. They can be restricted to addresses but not removed. Any list of
-# addresses always includes the dashboard's (P5AGENT_ALLOW_IP): it drives the
-# agent and probes every app.
+# addresses always includes the dashboard's (P5AGENT_ALLOW_IP, and the address
+# the agent received the request from): it drives the agent and probes every app.
 
 set -uo pipefail
 
@@ -44,12 +44,31 @@ case "${1:-}" in
 esac
 
 exec python3 - "$DATA_DIR/installed_apps.json" "$PORT" "$(getenvval P5AGENT_ALLOW_IP)" "$@" <<'PY'
-import ipaddress, json, re, subprocess, sys
+import ipaddress, json, os, re, subprocess, sys
 
 installed, agent_port, allow_ip = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 args = sys.argv[4:]
 mode = args[0] if args else "ensure"
-dashboard = [ip.strip() for ip in allow_ip.split(",") if ip.strip() and ip.strip() not in ("127.0.0.1", "::1")]
+
+def public_addr(text):
+    """`text` as a plain address, or None for loopback, unspecified or not an
+    address at all."""
+    try:
+        a = ipaddress.ip_address(str(text).strip())
+    except ValueError:
+        return None
+    if getattr(a, "ipv4_mapped", None):
+        a = a.ipv4_mapped
+    return None if a.is_loopback or a.is_unspecified else str(a)
+
+# The dashboard's addresses: P5AGENT_ALLOW_IP, plus the address the request
+# that runs this came from (P5AGENT_CALLER_IP, set by the agent) — so it is
+# known even when P5AGENT_ALLOW_IP is unset.
+dashboard = []
+for ip in allow_ip.split(",") + [os.environ.get("P5AGENT_CALLER_IP", "")]:
+    ip = public_addr(ip)
+    if ip and ip not in dashboard:
+        dashboard.append(ip)
 
 def say(mark, text):
     colour = {"→": "\033[1;34m", "✗": "\033[1;31m", "!": "\033[1;33m"}.get(mark)

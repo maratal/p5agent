@@ -135,9 +135,9 @@ PENDING_INSTALL = os.path.join(DATA_DIR, "pending_install.json")
 INSTALL_STALL_SECS = 1800  # no log activity for 30 min → the install failed
 
 
-def run(cmd, cwd=None):
+def run(cmd, cwd=None, extra_env=None):
     """Run a command, capturing combined stdout+stderr. Returns (rc, output)."""
-    env = dict(os.environ, HOME="/root", DEBIAN_FRONTEND="noninteractive")
+    env = dict(os.environ, HOME="/root", DEBIAN_FRONTEND="noninteractive", **(extra_env or {}))
     try:
         proc = subprocess.run(
             cmd,
@@ -867,8 +867,13 @@ class Handler(BaseHTTPRequestHandler):
         started here, followed through /firewall-log."""
         if not os.path.isfile(FIREWALL_SCRIPT):
             return self._send(500, {"error": "firewall.sh not found"})
+        # The address this request came from — the dashboard, as the upplet's
+        # firewall sees it. firewall.sh puts it on every address list next to
+        # P5AGENT_ALLOW_IP, so a list never shuts out the dashboard driving it,
+        # even on an upplet whose P5AGENT_ALLOW_IP is unset.
+        caller = {"P5AGENT_CALLER_IP": self.client_address[0]}
         if self.command == "GET":
-            rc, out = run(["bash", FIREWALL_SCRIPT, "--plan"])
+            rc, out = run(["bash", FIREWALL_SCRIPT, "--plan"], extra_env=caller)
             try:
                 table = json.loads(out.strip().splitlines()[-1]) if rc == 0 else None
             except (ValueError, IndexError):
@@ -904,7 +909,7 @@ class Handler(BaseHTTPRequestHandler):
                 ["bash", "-c", runner, "p5agent-firewall",
                  FIREWALL_LOG, FIREWALL_SCRIPT, request, FIREWALL_DONE],
                 cwd=APP_DIR,
-                env=dict(os.environ, HOME="/root"),
+                env=dict(os.environ, HOME="/root", **caller),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,   # survive the agent and this request
