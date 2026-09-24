@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # nginx.sh — puts Nginx in front of installed apps.
 #
-#   nginx.sh wire <name> <app-port> [--bots] [--fail2ban]
+#   nginx.sh wire <name> <app-port> [--public <port>] [--bots] [--fail2ban]
 #                                     move the app to <app-port> (plain HTTP,
 #                                     loopback only) and let Nginx serve its old
 #                                     port over HTTPS, plus port 80. 0 picks the
 #                                     port: the app's current private one on a
 #                                     re-wire, else the first free from 5656.
+#                                     --public: the port Nginx serves the app on
+#                                     instead (the old one is closed); left out,
+#                                     it stays where it is
 #                                     --bots / --fail2ban: see "Bot protection"
 #                                     below; leaving a flag out on a re-run
 #                                     turns that protection off again
@@ -333,7 +336,7 @@ pick_port() {
 
 # ── wire ─────────────────────────────────────────────────────────────────────
 do_wire() {
-    local name="$1" new_port="$2" bots="$3" f2b="$4"
+    local name="$1" new_port="$2" bots="$3" f2b="$4" new_public="${5:-}"
     [[ "$bots" == 1 || "$f2b" != 1 ]] || fail "fail2ban bans what bot protection refuses — turn bot protection on too"
     local row cur_port public
     row=$(apps_table | awk -F'\t' -v n="$name" '$1 == n')
@@ -346,16 +349,33 @@ do_wire() {
         ok "Picked port $new_port for $name"
     fi
     public="${public:-$cur_port}"
+    # The port Nginx serves the app on: where it is now (the app's own port on a
+    # first wire), or the one asked for — the old one is closed afterwards.
+    local old_public="$public"
+    if [[ -n "$new_public" ]]; then
+        [[ "$new_public" =~ ^[0-9]+$ ]] && (( new_public >= 1 && new_public <= 65535 )) \
+            || fail "The public port must be a number from 1 to 65535"
+        public="$new_public"
+    fi
     [[ "$new_port" =~ ^[0-9]+$ ]] && (( new_port >= 1024 && new_port <= 65535 )) \
         || fail "The app's new port must be a number from 1024 to 65535 (or 0 to pick one)"
     (( new_port != AGENT_PORT )) || fail "Port $new_port is the agent's"
-    [[ "$public" != 80 ]] || fail "$name is on port 80, which Nginx needs for itself — reinstall it on 443"
+    [[ "$public" != 80 ]] || fail "Port 80 is Nginx's own (certificates, the redirect to HTTPS) — pick another public port"
+    (( public != AGENT_PORT )) || fail "Port $public is the agent's"
     (( new_port != public )) || fail "The app's new port must differ from the port Nginx takes ($public)"
 
     # Not a port another app has, privately or through Nginx.
     local clash
     clash=$(apps_table | awk -F'\t' -v n="$name" -v p="$new_port" '$1 != n && ($2 == p || $3 == p) {print $1}' | head -1)
     [[ -z "$clash" ]] || fail "Port $new_port is already used by $clash"
+    if [[ "$public" != "$old_public" ]]; then
+        clash=$(apps_table | awk -F'\t' -v n="$name" -v p="$public" '$1 != n && ($2 == p || $3 == p) {print $1}' | head -1)
+        [[ -z "$clash" ]] || fail "Port $public is already used by $clash"
+        # Free, unless it is this app's own port — which it is leaving.
+        if [[ "$public" != "$cur_port" ]] && ss -ltnH "sport = :$public" 2>/dev/null | grep -q .; then
+            fail "Something is already listening on port $public"
+        fi
+    fi
     if [[ "$new_port" != "$cur_port" ]] && ss -ltnH "sport = :$new_port" 2>/dev/null | grep -q .; then
         fail "Something is already listening on port $new_port"
     fi
@@ -488,6 +508,10 @@ PY
         bash "$HERE/firewall.sh" >/dev/null 2>&1 || true
         bash "$HERE/firewall.sh" --close "$new_port/tcp" >/dev/null 2>&1 || true
         ok "Firewall: $public and 80 open, $new_port closed"
+        if [[ "$old_public" != "$public" && "$old_public" != "$new_port" ]]; then
+            bash "$HERE/firewall.sh" --close "$old_public/tcp" >/dev/null 2>&1 || true
+            ok "Firewall: $old_public closed — $name is served on $public now"
+        fi
     fi
 
     switch_renewal_to_webroot "$cert"
@@ -569,16 +593,19 @@ do_unwire() {
 
 case "${1:-}" in
     wire)
-        [[ $# -ge 3 ]] || fail "usage: nginx.sh wire <name> <app-port> [--bots] [--fail2ban]"
-        bots=0 f2b=0
-        for flag in "${@:4}"; do
-            case "$flag" in
+        [[ $# -ge 3 ]] || fail "usage: nginx.sh wire <name> <app-port> [--public <port>] [--bots] [--fail2ban]"
+        wire_name="$2" wire_port="$3" bots=0 f2b=0 public_port=""
+        shift 3
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
                 --bots) bots=1 ;;
                 --fail2ban) f2b=1 ;;
-                *) fail "Unknown option: $flag" ;;
+                --public) [[ $# -ge 2 ]] || fail "--public needs a port"; public_port="$2"; shift ;;
+                *) fail "Unknown option: $1" ;;
             esac
+            shift
         done
-        do_wire "$2" "$3" "$bots" "$f2b" ;;
+        do_wire "$wire_name" "$wire_port" "$bots" "$f2b" "$public_port" ;;
     certs)  [[ $# -eq 3 ]] || fail "usage: nginx.sh certs <cert> <key>"; do_certs "$2" "$3" ;;
     unwire) [[ $# -eq 2 ]] || fail "usage: nginx.sh unwire <name>"; do_unwire "$2" ;;
     *) sed -n '2,20p' "$0"; exit 2 ;;

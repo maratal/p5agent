@@ -17,6 +17,7 @@ root systemd service on port 5005 and exposes:
                         agent --remove | -r <ip>   take <ip> off P5AGENT_ALLOW_IP
                         proxy --allow | -a <names> add comma-separated domain
                                                    names to Squid's whitelist
+                        proxy --remove | -r <names> take domain names off it
                         proxy --whitelist | -wl    the whitelist Squid has loaded
     *    /install-app  spawn install_app.sh in the background to install an app
                       and its dependencies; returns 200 once the job is launched.
@@ -31,7 +32,8 @@ root systemd service on port 5005 and exposes:
     POST /app         one installed app's lifecycle, via app_ops.sh:
                       {"op": start|stop|backup|update|rollback|uninstall|nginx, "name": ...,
                        "drop_db": bool (uninstall), "port": int (nginx: the
-                       app's new private port, 0 = pick one), "bots": bool,
+                       app's new private port, 0 = pick one), "public_port":
+                       int (nginx: the port it serves the app on), "bots": bool,
                        "fail2ban": bool (nginx: bot protection, on or off)} -> {returncode, output};
                       update and nginx run in the background -> {"status": "started"}
     GET  /app-log     the current (or last) app job — an update or an nginx wire:
@@ -323,35 +325,81 @@ def squid_current():
     }
 
 
+def squid_names(text):
+    """Comma- or space-separated domain names, lower case, each once — or
+    (None, message) when one is not a domain name."""
+    names = [n.lower().rstrip(".") for n in re.split(r"[,\s]+", text or "")]
+    names = list(dict.fromkeys(n for n in names if n and n != "."))
+    bad = [n for n in names if len(n) > 253 or not SQUID_DOMAIN_RE.match(n)]
+    if bad:
+        return None, "Not a domain name: %s\n" % ", ".join(bad)
+    return names, ""
+
+
+def squid_covers(entry, name):
+    """Does whitelist `entry` match everything `name` matches?"""
+    if entry == name:
+        return True
+    return entry.startswith(".") and (name.lstrip(".") == entry[1:] or name.endswith(entry))
+
+
+def squid_save_whitelist(entries, old_text):
+    """Write the whitelist Squid uses and have Squid re-read it, checking the
+    whole configuration first; a list Squid refuses goes back to what it was.
+    Returns (rc, output) — output empty on success."""
+    try:
+        st = os.stat(SQUID_WHITELIST_LIVE)
+        tmp = SQUID_WHITELIST_LIVE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, st.st_mode & 0o777)
+        with os.fdopen(fd, "w") as fh:
+            fh.write("\n".join(entries) + "\n")
+        os.chown(tmp, st.st_uid, st.st_gid)
+        os.replace(tmp, SQUID_WHITELIST_LIVE)
+    except OSError as exc:
+        return 1, "Not saved: %s\n" % exc
+    rc, out = run(["squid", "-k", "parse"])
+    if rc == 0:
+        rc, out = run(["squid", "-k", "reconfigure"])
+    if rc != 0:
+        try:
+            with open(SQUID_WHITELIST_LIVE, "w") as fh:
+                fh.write(old_text)
+        except OSError:
+            pass
+        return 1, out + "\nSquid did not accept the new list — the whitelist is unchanged\n"
+    return 0, ""
+
+
+def squid_whitelist_ready():
+    """(rc, message) when the whitelist cannot be edited here, else None."""
+    current = squid_current()
+    if not current:
+        return 1, "Squid is not set up on this upplet — run Setup Squid first\n"
+    if not current.get("whitelist"):
+        return 1, "Squid has no whitelist: every domain is allowed already\n"
+    return None
+
+
 def squid_allow(text):
     """`proxy --allow | -a <names>`: add comma-separated domain names to the
     whitelist Squid uses, and have Squid re-read it. A name with a leading dot
     covers its subdomains too; one without is that host only. A name already
     covered by an entry is skipped; entries the new ones cover are dropped
     (Squid warns about overlapping dstdomain entries). Returns (rc, output)."""
-    names = [n.lower().rstrip(".") for n in re.split(r"[,\s]+", text or "")]
-    names = [n for n in names if n and n != "."]
+    names, error = squid_names(text)
+    if error:
+        return 2, error
     if not names:
         return 2, Handler.ALIAS_USAGE["proxy"]
-    bad = [n for n in names if len(n) > 253 or not SQUID_DOMAIN_RE.match(n)]
-    if bad:
-        return 2, "Not a domain name: %s\n" % ", ".join(bad)
-    current = squid_current()
-    if not current:
-        return 1, "Squid is not set up on this upplet — run Setup Squid first\n"
-    if not current.get("whitelist"):
-        return 1, "Squid has no whitelist: every domain is allowed already\n"
-
-    def covers(entry, name):
-        """Does whitelist `entry` match everything `name` matches?"""
-        if entry == name:
-            return True
-        return entry.startswith(".") and (name.lstrip(".") == entry[1:] or name.endswith(entry))
+    blocked = squid_whitelist_ready()
+    if blocked:
+        return blocked
+    covers = squid_covers
 
     old_text = read_file(SQUID_WHITELIST_LIVE)
     entries = squid_whitelist_domains(old_text)
     added, skipped, dropped = [], [], []
-    for name in dict.fromkeys(names):
+    for name in names:
         holder = next((e for e in entries if covers(e, name)), None)
         if holder:
             skipped.append(name if holder == name else "%s (covered by %s)" % (name, holder))
@@ -364,34 +412,60 @@ def squid_allow(text):
         return 0, "Nothing to add — already allowed: %s\n" % ", ".join(skipped)
 
     entries = squid_whitelist_domains("\n".join(entries))
-    try:
-        st = os.stat(SQUID_WHITELIST_LIVE)
-        tmp = SQUID_WHITELIST_LIVE + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, st.st_mode & 0o777)
-        with os.fdopen(fd, "w") as fh:
-            fh.write("\n".join(entries) + "\n")
-        os.chown(tmp, st.st_uid, st.st_gid)
-        os.replace(tmp, SQUID_WHITELIST_LIVE)
-    except OSError as exc:
-        return 1, "Not saved: %s\n" % exc
-
-    # Check the whole configuration with the new list before Squid re-reads it;
-    # a list Squid refuses goes back to what it was.
-    rc, out = run(["squid", "-k", "parse"])
-    if rc == 0:
-        rc, out = run(["squid", "-k", "reconfigure"])
+    rc, out = squid_save_whitelist(entries, old_text)
     if rc != 0:
-        try:
-            with open(SQUID_WHITELIST_LIVE, "w") as fh:
-                fh.write(old_text)
-        except OSError:
-            pass
-        return 1, out + "\nSquid did not accept the new list — the whitelist is unchanged\n"
+        return rc, out
     lines = ["Added: %s" % ", ".join(added)]
     if dropped:
         lines.append("Dropped, now covered: %s" % ", ".join(dropped))
     if skipped:
         lines.append("Already allowed: %s" % ", ".join(skipped))
+    lines.append("Squid reloaded — %d domain(s) on the whitelist" % len(entries))
+    return 0, "\n".join(lines) + "\n"
+
+
+def squid_remove(text):
+    """`proxy --remove | -r <names>`: take comma-separated entries off the
+    whitelist Squid uses, and have Squid re-read it. Only an entry as it is
+    written goes (".github.com" and "github.com" are different entries); a
+    name still reached through a broader entry is said so. The list is never
+    left empty — turning the whitelist off is Setup Squid's. Returns
+    (rc, output)."""
+    names, error = squid_names(text)
+    if error:
+        return 2, error
+    if not names:
+        return 2, Handler.ALIAS_USAGE["proxy"]
+    blocked = squid_whitelist_ready()
+    if blocked:
+        return blocked
+    old_text = read_file(SQUID_WHITELIST_LIVE)
+    entries = squid_whitelist_domains(old_text)
+    removed, missing = [], []
+    for name in names:
+        if name in entries:
+            entries.remove(name)
+            removed.append(name)
+        else:
+            missing.append(name)
+    notes = []
+    for name in removed + missing:
+        holder = next((e for e in entries if squid_covers(e, name)), None)
+        if holder:
+            notes.append("%s is still allowed through %s" % (name, holder))
+    if not removed:
+        return 0, "Nothing to remove — not on the list: %s\n%s" % (
+            ", ".join(missing), "".join(n + "\n" for n in notes))
+    if not entries:
+        return 1, ("Not removed: the whitelist would be empty. To allow every domain, "
+                   "turn the whitelist off in Setup Squid\n")
+    rc, out = squid_save_whitelist(entries, old_text)
+    if rc != 0:
+        return rc, out
+    lines = ["Removed: %s" % ", ".join(removed)]
+    if missing:
+        lines.append("Not on the list: %s" % ", ".join(missing))
+    lines += notes
     lines.append("Squid reloaded — %d domain(s) on the whitelist" % len(entries))
     return 0, "\n".join(lines) + "\n"
 
@@ -929,6 +1003,7 @@ class Handler(BaseHTTPRequestHandler):
         "agent": "usage: agent --print | -p\n       agent --allow | -a <ip>\n"
                  "       agent --remove | -r <ip>\n",
         "proxy": "usage: proxy --allow | -a <name>[,<name>...]\n"
+                 "       proxy --remove | -r <name>[,<name>...]\n"
                  "       proxy --whitelist | -wl\n",
     }
 
@@ -941,6 +1016,7 @@ class Handler(BaseHTTPRequestHandler):
             agent --remove | -r <ip> take <ip> off it
             proxy --allow | -a <names>  add comma-separated domain names to
                                      Squid's whitelist (squid_allow)
+            proxy --remove | -r <names>  take them off it (squid_remove)
             proxy --whitelist | -wl  the whitelist Squid has loaded
         Returns True when it answered, False when `text` is not an alias."""
         m = self.ALIAS.match(text)
@@ -958,9 +1034,10 @@ class Handler(BaseHTTPRequestHandler):
         elif name == "proxy" and args in (["--whitelist"], ["-wl"]):
             rc, out = squid_whitelist_report()
             self._send(200 if rc == 0 else 500, {"returncode": rc, "output": out})
-        elif name == "proxy" and len(args) >= 2 and args[0] in ("--allow", "-a"):
+        elif name == "proxy" and len(args) >= 2 and args[0] in ("--allow", "-a", "--remove", "-r"):
             # The names as typed after the flag: "a.com, b.com" is one list.
-            rc, out = squid_allow(m.group(2).split(None, 1)[1])
+            names = m.group(2).split(None, 1)[1]
+            rc, out = squid_allow(names) if args[0] in ("--allow", "-a") else squid_remove(names)
             self._send(200 if rc == 0 else 500, {"returncode": rc, "output": out})
         else:
             self._send(500, {"returncode": 2, "output": self.ALIAS_USAGE[name]})
@@ -1076,6 +1153,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"error": "port must be 0 or a number from 1024 to 65535"})
             # Bot protection is set on every run: a flag left out turns it off.
             flags = ["--port", str(port)]
+            # The port Nginx serves the app on; left out, it stays where it is.
+            public = req.get("public_port")
+            if public is not None:
+                if not isinstance(public, int) or isinstance(public, bool) or not 1 <= public <= 65535 or public in (80, PORT):
+                    return self._send(400, {"error": "public_port must be a number from 1 to 65535, not 80 or %d" % PORT})
+                flags += ["--public", str(public)]
             if req.get("bots") is True:
                 flags.append("--bots")
                 if req.get("fail2ban") is True:

@@ -15,7 +15,7 @@
 #                  start the app again (the backup is used up)
 #   nginx          put Nginx in front of the app (nginx.sh wire): the app moves
 #                  to --port <n> (0 = pick one) over plain HTTP on 127.0.0.1, Nginx serves its
-#                  old port over HTTPS plus port 80; [--bots] [--fail2ban]
+#                  old port over HTTPS plus port 80; [--public <port>] [--bots] [--fail2ban]
 #                  turn bot protection on (left out: off)
 #   uninstall      stop and remove the app: its service, folder and backups,
 #                  certificate dir, sudoers entry, user, firewall port and its
