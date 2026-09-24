@@ -47,8 +47,12 @@ root systemd service on port 5005 and exposes:
                       "upplet" | "template"; current: {port, user, whitelist}
                       of the proxy set up already, or null}
     POST /squid       {user, password, port, whitelist: bool, domains: [...]} —
-                      run squid/setup.sh with them, in the background
+                      run squid/setup.sh with them, in the background;
+                      {keep_credentials: true} instead of user and password
+                      changes the rest and keeps the proxy's credentials
     GET  /squid-log   the current (or last) Squid setup: {log, finished, returncode}
+    GET  /utilities   what is set up on the upplet besides apps: {squid: {port,
+                      user, whitelist} | null, nginx: [apps behind Nginx]}
     GET  /info        the upplet itself: OS, kernel, uptime, memory, disk, this
                       agent's commit, installed versions of the supported
                       dependencies, and the firewall's rules
@@ -793,7 +797,7 @@ class Handler(BaseHTTPRequestHandler):
 
     ROUTES = ("/update", "/command", "/install-app", "/progress",
               "/supported", "/apps", "/certs", "/certs-log", "/info", "/app",
-              "/app-log", "/firewall", "/firewall-log", "/squid", "/squid-log")
+              "/app-log", "/firewall", "/firewall-log", "/squid", "/squid-log", "/utilities")
     # Only running arbitrary commands is locked to the allowed source IP; every
     # other operation needs just the token.
     IP_RESTRICTED = ("/command",)
@@ -829,6 +833,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/firewall-log": self._do_firewall_log,
                 "/squid": self._do_squid,
                 "/squid-log": self._do_squid_log,
+                "/utilities": self._do_utilities,
             }[path]()
         except Exception as exc:  # noqa: BLE001 - never leak a traceback as 500 HTML
             try:
@@ -1250,8 +1255,12 @@ class Handler(BaseHTTPRequestHandler):
             req = json.loads(self._body().decode("utf-8", "replace") or "{}")
         except ValueError:
             return self._send(400, {"error": "body must be JSON"})
-        user = str(req.get("user") or "").strip()
-        password = str(req.get("password") or "")
+        keep = req.get("keep_credentials") is True
+        current_setup = squid_current()
+        if keep and not current_setup:
+            return self._send(409, {"error": "Squid is not set up here — there are no credentials to keep"})
+        user = str(req.get("user") or "").strip() if not keep else (current_setup.get("user") or "")
+        password = str(req.get("password") or "") if not keep else "kept"
         use_whitelist = bool(req.get("whitelist"))
         try:
             port = int(req.get("port"))
@@ -1283,8 +1292,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(409, {"error": "Squid is being set up already"})
 
         os.makedirs(DATA_DIR, exist_ok=True)
-        extra = {"PROXY_USER": user, "PROXY_PASS": password, "PROXY_PORT": str(port),
-                 "SQUID_WHITELIST": "1" if use_whitelist else "0", "SQUID_MANAGED": "1"}
+        extra = {"PROXY_PORT": str(port), "SQUID_MANAGED": "1",
+                 "SQUID_WHITELIST": "1" if use_whitelist else "0"}
+        if keep:
+            extra["SQUID_KEEP_PASSWD"] = "1"
+        else:
+            extra.update({"PROXY_USER": user, "PROXY_PASS": password})
         request = ""
         if use_whitelist:
             request = os.path.join(TMP_DIR, "squid_whitelist_%s.txt" % datetime.now().strftime("%d_%m_%y_%H_%M_%S"))
@@ -1293,8 +1306,9 @@ class Handler(BaseHTTPRequestHandler):
                 fh.write("\n".join(domains) + "\n")
             extra["WHITELIST_FILE"] = request
         with open(SQUID_LOG, "w") as fh:
-            fh.write("[p5agent] setting up Squid on port %d for user %s%s\n"
-                     % (port, user, " with %d whitelisted domain(s)" % len(domains) if use_whitelist else ", no whitelist"))
+            fh.write("[p5agent] setting up Squid on port %d for user %s%s%s\n"
+                     % (port, user, " (credentials kept)" if keep else "",
+                        " with %d whitelisted domain(s)" % len(domains) if use_whitelist else ", no whitelist"))
         with open(SQUID_STATUS, "w") as fh:
             json.dump({"started_at": int(time.time()), "port": port, "user": user}, fh)
         runner = ('exec >>"$1" 2>&1 </dev/null; bash "$2"; rc=$?; '
@@ -1316,6 +1330,16 @@ class Handler(BaseHTTPRequestHandler):
                     pass
             return self._send(500, {"error": "failed to start the Squid setup", "detail": str(exc)})
         return self._send(200, {"status": "started"})
+
+    def _do_utilities(self):
+        """What is set up here besides apps — for the dashboard's upplet menu:
+        Squid (as squid/setup.sh left it) and the apps behind Nginx."""
+        try:
+            apps = json.loads(read_file(INSTALLED_APPS) or "[]")
+        except ValueError:
+            apps = []
+        wired = [str(a.get("name")) for a in apps if isinstance(a, dict) and a.get("public-port")]
+        return self._send(200, {"squid": squid_current(), "nginx": wired})
 
     def _do_squid_log(self):
         """The current (or last) Squid setup: {log, finished, returncode}."""

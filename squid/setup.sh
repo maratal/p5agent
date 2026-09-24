@@ -9,6 +9,9 @@
 # Env:    PROXY_PORT      (default 3128)
 #         PROXY_USER      username — skips the prompt when set
 #         PROXY_PASS      password — skips the prompt when set
+#         SQUID_KEEP_PASSWD 1 = keep the credentials a previous run set up
+#                         (its passwd file): no prompt, PROXY_USER/PROXY_PASS
+#                         unused — for changing the rest (port, whitelist)
 #         WHITELIST_FILE  domain list to use instead of whitelist.txt
 #         SQUID_WHITELIST 0 = no domain whitelist: any destination for an
 #                         authenticated user (default 1)
@@ -79,7 +82,13 @@ done
 [[ -n "$AUTH_HELPER" ]] || die "basic_ncsa_auth helper not found"
 
 # --- Prompt for credentials ------------------------------------------------
-if [[ -z "${PROXY_USER:-}" ]]; then
+KEEP_PASSWD=0
+if [[ "${SQUID_KEEP_PASSWD:-0}" == "1" ]]; then
+    PROXY_USER="$(head -n1 "$PASSWD_FILE" 2>/dev/null | cut -d: -f1 || true)"
+    [[ -n "$PROXY_USER" ]] || die "no credentials to keep: $PASSWD_FILE is missing or empty"
+    KEEP_PASSWD=1
+    PROXY_PASS="kept"             # not used: the passwd file stays as it is
+elif [[ -z "${PROXY_USER:-}" ]]; then
     read -r -p "Proxy username: " PROXY_USER
 fi
 [[ -n "$PROXY_USER" ]] || die "username cannot be empty"
@@ -99,9 +108,13 @@ P5AGENT_PORT="${P5AGENT_PORT:-5005/tcp}"
 [[ "$P5AGENT_PORT" == */* ]] || P5AGENT_PORT="$P5AGENT_PORT/tcp"
 
 # --- Write password file (password read from stdin, not visible in ps) ----
-printf '%s' "$PROXY_PASS" | htpasswd -i -c -B "$PASSWD_FILE" "$PROXY_USER" >/dev/null
+if [[ "$KEEP_PASSWD" == "1" ]]; then
+    echo "Credentials kept for user '$PROXY_USER'."
+else
+    printf '%s' "$PROXY_PASS" | htpasswd -i -c -B "$PASSWD_FILE" "$PROXY_USER" >/dev/null
+    echo "Password file written for user '$PROXY_USER'."
+fi
 unset PROXY_PASS PROXY_PASS2
-echo "Password file written for user '$PROXY_USER'."
 
 # Determine the user Squid runs as
 SQUID_USER="proxy"
