@@ -61,7 +61,6 @@
 .discordapp.com
 .discordapp.net
 .discourse-cdn.com
-.draw.io
 .facebook.net
 .fb.com
 .fbcdn.net
