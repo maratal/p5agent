@@ -17,6 +17,7 @@ root systemd service on port 5005 and exposes:
                         agent --remove | -r <ip>   take <ip> off P5AGENT_ALLOW_IP
                         proxy --allow | -a <names> add comma-separated domain
                                                    names to Squid's whitelist
+                        proxy --whitelist | -wl    the whitelist Squid has loaded
     *    /install-app  spawn install_app.sh in the background to install an app
                       and its dependencies; returns 200 once the job is launched.
                       One install runs at a time: the request is recorded in
@@ -278,6 +279,21 @@ def squid_status():
     return status
 
 
+def nginx_in_use():
+    """Why this upplet counts as an Nginx one — an app behind Nginx, or Nginx
+    running — or "" when it does not. Squid and Nginx do not share an upplet:
+    a proxy upplet's firewall is SSH, the agent and the proxy port only."""
+    try:
+        apps = json.loads(read_file(INSTALLED_APPS) or "[]")
+    except ValueError:
+        apps = []
+    wired = [str(a.get("name")) for a in apps if isinstance(a, dict) and a.get("public-port")]
+    if wired:
+        return "%s %s behind Nginx" % (", ".join(wired), "is" if len(wired) == 1 else "are")
+    rc, _ = run(["systemctl", "is-active", "--quiet", "nginx"])
+    return "Nginx is running" if rc == 0 else ""
+
+
 def squid_whitelist_domains(text):
     """The entries of a whitelist file: comments, blanks and case dropped,
     each once, in alphabetical order (a leading dot does not count)."""
@@ -312,7 +328,7 @@ def squid_allow(text):
     names = [n.lower().rstrip(".") for n in re.split(r"[,\s]+", text or "")]
     names = [n for n in names if n and n != "."]
     if not names:
-        return 2, "usage: proxy --allow | -a <name>[,<name>...]\n"
+        return 2, Handler.ALIAS_USAGE["proxy"]
     bad = [n for n in names if len(n) > 253 or not SQUID_DOMAIN_RE.match(n)]
     if bad:
         return 2, "Not a domain name: %s\n" % ", ".join(bad)
@@ -374,6 +390,62 @@ def squid_allow(text):
         lines.append("Already allowed: %s" % ", ".join(skipped))
     lines.append("Squid reloaded — %d domain(s) on the whitelist" % len(entries))
     return 0, "\n".join(lines) + "\n"
+
+
+def squid_whitelist_report():
+    """`proxy --whitelist | -wl`: the whitelist as Squid has it loaded, asked
+    from Squid's cache manager (its configuration, open to 127.0.0.1 only —
+    see squid/setup.sh). When Squid does not answer, the file it reads is
+    shown instead, and said so. Returns (rc, output)."""
+    current = squid_current()
+    if not current:
+        return 1, "Squid is not set up on this upplet — run Setup Squid first\n"
+    file_list = squid_whitelist_domains(read_file(SQUID_WHITELIST_LIVE))
+    loaded, why, hint = None, "", ""
+    try:
+        import urllib.error
+        import urllib.request
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        url = "http://127.0.0.1:%d/squid-internal-mgr/config" % (current.get("port") or 3128)
+        # Squid's port is closed for a moment while it reloads (as after
+        # `proxy --allow`): a refused connection is tried again, briefly.
+        for attempt in range(12):
+            try:
+                with opener.open(url, timeout=5) as resp:
+                    config = resp.read().decode("utf-8", "replace")
+                break
+            except urllib.error.URLError as exc:
+                if isinstance(exc, urllib.error.HTTPError) or attempt == 11 or \
+                        not isinstance(exc.reason, ConnectionRefusedError):
+                    raise
+                time.sleep(0.25)
+        if re.search(r"^\s*http_access\b", config, re.M):
+            loaded = []
+            for line in config.splitlines():
+                parts = line.split()
+                if parts[:3] == ["acl", "whitelist", "dstdomain"]:
+                    loaded += [p for p in parts[3:] if not p.startswith("-")]
+            loaded = squid_whitelist_domains("\n".join(loaded))
+        else:
+            why = "Squid answered without its configuration"
+    except urllib.error.HTTPError as exc:
+        # Squid is up but will not tell: a configuration from before it did.
+        why = "Squid refused to show its configuration (HTTP %d)" % exc.code
+        hint = " Re-run Setup Squid to let the agent ask Squid itself."
+    except Exception as exc:  # noqa: BLE001 - any failure means: fall back to the file
+        why = "Squid did not answer (%s)" % getattr(exc, "reason", exc)
+
+    if loaded is None:
+        head = ("%s — this is %s, which Squid loads on start and reload.%s\n"
+                % (why, SQUID_WHITELIST_LIVE, hint))
+        return 0, head + "%d domain(s):\n%s" % (len(file_list), "".join(d + "\n" for d in file_list))
+    if not loaded and not current.get("whitelist"):
+        return 0, "Squid has no whitelist: every domain is allowed\n"
+    out = "%d domain(s) loaded in Squid:\n%s" % (len(loaded), "".join(d + "\n" for d in loaded))
+    if loaded != file_list:
+        out += ("\n%s differs from what Squid has loaded — `squid -k reconfigure` loads it\n"
+                % SQUID_WHITELIST_LIVE)
+    return 0, out
 
 
 def listening_ports():
@@ -851,7 +923,8 @@ class Handler(BaseHTTPRequestHandler):
         "token": "usage: token --print | -p\n",
         "agent": "usage: agent --print | -p\n       agent --allow | -a <ip>\n"
                  "       agent --remove | -r <ip>\n",
-        "proxy": "usage: proxy --allow | -a <name>[,<name>...]\n",
+        "proxy": "usage: proxy --allow | -a <name>[,<name>...]\n"
+                 "       proxy --whitelist | -wl\n",
     }
 
     def _alias(self, text):
@@ -863,6 +936,7 @@ class Handler(BaseHTTPRequestHandler):
             agent --remove | -r <ip> take <ip> off it
             proxy --allow | -a <names>  add comma-separated domain names to
                                      Squid's whitelist (squid_allow)
+            proxy --whitelist | -wl  the whitelist Squid has loaded
         Returns True when it answered, False when `text` is not an alias."""
         m = self.ALIAS.match(text)
         if not m:
@@ -875,6 +949,9 @@ class Handler(BaseHTTPRequestHandler):
         elif name == "agent" and len(args) == 2 and args[0] in ("--allow", "-a", "--remove", "-r"):
             rc, out = change_allow_ip(args[1], remove=args[0] in ("--remove", "-r"),
                                       caller=self.client_address[0])
+            self._send(200 if rc == 0 else 500, {"returncode": rc, "output": out})
+        elif name == "proxy" and args in (["--whitelist"], ["-wl"]):
+            rc, out = squid_whitelist_report()
             self._send(200 if rc == 0 else 500, {"returncode": rc, "output": out})
         elif name == "proxy" and len(args) >= 2 and args[0] in ("--allow", "-a"):
             # The names as typed after the flag: "a.com, b.com" is one list.
@@ -986,6 +1063,8 @@ class Handler(BaseHTTPRequestHandler):
         if op == "update":
             return self._start_app_job(name, "update")
         if op == "nginx":
+            if squid_current():
+                return self._send(409, {"error": "Squid is set up on this upplet — Nginx runs on an upplet without Squid"})
             port = req.get("port")
             # 0: nginx.sh picks the port.
             if not isinstance(port, int) or isinstance(port, bool) or not (port == 0 or 1024 <= port <= 65535):
@@ -1164,6 +1243,7 @@ class Handler(BaseHTTPRequestHandler):
                 "whitelist": domains or squid_whitelist_domains(read_file(SQUID_WHITELIST)),
                 "whitelistSource": "upplet" if domains else "template",
                 "current": current,
+                "nginx": nginx_in_use() or None,     # set: Setup Squid is refused here
             })
 
         try:
@@ -1192,6 +1272,9 @@ class Handler(BaseHTTPRequestHandler):
             bad = [d for d in domains if len(d) > 253 or not SQUID_DOMAIN_RE.match(d)]
             if bad:
                 return self._send(400, {"error": "not a domain name: %s" % bad[0]})
+        nginx = nginx_in_use()
+        if nginx:
+            return self._send(409, {"error": "%s on this upplet — Squid runs on an upplet without Nginx" % nginx})
         holder = listening_ports().get(port)
         if holder and holder != "squid":
             return self._send(409, {"error": "port %d is in use by %s" % (port, holder)})

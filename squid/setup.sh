@@ -13,10 +13,14 @@
 #         SQUID_WHITELIST 0 = no domain whitelist: any destination for an
 #                         authenticated user (default 1)
 #         SQUID_MANAGED   1 = run by p5agent (the dashboard's Setup Squid): the
-#                         firewall is p5agent's, so only the proxy port is
-#                         opened (and a previous proxy port closed) — SSH and
-#                         the agent's rules, restrictions included, are left
-#                         alone
+#                         firewall is p5agent's, so SSH and the agent's rules,
+#                         restrictions included, are left as they are
+#
+# Either way the firewall ends up open on SSH, p5agent and the proxy port only:
+# every other allow rule is removed. A Squid upplet has no Nginx, so p5agent's
+# firewall.sh no longer counts port 80 as built-in here and keeps it closed; an
+# installed app's port is still re-opened by Update Provisioning and app
+# installs.
 
 set -euo pipefail
 
@@ -45,9 +49,6 @@ if [[ "$USE_WHITELIST" == "1" ]]; then
         | grep -v '^$' | sort -u || true)"
     [[ -n "$CLEAN_WHITELIST" ]] || die "whitelist has no usable entries"
 fi
-
-# The port a previous run left Squid on — its firewall rule goes if it changes.
-OLD_PORT="$(awk '$1=="http_port"{print $2; exit}' "$SQUID_CONF" 2>/dev/null || true)"
 
 # --- Install dependencies --------------------------------------------------
 install_deps() {
@@ -172,7 +173,15 @@ $IP_DEST_ACL
 acl internal_dst dst 0.0.0.0/8 127.0.0.0/8 169.254.0.0/16 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
 acl internal_dst dst ::1 fe80::/10 fc00::/7
 
+# --- Cache manager ---
+# Only the upplet itself may ask Squid about its state, and only for its
+# configuration (p5agent's "proxy --whitelist" reads the whitelist Squid has
+# loaded from it). First, as the request is to Squid's own port on 127.0.0.1.
+cachemgr_passwd none config
+cachemgr_passwd disable all
+
 # --- Access rules (first match wins) ---
+http_access allow localhost manager
 http_access deny !Safe_ports
 http_access deny CONNECT !SSL_ports
 http_access deny manager
@@ -201,8 +210,9 @@ else
 fi
 
 # --- Firewall (ufw) --------------------------------------------------------
-# Policy: deny all incoming except SSH, the proxy port and p5agent; allow all outgoing.
-# Set UFW_RESET=1 to wipe pre-existing ufw rules first (otherwise they are kept).
+# Policy: deny all incoming except SSH, the proxy port and p5agent; allow all
+# outgoing. Every other allow rule is removed.
+# Set UFW_RESET=1 to wipe pre-existing ufw rules first.
 echo "Configuring firewall (ufw)..."
 
 if ! command -v ufw >/dev/null 2>&1; then
@@ -213,26 +223,88 @@ if ! command -v ufw >/dev/null 2>&1; then
     fi
 fi
 
-if [[ "$MANAGED" == "1" ]]; then
-    # p5agent owns this firewall (deny incoming by default, SSH and the agent
-    # already allowed — maybe restricted to addresses, which a blanket allow
-    # here would undo). Only the proxy's own port changes.
-    if [[ -n "$OLD_PORT" && "$OLD_PORT" != "$PROXY_PORT" ]]; then
-        ufw delete allow "$OLD_PORT/tcp" >/dev/null 2>&1 && echo "Closed the previous proxy port $OLD_PORT/tcp." || true
-    fi
-    ufw allow "$PROXY_PORT/tcp" comment 'squid proxy' >/dev/null
-    echo "Port $PROXY_PORT/tcp is open."
-    echo
-    echo "Done. Squid is listening on port $PROXY_PORT."
-    exit 0
-fi
-
 # Detect SSH port(s) so we never lock ourselves out (falls back to 22).
 SSH_PORTS="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' || true)"
 [[ -n "$SSH_PORTS" ]] || SSH_PORTS="22"
 # If this script is running over SSH, also keep the port of the current session open.
 [[ -z "${SSH_CONNECTION:-}" ]] || SSH_PORTS+=$'\n'"${SSH_CONNECTION##* }"
 SSH_PORTS="$(printf '%s\n' "$SSH_PORTS" | sort -un)"
+AGENT_PORT_NUM="${P5AGENT_PORT%/*}"
+
+# Remove every allow rule that opens anything but the given ports: other
+# ports, port ranges that reach beyond them, and rules with no port at all
+# ("allow from <ip>" opens every port to it). Rules on the kept ports stay as
+# they are, address restrictions included; deny/limit/reject rules stay too.
+close_other_ports() {
+    python3 - "$@" <<'PY'
+import re, shlex, subprocess, sys
+
+keep = {int(p) for p in sys.argv[1:]}
+
+def ports(spec):
+    """'80', '80,443', '8000:8100' -> set of ints."""
+    out = set()
+    for part in spec.split(","):
+        a, _, b = part.partition(":")
+        out |= set(range(int(a), int(b or a) + 1))
+    return out
+
+added = subprocess.run(["ufw", "show", "added"], capture_output=True, text=True).stdout
+for line in added.splitlines():
+    if not line.startswith("ufw "):
+        continue
+    rule = re.sub(r" comment .*$", "", line[4:].strip())
+    try:
+        words = shlex.split(rule)                  # 'Nginx Full' is one word
+    except ValueError:
+        words = rule.split()
+    if not words or words[0] != "allow":
+        continue                                   # deny, limit, reject, route …
+    spec = app = None
+    if len(words) > 1 and re.fullmatch(r"[\d,:]+(/(tcp|udp))?", words[1]):
+        spec = words[1].split("/")[0]
+    elif "port" in words:
+        spec = words[words.index("port") + 1]
+    elif "app" in words:
+        i = words.index("app") + 1
+        app = " ".join(words[i:])
+        words = words[:i] + [app]
+    elif len(words) > 1 and words[1] not in ("from", "to", "in", "out", "on"):
+        app = " ".join(words[1:])                  # an application profile
+        words = ["allow", app]
+    if app is not None and "ssh" in app.lower():
+        continue                                   # OpenSSH: SSH stays reachable
+    if spec is not None and ports(spec) <= keep:
+        continue
+    rc = subprocess.run(["ufw", "--force", "delete"] + words, capture_output=True, text=True)
+    print(("Closed: %s" % rule) if rc.returncode == 0
+          else "Could not close %s: %s" % (rule, (rc.stdout or rc.stderr).strip()))
+PY
+}
+
+# The proxy port is opened to anyone only when it has no rule yet — one
+# restricted to addresses (in Firewall Settings) stays restricted.
+open_proxy_port() {
+    if ufw show added | grep -Eq "allow ${PROXY_PORT}(/tcp)?( |\$)|port ${PROXY_PORT}( |\$)"; then
+        echo "Port $PROXY_PORT/tcp keeps its existing rules."
+    else
+        ufw allow "$PROXY_PORT/tcp" comment 'squid proxy' >/dev/null
+        echo "Port $PROXY_PORT/tcp is open."
+    fi
+}
+
+if [[ "$MANAGED" == "1" ]]; then
+    # p5agent owns this firewall (deny incoming by default, SSH and the agent
+    # already allowed — maybe restricted to addresses, which a blanket allow
+    # here would undo), so those rules are left alone.
+    open_proxy_port
+    # shellcheck disable=SC2086
+    close_other_ports $SSH_PORTS "$AGENT_PORT_NUM" "$PROXY_PORT"
+    echo "Open: SSH ($(echo $SSH_PORTS | tr ' ' ',')), p5agent ($AGENT_PORT_NUM), proxy ($PROXY_PORT) — every other port is closed."
+    echo
+    echo "Done. Squid is listening on port $PROXY_PORT."
+    exit 0
+fi
 
 if [[ "${UFW_RESET:-0}" == "1" ]]; then
     ufw --force reset >/dev/null
@@ -244,8 +316,10 @@ ufw default allow outgoing >/dev/null
 for port in $SSH_PORTS; do
     ufw allow "$port/tcp" comment 'ssh' >/dev/null
 done
-ufw allow "$PROXY_PORT/tcp" comment 'squid proxy' >/dev/null
+open_proxy_port
 ufw allow "$P5AGENT_PORT"   comment 'p5agent'     >/dev/null
+# shellcheck disable=SC2086
+close_other_ports $SSH_PORTS "$AGENT_PORT_NUM" "$PROXY_PORT"
 
 # Rules are added before enabling, so an active SSH session is not cut off.
 ufw --force enable >/dev/null
