@@ -1,0 +1,110 @@
+# Main
+.apple.com
+.archive.org
+.askubuntu.com
+.atlassian.com
+.atlassian.net
+.booking.com
+.cloudflare.com
+.cursor.com
+.digitalocean.com
+.discord.com
+.duckduckgo.com
+.facebook.com
+.genius.com
+.github.com
+.github.io
+.google.com
+.icloud.com
+.instagram.com
+.proton.me
+.quora.com
+.redd.it
+.reddit.com
+.serverfault.com
+.skyscanner.com
+.skyscanner.net
+.slack.com
+.squid-cache.org
+.stackexchange.com
+.stackoverflow.com
+.stripe.com
+.superuser.com
+.swift.org
+.visualstudio.com
+.whatsapp.com
+.whatsapp.net
+.wikimedia.org
+.wikipedia.org
+.youtu.be
+.youtube-nocookie.com
+.youtube.com
+.zoom.us
+
+# News
+.reuters.com
+.theguardian.com
+
+# Support/CDN
+.apple-mapkit.com
+.awswaf.com
+.bstatic.com
+.cdn-apple.com
+.cdn.jsdelivr.net
+.cdninstagram.com
+.cookielaw.org
+.cursor.sh
+.cursorapi.com
+.digitalocean-ui.com
+.discord.gg
+.discord.media
+.discordapp.com
+.discordapp.net
+.discourse-cdn.com
+.draw.io
+.facebook.net
+.fb.com
+.fbcdn.net
+.ggpht.com
+.githubassets.com
+.githubusercontent.com
+.googleapis.com
+.googleusercontent.com
+.googlevideo.com
+.gravatar.com
+.gstatic.com
+.guim.co.uk
+.hcaptcha.com
+.imgur.com
+.mzstatic.com
+.public.atl-paas.net
+.quoracdn.net
+.recaptcha.net
+.redditmedia.com
+.redditspace.com
+.redditstatic.com
+.skyscnr.com
+.slack-edge.com
+.slack-imgs.com
+.sstatic.net
+.static.nc-img.com
+.stripe.network
+.stripecdn.com
+.typekit.net
+.vsassets.io
+.vscode-cdn.net
+.vscode-unpkg.net
+.wp.com
+.ytimg.com
+
+# Certificate checks over plain HTTP (revocation lists, OCSP, intermediate
+# certificates) — if these are blocked, some clients pause on HTTPS sites or
+# reject servers that send an incomplete certificate chain
+.digicert.com
+.lencr.org
+.pki.goog
+
+# Not included on purpose: anyone can host their own server under these, so
+# they would let any destination through. Add the exact hosts you need instead
+# (e.g. s3.eu-central-1.amazonaws.com, d1234abcd.cloudfront.net).
+#   .amazonaws.com  .cloudfront.net  .windows.net  .github.dev
