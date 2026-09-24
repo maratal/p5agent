@@ -15,6 +15,8 @@ root systemd service on port 5005 and exposes:
                         agent --print | -p         the P5AGENT_ALLOW_IP list
                         agent --allow | -a <ip>    add <ip> to P5AGENT_ALLOW_IP
                         agent --remove | -r <ip>   take <ip> off P5AGENT_ALLOW_IP
+                        proxy --allow | -a <names> add comma-separated domain
+                                                   names to Squid's whitelist
     *    /install-app  spawn install_app.sh in the background to install an app
                       and its dependencies; returns 200 once the job is launched.
                       One install runs at a time: the request is recorded in
@@ -299,6 +301,79 @@ def squid_current():
         "user": user or None,
         "whitelist": bool(re.search(r"^http_access allow authenticated whitelist", conf, re.M)),
     }
+
+
+def squid_allow(text):
+    """`proxy --allow | -a <names>`: add comma-separated domain names to the
+    whitelist Squid uses, and have Squid re-read it. A name with a leading dot
+    covers its subdomains too; one without is that host only. A name already
+    covered by an entry is skipped; entries the new ones cover are dropped
+    (Squid warns about overlapping dstdomain entries). Returns (rc, output)."""
+    names = [n.lower().rstrip(".") for n in re.split(r"[,\s]+", text or "")]
+    names = [n for n in names if n and n != "."]
+    if not names:
+        return 2, "usage: proxy --allow | -a <name>[,<name>...]\n"
+    bad = [n for n in names if len(n) > 253 or not SQUID_DOMAIN_RE.match(n)]
+    if bad:
+        return 2, "Not a domain name: %s\n" % ", ".join(bad)
+    current = squid_current()
+    if not current:
+        return 1, "Squid is not set up on this upplet — run Setup Squid first\n"
+    if not current.get("whitelist"):
+        return 1, "Squid has no whitelist: every domain is allowed already\n"
+
+    def covers(entry, name):
+        """Does whitelist `entry` match everything `name` matches?"""
+        if entry == name:
+            return True
+        return entry.startswith(".") and (name.lstrip(".") == entry[1:] or name.endswith(entry))
+
+    old_text = read_file(SQUID_WHITELIST_LIVE)
+    entries = squid_whitelist_domains(old_text)
+    added, skipped, dropped = [], [], []
+    for name in dict.fromkeys(names):
+        holder = next((e for e in entries if covers(e, name)), None)
+        if holder:
+            skipped.append(name if holder == name else "%s (covered by %s)" % (name, holder))
+            continue
+        covered = [e for e in entries if covers(name, e)]
+        dropped += covered
+        entries = [e for e in entries if e not in covered] + [name]
+        added.append(name)
+    if not added:
+        return 0, "Nothing to add — already allowed: %s\n" % ", ".join(skipped)
+
+    entries = squid_whitelist_domains("\n".join(entries))
+    try:
+        st = os.stat(SQUID_WHITELIST_LIVE)
+        tmp = SQUID_WHITELIST_LIVE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, st.st_mode & 0o777)
+        with os.fdopen(fd, "w") as fh:
+            fh.write("\n".join(entries) + "\n")
+        os.chown(tmp, st.st_uid, st.st_gid)
+        os.replace(tmp, SQUID_WHITELIST_LIVE)
+    except OSError as exc:
+        return 1, "Not saved: %s\n" % exc
+
+    # Check the whole configuration with the new list before Squid re-reads it;
+    # a list Squid refuses goes back to what it was.
+    rc, out = run(["squid", "-k", "parse"])
+    if rc == 0:
+        rc, out = run(["squid", "-k", "reconfigure"])
+    if rc != 0:
+        try:
+            with open(SQUID_WHITELIST_LIVE, "w") as fh:
+                fh.write(old_text)
+        except OSError:
+            pass
+        return 1, out + "\nSquid did not accept the new list — the whitelist is unchanged\n"
+    lines = ["Added: %s" % ", ".join(added)]
+    if dropped:
+        lines.append("Dropped, now covered: %s" % ", ".join(dropped))
+    if skipped:
+        lines.append("Already allowed: %s" % ", ".join(skipped))
+    lines.append("Squid reloaded — %d domain(s) on the whitelist" % len(entries))
+    return 0, "\n".join(lines) + "\n"
 
 
 def listening_ports():
@@ -771,11 +846,12 @@ class Handler(BaseHTTPRequestHandler):
     # Built-in Run Command aliases, answered here without a script. Any single
     # line starting with an alias name is the alias's, even a wrong one:
     # falling through to bash would leave whatever was typed in /tmp.
-    ALIAS = re.compile(r"^\s*(token|agent)(?:[ \t]+([^\n]*?))?\s*$")
+    ALIAS = re.compile(r"^\s*(token|agent|proxy)(?:[ \t]+([^\n]*?))?\s*$")
     ALIAS_USAGE = {
         "token": "usage: token --print | -p\n",
         "agent": "usage: agent --print | -p\n       agent --allow | -a <ip>\n"
                  "       agent --remove | -r <ip>\n",
+        "proxy": "usage: proxy --allow | -a <name>[,<name>...]\n",
     }
 
     def _alias(self, text):
@@ -785,6 +861,8 @@ class Handler(BaseHTTPRequestHandler):
                                      Command is accepted from
             agent --allow | -a <ip>  add <ip> to it
             agent --remove | -r <ip> take <ip> off it
+            proxy --allow | -a <names>  add comma-separated domain names to
+                                     Squid's whitelist (squid_allow)
         Returns True when it answered, False when `text` is not an alias."""
         m = self.ALIAS.match(text)
         if not m:
@@ -797,6 +875,10 @@ class Handler(BaseHTTPRequestHandler):
         elif name == "agent" and len(args) == 2 and args[0] in ("--allow", "-a", "--remove", "-r"):
             rc, out = change_allow_ip(args[1], remove=args[0] in ("--remove", "-r"),
                                       caller=self.client_address[0])
+            self._send(200 if rc == 0 else 500, {"returncode": rc, "output": out})
+        elif name == "proxy" and len(args) >= 2 and args[0] in ("--allow", "-a"):
+            # The names as typed after the flag: "a.com, b.com" is one list.
+            rc, out = squid_allow(m.group(2).split(None, 1)[1])
             self._send(200 if rc == 0 else 500, {"returncode": rc, "output": out})
         else:
             self._send(500, {"returncode": 2, "output": self.ALIAS_USAGE[name]})
