@@ -1136,7 +1136,9 @@ class Handler(BaseHTTPRequestHandler):
             def _mask_ip(ip):
                 return ip[:2] + "*" * max(0, len(ip) - 4) + ip[-2:] if len(ip) > 4 else ip
             return self._send(403, {"error": "forbidden",
-                                    "detail": "%s is restricted to %s" % (path, ", ".join(_mask_ip(ip) for ip in sorted(ALLOW_IP)))})
+                                    "detail": "%s is restricted to %s — this request came from %s" % (
+                                        path, ", ".join(_mask_ip(ip) for ip in sorted(ALLOW_IP)),
+                                        self.client_address[0])})
         try:
             return {
                 "/update": self._do_update,
