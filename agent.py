@@ -14,12 +14,17 @@ root systemd service on port 5005 and exposes:
                       Built-in aliases, answered without running a script:
                         token --print | -p         the management token
                         agent --print | -p         the P5AGENT_ALLOW_IP list
-                        agent --allow | -a <ip>    add <ip> to P5AGENT_ALLOW_IP
+                        agent --allow | -a <ip> [-t <time>]
+                                                   add <ip> to P5AGENT_ALLOW_IP
                         agent --remove | -r <ip>   take <ip> off P5AGENT_ALLOW_IP
-                        proxy --allow | -a <names> add comma-separated domain
+                        proxy --allow | -a <names> [-t <time>]
+                                                   add comma-separated domain
                                                    names to Squid's whitelist
                         proxy --remove | -r <names> take domain names off it
                         proxy --whitelist | -wl    the whitelist Squid has loaded
+                      -t | --timeout <time>: how long the allow lasts — 30m,
+                      2h, 1d — revoked after that, even across agent
+                      restarts (timed_rules.json); left out: for good
     *    /install-app  spawn install_app.sh in the background to install an app
                       and its dependencies; returns 200 once the job is launched.
                       One install runs at a time: the request is recorded in
@@ -89,6 +94,7 @@ import shutil
 import ssl
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -104,11 +110,14 @@ ALLOW_IP = {ip.strip() for ip in os.environ.get("P5AGENT_ALLOW_IP", "127.0.0.1")
 ENV_FILE = os.environ.get("P5AGENT_ENV_FILE", "/etc/p5agent.env")
 
 
-def change_allow_ip(text, remove=False, caller=None):
+def change_allow_ip(text, remove=False, caller=None, seconds=None):
     """`agent --allow | --remove <ip>`: add one address to P5AGENT_ALLOW_IP or
     take one off — in effect at once, and written to ENV_FILE so it survives a
     restart. The address the request came from (`caller`) cannot be removed:
-    that would shut the one asking out of Run Command. Returns (rc, output)."""
+    that would shut the one asking out of Run Command. `seconds` (allow
+    only): the address is taken off again that much later (timed rules); an
+    allow without it is for good, and makes a timed one permanent. Returns
+    (rc, output)."""
     try:
         ip = str(ipaddress.ip_address(text.strip()))
     except ValueError:
@@ -116,12 +125,22 @@ def change_allow_ip(text, remove=False, caller=None):
     allowed = [a.strip() for a in os.environ.get("P5AGENT_ALLOW_IP", "").split(",") if a.strip()] or sorted(ALLOW_IP)
     if remove:
         if ip not in ALLOW_IP:
+            timed_rule_clear("agent", ip)
             return 0, "%s is not on the list\n" % ip
         if ip == caller:
             return 1, "Not removed: %s is the address this request came from\n" % ip
         allowed = [a for a in allowed if a != ip]
     else:
         if ip in ALLOW_IP:
+            timed = timed_rule_get("agent", ip)
+            if seconds and timed:
+                until = timed_rule_set("agent", ip, seconds)
+                return 0, "%s is already allowed — now %s\n" % (ip, until_text(until))
+            if seconds:
+                return 0, "%s is already allowed for good — left that way, not timed\n" % ip
+            if timed:
+                timed_rule_clear("agent", ip)
+                return 0, "%s is already allowed — now for good, no longer timed\n" % ip
             return 0, "%s is already allowed\n" % ip
         allowed.append(ip)
     value = ",".join(allowed)
@@ -141,12 +160,16 @@ def change_allow_ip(text, remove=False, caller=None):
         return 1, "Not saved: %s\n" % exc
     if remove:
         ALLOW_IP.discard(ip)
+        timed_rule_clear("agent", ip)
     else:
         ALLOW_IP.add(ip)
     # Scripts the agent runs (firewall.sh) read it from the environment first.
     os.environ["P5AGENT_ALLOW_IP"] = value
-    return 0, "%s %s — Run Command is now accepted from %s\n" % (
-        ip, "removed" if remove else "added", ", ".join(allowed) or "nowhere")
+    timed = ""
+    if not remove and seconds:
+        timed = " " + until_text(timed_rule_set("agent", ip, seconds))
+    return 0, "%s %s%s — Run Command is now accepted from %s\n" % (
+        ip, "removed" if remove else "added", timed, ", ".join(allowed) or "nowhere")
 
 
 # When this agent process started: "/" reports it, so the dashboard can tell
@@ -414,12 +437,15 @@ def squid_whitelist_ready():
     return None
 
 
-def squid_allow(text):
+def squid_allow(text, seconds=None):
     """`proxy --allow | -a <names>`: add comma-separated domain names to the
     whitelist Squid uses, and have Squid re-read it. A name with a leading dot
     covers its subdomains too; one without is that host only. A name already
     covered by an entry is skipped; entries the new ones cover are dropped
-    (Squid warns about overlapping dstdomain entries). Returns (rc, output)."""
+    (Squid warns about overlapping dstdomain entries). `seconds`: the names
+    added are taken off again that much later, and the entries they dropped
+    come back then (timed rules); an allow without it is for good, and makes
+    a timed entry permanent. Returns (rc, output)."""
     names, error = squid_names(text)
     if error:
         return 2, error
@@ -432,26 +458,52 @@ def squid_allow(text):
 
     old_text = read_file(SQUID_WHITELIST_LIVE)
     entries = squid_whitelist_domains(old_text)
-    added, skipped, dropped = [], [], []
+    added, skipped, dropped, retimed = [], [], [], []
+    restore = {}        # name added for a time -> the entries it dropped
     for name in names:
         holder = next((e for e in entries if covers(e, name)), None)
+        if holder == name and timed_rule_get("proxy", name):
+            # Timed already: a new time replaces it, none makes it for good.
+            if seconds:
+                timed_rule_set("proxy", name, seconds, timed_rule_get("proxy", name).get("restore"))
+                retimed.append(name)
+            else:
+                timed_rule_clear("proxy", name)
+                retimed.append(name)
+            continue
         if holder:
             skipped.append(name if holder == name else "%s (covered by %s)" % (name, holder))
             continue
         covered = [e for e in entries if covers(name, e)]
         dropped += covered
+        restore[name] = covered
         entries = [e for e in entries if e not in covered] + [name]
         added.append(name)
     if not added:
+        if retimed:
+            return 0, "Already allowed: %s — now %s\n" % (
+                ", ".join(retimed), until_text(timed_rule_get("proxy", retimed[0])["until"]) if seconds else "for good, no longer timed")
         return 0, "Nothing to add — already allowed: %s\n" % ", ".join(skipped)
 
     entries = squid_whitelist_domains("\n".join(entries))
     rc, out = squid_save_whitelist(entries, old_text)
     if rc != 0:
         return rc, out
-    lines = ["Added: %s" % ", ".join(added)]
+    until = None
+    for name in added:
+        if seconds:
+            until = timed_rule_set("proxy", name, seconds, restore[name])
+    for name in dropped:
+        # Gone from the list: nothing left for its own timer to take off. (A
+        # timed name that dropped it puts it back when its time is up.)
+        if not seconds:
+            timed_rule_clear("proxy", name)
+    lines = ["Added: %s%s" % (", ".join(added), " — " + until_text(until) if until else "")]
     if dropped:
-        lines.append("Dropped, now covered: %s" % ", ".join(dropped))
+        lines.append("Dropped, now covered: %s%s" % (", ".join(dropped), " — back when that ends" if seconds else ""))
+    if retimed:
+        lines.append("Already allowed: %s — now %s" % (
+            ", ".join(retimed), until_text(until) if seconds else "for good, no longer timed"))
     if skipped:
         lines.append("Already allowed: %s" % ", ".join(skipped))
     lines.append("Squid reloaded — %d domain(s) on the whitelist" % len(entries))
@@ -496,6 +548,8 @@ def squid_remove(text):
     rc, out = squid_save_whitelist(entries, old_text)
     if rc != 0:
         return rc, out
+    for name in removed:
+        timed_rule_clear("proxy", name)
     lines = ["Removed: %s" % ", ".join(removed)]
     if missing:
         lines.append("Not on the list: %s" % ", ".join(missing))
@@ -550,14 +604,159 @@ def squid_whitelist_report():
     if loaded is None:
         head = ("%s — this is %s, which Squid loads on start and reload.%s\n"
                 % (why, SQUID_WHITELIST_LIVE, hint))
-        return 0, head + "%d domain(s):\n%s" % (len(file_list), "".join(d + "\n" for d in file_list))
+        return 0, head + "%d domain(s):\n%s" % (len(file_list), "".join(d + "\n" for d in file_list)) + squid_timed_report()
     if not loaded and not current.get("whitelist"):
         return 0, "Squid has no whitelist: every domain is allowed\n"
     out = "%d domain(s) loaded in Squid:\n%s" % (len(loaded), "".join(d + "\n" for d in loaded))
     if loaded != file_list:
         out += ("\n%s differs from what Squid has loaded — `squid -k reconfigure` loads it\n"
                 % SQUID_WHITELIST_LIVE)
-    return 0, out
+    return 0, out + squid_timed_report()
+
+
+def squid_timed_report():
+    """The whitelist entries allowed for a time, for `proxy -wl`."""
+    timed = [r for r in timed_rules_load() if r["kind"] == "proxy"]
+    if not timed:
+        return ""
+    return "\nTimed:\n" + "".join("%s — %s\n" % (r["value"], until_text(r["until"])) for r in timed)
+
+
+# ─── Timed rules ─────────────────────────────────────────────────────────────
+# `agent -a <ip> -t <time>` and `proxy -a <names> -t <time>` allow for a time
+# (parse_duration: 30m, 2h, 1d): each is
+# recorded here with the time it ends, and revoke_due() — every minute, and
+# right after the agent starts — takes it off once that time has come. The
+# file, not memory, is the record: an update restarts the agent, and a rule
+# that came due meanwhile goes on start. {kind: agent|proxy, value: the IP or
+# the whitelist entry, until: epoch seconds, restore: [entries a proxy name
+# dropped as covered — put back when it goes]}.
+TIMED_RULES = os.path.join(DATA_DIR, "timed_rules.json")
+RULES_LOCK = threading.RLock()      # the aliases and the revoker, one at a time
+REVOKE_EVERY = 60
+
+
+def timed_rules_load():
+    try:
+        rules = json.loads(read_file(TIMED_RULES) or "[]")
+    except ValueError:
+        return []
+    return [r for r in rules if isinstance(r, dict) and r.get("kind") in ("agent", "proxy")
+            and r.get("value") and isinstance(r.get("until"), (int, float))]
+
+
+def timed_rules_save(rules):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    tmp = TIMED_RULES + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(rules, fh, indent=1)
+    os.replace(tmp, TIMED_RULES)
+
+
+def timed_rule_get(kind, value):
+    return next((r for r in timed_rules_load() if r["kind"] == kind and r["value"] == value), None)
+
+
+def timed_rule_set(kind, value, seconds, restore=None):
+    """Record (or re-time) one rule; returns the epoch it ends at."""
+    until = int(time.time()) + int(seconds)
+    rules = [r for r in timed_rules_load() if not (r["kind"] == kind and r["value"] == value)]
+    rule = {"kind": kind, "value": value, "until": until}
+    if restore:
+        rule["restore"] = list(restore)
+    timed_rules_save(rules + [rule])
+    return until
+
+
+def timed_rule_clear(kind, value):
+    rules = timed_rules_load()
+    kept = [r for r in rules if not (r["kind"] == kind and r["value"] == value)]
+    if len(kept) != len(rules):
+        timed_rules_save(kept)
+
+
+def until_text(until):
+    """"until 23:27 UTC, 30 min left" — the upplet's clock."""
+    left = max(0, int(until - time.time()))
+    minutes = (left + 59) // 60
+    when = datetime.fromtimestamp(until).astimezone()
+    today = when.date() == datetime.now().astimezone().date()
+    stamp = when.strftime("%H:%M %Z" if today else "%d %b %H:%M %Z")
+    if minutes >= 120:
+        span = "%dh %02dm" % divmod(minutes, 60)
+    else:
+        span = "%d min" % minutes
+    return "until %s, %s left" % (stamp, span)
+
+
+# Minutes at the least: the revoker looks once a minute (REVOKE_EVERY).
+DURATION_UNITS = {"m": 60, "h": 3600, "d": 86400}
+MAX_TIMEOUT = 365 * 86400
+
+
+def parse_duration(text):
+    """`-t`'s value — a number and a unit, as firewalld and ssh-add take it:
+    30m, 2h, 1d. The unit is required: a bare number would be read as
+    seconds by some and minutes by others. Returns (seconds, error)."""
+    m = re.match(r"^(\d+)([mhd])$", (text or "").strip().lower())
+    if not m:
+        return None, "Not a time: %r — a number with m, h or d, as 30m or 2h\n" % (text or "")
+    seconds = int(m.group(1)) * DURATION_UNITS[m.group(2)]
+    if not 1 <= seconds <= MAX_TIMEOUT:
+        return None, "Time: from 1m to 365d\n"
+    return seconds, None
+
+
+def revoke_rule(rule):
+    """Take one timed allow off. Returns a line for the agent's log."""
+    if rule["kind"] == "agent":
+        rc, out = change_allow_ip(rule["value"], remove=True)
+        return out.strip()
+    blocked = squid_whitelist_ready()
+    if blocked:
+        return "%s not revoked: %s" % (rule["value"], blocked[1].strip())
+    old_text = read_file(SQUID_WHITELIST_LIVE)
+    entries = squid_whitelist_domains(old_text)
+    if rule["value"] not in entries:
+        return "%s: no longer on the whitelist" % rule["value"]
+    entries.remove(rule["value"])
+    back = [e for e in rule.get("restore") or []
+            if e not in entries and not any(squid_covers(k, e) for k in entries)]
+    entries += back
+    if not entries:
+        return "%s not revoked: the whitelist would be empty" % rule["value"]
+    rc, out = squid_save_whitelist(squid_whitelist_domains("\n".join(entries)), old_text)
+    if rc != 0:
+        return "%s not revoked: %s" % (rule["value"], out.strip())
+    return "%s taken off the whitelist%s" % (rule["value"], " — back: " + ", ".join(back) if back else "")
+
+
+def revoke_due():
+    """Revoke every timed rule whose time has come."""
+    with RULES_LOCK:
+        now = time.time()
+        rules = timed_rules_load()
+        due = [r for r in rules if r["until"] <= now]
+        if not due:
+            return
+        # Off the record first: a revoke that fails is logged, not retried
+        # every minute for ever.
+        timed_rules_save([r for r in rules if r["until"] > now])
+        for rule in due:
+            try:
+                line = revoke_rule(rule)
+            except Exception as exc:  # noqa: BLE001 - one bad rule must not stop the rest
+                line = "%s not revoked: %s" % (rule["value"], exc)
+            sys.stderr.write("[p5agent] timed %s rule ended: %s\n" % (rule["kind"], line))
+
+
+def revoker():
+    while True:
+        try:
+            revoke_due()
+        except Exception as exc:  # noqa: BLE001 - keep the thread alive
+            sys.stderr.write("[p5agent] timed rules: %s\n" % exc)
+        time.sleep(REVOKE_EVERY)
 
 
 def listening_ports():
@@ -1055,47 +1254,78 @@ class Handler(BaseHTTPRequestHandler):
     ALIAS = re.compile(r"^\s*(token|agent|proxy)(?:[ \t]+([^\n]*?))?\s*$")
     ALIAS_USAGE = {
         "token": "usage: token --print | -p\n",
-        "agent": "usage: agent --print | -p\n       agent --allow | -a <ip>\n"
-                 "       agent --remove | -r <ip>\n",
-        "proxy": "usage: proxy --allow | -a <name>[,<name>...]\n"
+        "agent": "usage: agent --print | -p\n       agent --allow | -a <ip> [-t | --timeout <time>]\n"
+                 "       agent --remove | -r <ip>\n"
+                 "<time>: how long the allow lasts — 30m, 2h, 1d; left out, it is for good\n",
+        "proxy": "usage: proxy --allow | -a <name>[,<name>...] [-t | --timeout <time>]\n"
                  "       proxy --remove | -r <name>[,<name>...]\n"
-                 "       proxy --whitelist | -wl\n",
+                 "       proxy --whitelist | -wl\n"
+                 "<time>: how long the allow lasts — 30m, 2h, 1d; left out, it is for good\n",
     }
+    # -t 30m, -t=30m, --timeout 30m, --timeout=30m — anywhere after the flag.
+    TIMEOUT_OPT = re.compile(r"(?:^|\s)(?:-t|--timeout)(?:=|\s+)(\S+)")
+    TIMEOUT_BARE = re.compile(r"(?:^|\s)(?:-t|--timeout)\s*$")
 
     def _alias(self, text):
         """Answer a built-in alias:
             token --print | -p      the management token
             agent --print | -p       P5AGENT_ALLOW_IP — the addresses Run
                                      Command is accepted from
-            agent --allow | -a <ip>  add <ip> to it
+            agent --allow | -a <ip> [-t <time>]  add <ip> to it
             agent --remove | -r <ip> take <ip> off it
-            proxy --allow | -a <names>  add comma-separated domain names to
-                                     Squid's whitelist (squid_allow)
+            proxy --allow | -a <names> [-t <time>]  add comma-separated domain
+                                     names to Squid's whitelist (squid_allow)
+            -t | --timeout <time>: how long until the allow is revoked
+                                     (timed rules; parse_duration)
             proxy --remove | -r <names>  take them off it (squid_remove)
             proxy --whitelist | -wl  the whitelist Squid has loaded
         Returns True when it answered, False when `text` is not an alias."""
         m = self.ALIAS.match(text)
         if not m:
             return False
-        name, args = m.group(1), (m.group(2) or "").split()
-        if name == "token" and args in (["--print"], ["-p"]):
-            self._send(200, {"returncode": 0, "output": TOKEN + "\n"})
-        elif name == "agent" and args in (["--print"], ["-p"]):
-            self._send(200, {"returncode": 0, "output": ", ".join(sorted(ALLOW_IP)) + "\n"})
-        elif name == "agent" and len(args) == 2 and args[0] in ("--allow", "-a", "--remove", "-r"):
-            rc, out = change_allow_ip(args[1], remove=args[0] in ("--remove", "-r"),
-                                      caller=self.client_address[0])
-            self._send(200 if rc == 0 else 500, {"returncode": rc, "output": out})
-        elif name == "proxy" and args in (["--whitelist"], ["-wl"]):
-            rc, out = squid_whitelist_report()
-            self._send(200 if rc == 0 else 500, {"returncode": rc, "output": out})
-        elif name == "proxy" and len(args) >= 2 and args[0] in ("--allow", "-a", "--remove", "-r"):
-            # The names as typed after the flag: "a.com, b.com" is one list.
-            names = m.group(2).split(None, 1)[1]
-            rc, out = squid_allow(names) if args[0] in ("--allow", "-a") else squid_remove(names)
-            self._send(200 if rc == 0 else 500, {"returncode": rc, "output": out})
-        else:
+        name, rest = m.group(1), m.group(2) or ""
+        # -t / --timeout <time>: taken out of the words wherever it is, so the
+        # rest reads as without it.
+        seconds = None
+        timeouts = self.TIMEOUT_OPT.findall(rest)
+        if timeouts or self.TIMEOUT_BARE.search(rest):
+            if len(timeouts) != 1 or self.TIMEOUT_BARE.search(rest):
+                self._send(500, {"returncode": 2, "output": self.ALIAS_USAGE[name]})
+                return True
+            seconds, error = parse_duration(timeouts[0])
+            if error:
+                self._send(500, {"returncode": 2, "output": error + self.ALIAS_USAGE[name]})
+                return True
+            rest = self.TIMEOUT_OPT.sub("", rest).strip()
+        args = rest.split()
+        allow = args[:1] in (["--allow"], ["-a"])
+        remove = args[:1] in (["--remove"], ["-r"])
+        if seconds is not None and not allow:
+            # Only an allow is timed; a removal is at once and for good.
             self._send(500, {"returncode": 2, "output": self.ALIAS_USAGE[name]})
+            return True
+        with RULES_LOCK:
+            if name == "token" and args in (["--print"], ["-p"]):
+                self._send(200, {"returncode": 0, "output": TOKEN + "\n"})
+            elif name == "agent" and args in (["--print"], ["-p"]):
+                timed = {r["value"]: r for r in timed_rules_load() if r["kind"] == "agent"}
+                self._send(200, {"returncode": 0, "output": ", ".join(
+                    ip + (" (%s)" % until_text(timed[ip]["until"]) if ip in timed else "")
+                    for ip in sorted(ALLOW_IP)) + "\n"})
+            elif name == "agent" and len(args) == 2 and (allow or remove):
+                rc, out = change_allow_ip(args[1], remove=remove, caller=self.client_address[0],
+                                          seconds=seconds)
+                self._send(200 if rc == 0 else 500, {"returncode": rc, "output": out})
+            elif name == "proxy" and args in (["--whitelist"], ["-wl"]):
+                rc, out = squid_whitelist_report()
+                self._send(200 if rc == 0 else 500, {"returncode": rc, "output": out})
+            elif name == "proxy" and len(args) >= 2 and (allow or remove):
+                # The names as typed after the flag: "a.com, b.com" is one list.
+                names = rest.split(None, 1)[1]
+                rc, out = squid_allow(names, seconds) if allow else squid_remove(names)
+                self._send(200 if rc == 0 else 500, {"returncode": rc, "output": out})
+            else:
+                self._send(500, {"returncode": 2, "output": self.ALIAS_USAGE[name]})
         return True
 
     def _do_install_app(self):
@@ -1525,6 +1755,9 @@ def main():
             "request will be rejected with 401.\n"
         )
     server = Server((BIND, PORT), Handler)
+    # Timed allows: what came due while the agent was down goes now, the rest
+    # when its time comes.
+    threading.Thread(target=revoker, name="timed-rules", daemon=True).start()
 
     scheme = "http"
     if TLS_CERT and TLS_KEY:
