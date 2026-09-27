@@ -6,7 +6,8 @@ A tiny HTTP control plane for a deployed droplet, written with the Python
 standard library only (no pip installs; Ubuntu ships python3). It runs as a
 root systemd service on port 5005 and exposes:
 
-    GET  /            liveness probe (no token required)
+    GET  /            liveness probe (no token required); started_at — when this
+                      agent process started, so a restart can be told apart
     *    /update      git-pull this checkout, then run update.sh
     *    /command     save the request to /tmp/command_<dd_mm_yy_hh_mm_ss>.sh and
                       run it as root — restricted to P5AGENT_ALLOW_IP.
@@ -148,6 +149,10 @@ def change_allow_ip(text, remove=False, caller=None):
         ip, "removed" if remove else "added", ", ".join(allowed) or "nowhere")
 
 
+# When this agent process started: "/" reports it, so the dashboard can tell
+# the agent that answers after Update Provisioning is a new one.
+STARTED_AT = int(time.time())
+
 BIND = os.environ.get("P5AGENT_BIND", "0.0.0.0")
 PORT = int(os.environ.get("P5AGENT_PORT", "5005"))
 DATA_DIR = os.environ.get("P5AGENT_DATA_DIR", "/var/lib/p5agent")
@@ -237,11 +242,34 @@ def run(cmd, cwd=None, extra_env=None):
         return 1, "[p5agent] failed to run %r: %s\n" % (cmd, exc)
 
 
-def job_status(status_file, log_file, done_marker):
+def job_running(tag):
+    """Whether a job's runner is still alive: a process with `tag` — the name
+    the runner is started under ($0 of its bash -c) — among its arguments."""
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as fh:
+                args = fh.read().split(b"\0")
+        except OSError:
+            continue
+        if tag.encode() in args:
+            return True
+    return False
+
+
+# A job just started may not show up among the processes yet.
+JOB_START_GRACE = 30
+JOB_INTERRUPTED = "[p5agent] the job stopped without finishing — the agent restarted or the upplet ran out of memory"
+
+
+def job_status(status_file, log_file, done_marker, tag=None):
     """What the last background job (a certificate run, an app update) is doing,
     or {} when there has never been one. The log carries the answer: the runner
     appends a completion marker as its final act, so its absence means the job
-    is still going."""
+    is still going — unless its runner (`tag`) is gone: then it was stopped
+    before it could finish, and it is reported as ended ("interrupted"), not
+    as running for ever."""
     raw = read_file(status_file)
     if not raw:
         return {}
@@ -252,7 +280,13 @@ def job_status(status_file, log_file, done_marker):
     log = read_file(log_file) or ""
     status["log"] = log
     marker = log.rfind(done_marker)
-    if marker == -1:
+    started = status.get("started_at") or 0
+    if marker == -1 and tag and time.time() - started > JOB_START_GRACE and not job_running(tag):
+        status["finished"] = True
+        status["returncode"] = None
+        status["interrupted"] = True
+        status["log"] = log.rstrip("\n") + "\n\n" + JOB_INTERRUPTED + "\n"
+    elif marker == -1:
         status["finished"] = False
         status["returncode"] = None
     else:
@@ -266,20 +300,20 @@ def job_status(status_file, log_file, done_marker):
 
 
 def certs_status():
-    return job_status(CERTS_STATUS, CERTS_LOG, CERTS_DONE)
+    return job_status(CERTS_STATUS, CERTS_LOG, CERTS_DONE, "p5agent-certs")
 
 
 def firewall_status():
-    status = job_status(FIREWALL_STATUS, FIREWALL_LOG, FIREWALL_DONE)
-    if status.get("finished"):
+    status = job_status(FIREWALL_STATUS, FIREWALL_LOG, FIREWALL_DONE, "p5agent-firewall")
+    if status.get("finished") and not status.get("interrupted"):
         log = status["log"]
         status["log"] = log[:log.rfind(FIREWALL_DONE)].rstrip("\n") + "\n"
     return status
 
 
 def squid_status():
-    status = job_status(SQUID_STATUS, SQUID_LOG, SQUID_DONE)
-    if status.get("finished"):
+    status = job_status(SQUID_STATUS, SQUID_LOG, SQUID_DONE, "p5agent-squid")
+    if status.get("finished") and not status.get("interrupted"):
         log = status["log"]
         status["log"] = log[:log.rfind(SQUID_DONE)].rstrip("\n") + "\n"
     return status
@@ -545,11 +579,25 @@ def listening_ports():
 def app_update_status():
     """As certs_status, with the completion marker left out of the log: the
     update's own last line already says how it went."""
-    status = job_status(APP_UPDATE_STATUS, APP_UPDATE_LOG, APP_UPDATE_DONE)
-    if status.get("finished"):
+    status = job_status(APP_UPDATE_STATUS, APP_UPDATE_LOG, APP_UPDATE_DONE, "p5agent-app-job")
+    if status.get("finished") and not status.get("interrupted"):
         log = status["log"]
         status["log"] = log[:log.rfind(APP_UPDATE_DONE)].rstrip("\n") + "\n"
     return status
+
+
+def running_job():
+    """What the agent is running in the background right now, in words, or ""."""
+    installing = install_status()
+    if installing and not installing.get("completed"):
+        return "the installation of %s" % installing.get("app", "an app")
+    for label, status in (("an app job", app_update_status()), ("a certificate run", certs_status()),
+                          ("a firewall update", firewall_status()), ("the Squid setup", squid_status())):
+        if status and not status.get("finished"):
+            if label == "an app job":
+                label = "%s's %s" % (status.get("name", "an app"), "update" if status.get("op") == "update" else status.get("op", "job"))
+            return label
+    return ""
 
 
 def unique_script_path():
@@ -879,7 +927,7 @@ class Handler(BaseHTTPRequestHandler):
     def _dispatch(self):
         path = self._path()
         if path == "/":
-            return self._send(200, {"status": "ok", "service": "p5agent"})
+            return self._send(200, {"status": "ok", "service": "p5agent", "started_at": STARTED_AT})
         if path not in self.ROUTES:
             return self._send(404, {"error": "not found", "path": path})
         if not self._authorized():
@@ -927,12 +975,19 @@ class Handler(BaseHTTPRequestHandler):
     def _do_update(self):
         """1) sync this checkout to the remote, 2) run its update.sh.
 
+        Refused while a job runs: update.sh ends by restarting the agent, and
+        the restart stops every job it started (they live in its service), so
+        the job would end without finishing.
+
         We fetch and hard-reset to the upstream branch rather than `git pull`:
         a fast-forward pull cannot handle a force-pushed (rewritten) history, and
         resetting to local HEAD would keep the old code. Resetting to the remote
         tracking branch always lands exactly what was pushed. The overall result
         reflects update.sh, the authoritative step.
         """
+        running = running_job()
+        if running:
+            return self._send(409, {"error": "%s is running — update provisioning once it has finished" % running})
         parts = []
 
         if os.path.isdir(os.path.join(APP_DIR, ".git")):

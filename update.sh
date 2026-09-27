@@ -25,6 +25,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bash "$SCRIPT_DIR/firewall.sh" || log "Firewall step skipped (ufw unavailable?)"
 
 log "Scheduling p5agent restart to load the updated code"
-systemd-run --collect --on-active=1s --unit=p5agent-restart \
+# AccuracySec: a transient timer otherwise may fire up to a minute late, and
+# the old agent keeps answering (and taking jobs) until it does.
+systemd-run --collect --on-active=1s --timer-property=AccuracySec=100ms --unit=p5agent-restart \
     systemctl restart p5agent
 ok "Restart scheduled — updated agent will be live in ~1s"
