@@ -61,6 +61,9 @@ root systemd service on port 5005 and exposes:
     GET  /squid-log   the current (or last) Squid setup: {log, finished, returncode}
     GET  /utilities   what is set up on the upplet besides apps: {squid: {port,
                       user, whitelist} | null, nginx: [apps behind Nginx]}
+    GET  /ports       what listens on the upplet: {ports: {"<port>": process}}
+                      (ss -ltnp) — read-only, so the token is enough: Setup
+                      Nginx's port check does not need /command's allowed IP
     GET  /info        the upplet itself: OS, kernel, uptime, memory, disk, this
                       agent's commit, installed versions of the supported
                       dependencies, and the firewall's rules
@@ -1069,7 +1072,20 @@ class Handler(BaseHTTPRequestHandler):
     def _send(self, status, payload):
         self._send_raw(status, json.dumps(payload), "application/json")
 
+    def parse_request(self):
+        # One handler serves every request on a kept-alive connection: each
+        # starts with its body unread.
+        self._body_data = None
+        return super().parse_request()
+
     def _send_raw(self, status, text, content_type):
+        # Read what the request sent before answering, even when the answer
+        # does not need it (a 401, a refused /command): a body left unread
+        # would be taken as the start of the connection's next request.
+        try:
+            self._body()
+        except OSError:
+            self.close_connection = True
         body = text.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -1081,8 +1097,14 @@ class Handler(BaseHTTPRequestHandler):
         return urlparse(self.path).path.rstrip("/") or "/"
 
     def _body(self):
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        return self.rfile.read(length) if length > 0 else b""
+        """The request's body — read once, then the same bytes again."""
+        if getattr(self, "_body_data", None) is None:
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+            except ValueError:
+                length = 0
+            self._body_data = self.rfile.read(length) if length > 0 else b""
+        return self._body_data
 
     def _authorized(self):
         if not TOKEN:
@@ -1118,7 +1140,8 @@ class Handler(BaseHTTPRequestHandler):
 
     ROUTES = ("/update", "/command", "/install-app", "/progress",
               "/supported", "/apps", "/certs", "/certs-log", "/info", "/app",
-              "/app-log", "/firewall", "/firewall-log", "/squid", "/squid-log", "/utilities")
+              "/app-log", "/firewall", "/firewall-log", "/squid", "/squid-log", "/utilities",
+              "/ports")
     # Only running arbitrary commands is locked to the allowed source IP; every
     # other operation needs just the token.
     IP_RESTRICTED = ("/command",)
@@ -1157,6 +1180,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/squid": self._do_squid,
                 "/squid-log": self._do_squid_log,
                 "/utilities": self._do_utilities,
+                "/ports": self._do_ports,
             }[path]()
         except Exception as exc:  # noqa: BLE001 - never leak a traceback as 500 HTML
             try:
@@ -1433,7 +1457,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._start_app_job(name, "update")
         if op == "nginx":
             if squid_current():
-                return self._send(409, {"error": "Squid is set up on this upplet — Nginx runs on an upplet without Squid"})
+                return self._send(409, {"error": "Nginx and Squid can't be installed on the same upplet"})
             port = req.get("port")
             # 0: nginx.sh picks the port.
             if not isinstance(port, int) or isinstance(port, bool) or not (port == 0 or 1024 <= port <= 65535):
@@ -1653,7 +1677,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"error": "not a domain name: %s" % bad[0]})
         nginx = nginx_in_use()
         if nginx:
-            return self._send(409, {"error": "%s on this upplet — Squid runs on an upplet without Nginx" % nginx})
+            return self._send(409, {"error": "Nginx and Squid can't be installed on the same upplet"})
         holder = listening_ports().get(port)
         if holder and holder != "squid":
             return self._send(409, {"error": "port %d is in use by %s" % (port, holder)})
@@ -1700,6 +1724,12 @@ class Handler(BaseHTTPRequestHandler):
                     pass
             return self._send(500, {"error": "failed to start the Squid setup", "detail": str(exc)})
         return self._send(200, {"status": "started"})
+
+    def _do_ports(self):
+        """GET: every TCP port something listens on, with the process."""
+        if self.command != "GET":
+            return self._send(405, {"error": "GET only"})
+        return self._send(200, {"ports": {str(p): proc for p, proc in sorted(listening_ports().items())}})
 
     def _do_utilities(self):
         """What is set up here besides apps — for the dashboard's upplet menu:
