@@ -147,7 +147,7 @@ backup)
 
 nginx)
     [[ -n "$new_port" ]] || fail "nginx needs --port <the app's new port>"
-    bash "$HERE/nginx.sh" wire "$name" "$new_port" "${nginx_flags[@]}"
+    bash "$HERE/utilities/nginx/nginx.sh" wire "$name" "$new_port" "${nginx_flags[@]}"
     exit $?
     ;;
 
@@ -263,7 +263,7 @@ PY
     done
     remove_dir "/etc/${name}"             # its certificate dir
     rm -f "/etc/sudoers.d/${name}"
-    bash "$HERE/nginx.sh" unwire "$name" || warn "Could not remove $name's Nginx site"
+    bash "$HERE/utilities/nginx/nginx.sh" unwire "$name" || warn "Could not remove $name's Nginx site"
 
     if [[ -n "$drop_db" ]]; then
         case "$db_type" in

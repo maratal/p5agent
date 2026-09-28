@@ -20,7 +20,7 @@
 #
 # Built-in ports: SSH (22), the agent (5005), 80 (ACME http-01, Nginx's
 # redirect) and each installed app's port — its public-port when it is behind
-# Nginx. On a Squid upplet (squid/setup.sh), which never has Nginx, the proxy
+# Nginx. On a Squid upplet (squid.sh), which never has Nginx, the proxy
 # port is built-in instead of 80: Setup Squid closes 80 and nothing here opens
 # it again. They can be restricted to addresses but not removed. Any list of
 # addresses always includes the dashboard's (P5AGENT_ALLOW_IP, and the address
@@ -97,7 +97,7 @@ def show(port, proto, source):
 
 # ── Built-in ports ────────────────────────────────────────────────────────────
 def squid_port():
-    """The proxy port when Squid was set up here by squid/setup.sh (its
+    """The proxy port when Squid was set up here by squid.sh (its
     generated squid.conf), else None."""
     try:
         conf = open("/etc/squid/squid.conf").read()

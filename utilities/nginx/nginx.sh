@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# nginx.sh — puts Nginx in front of installed apps.
+# nginx.sh — puts Nginx in front of installed apps (utilities/nginx/ in p5agent).
 #
 #   nginx.sh wire <name> <app-port> [--public <port>] [--bots] [--fail2ban]
 #                                     move the app to <app-port> (plain HTTP,
@@ -16,6 +16,14 @@
 #   nginx.sh certs <cert> <key>       point every Nginx-served app at this
 #                                     certificate and reload (run by certs.sh)
 #   nginx.sh unwire <name>            drop the app's Nginx site (run by uninstall)
+#   nginx.sh start | stop             the service (its card's Start / Stop)
+#   nginx.sh update                   upgrade the package, check the config, restart
+#   nginx.sh remove                   take Nginx away (the dashboard's Uninstall on
+#                                     its card): every app behind it serves itself
+#                                     again — HTTPS on the port Nginx served it on,
+#                                     with the certificate Nginx used — then Nginx
+#                                     is stopped, disabled and its package removed
+#                                     (its config and /etc/nginx/p5 certificates stay)
 #
 # The layout it builds is the usual one:
 #
@@ -47,6 +55,7 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"     # the agent's checkout: certs.sh, firewall.sh
 DATA_DIR="${P5AGENT_DATA_DIR:-/var/lib/p5agent}"
 INSTALLED="$DATA_DIR/installed_apps.json"
 AGENT_PORT="${P5AGENT_PORT:-5005}"
@@ -399,7 +408,7 @@ do_wire() {
     fi
     if [[ -z "$cert" || -z "$key" || ! -f "$cert" || ! -f "$key" ]]; then
         log "No certificate on record for $name — making a self-signed one"
-        out=$(bash "$HERE/certs.sh" self-signed --cert "$CERT_DIR/$name.crt" --key "$CERT_DIR/$name.key" 2>&1) \
+        out=$(bash "$ROOT/certs.sh" self-signed --cert "$CERT_DIR/$name.crt" --key "$CERT_DIR/$name.key" 2>&1) \
             || { printf '%s\n' "$out"; fail "Could not make a certificate"; }
         cert="$CERT_DIR/$name.crt"; key="$CERT_DIR/$name.key"
     fi
@@ -505,11 +514,11 @@ PY
     # rule yet (a restriction from Firewall Settings stays), and the private
     # port is closed outright.
     if command -v ufw >/dev/null 2>&1; then
-        bash "$HERE/firewall.sh" >/dev/null 2>&1 || true
-        bash "$HERE/firewall.sh" --close "$new_port/tcp" >/dev/null 2>&1 || true
+        bash "$ROOT/firewall.sh" >/dev/null 2>&1 || true
+        bash "$ROOT/firewall.sh" --close "$new_port/tcp" >/dev/null 2>&1 || true
         ok "Firewall: $public and 80 open, $new_port closed"
         if [[ "$old_public" != "$public" && "$old_public" != "$new_port" ]]; then
-            bash "$HERE/firewall.sh" --close "$old_public/tcp" >/dev/null 2>&1 || true
+            bash "$ROOT/firewall.sh" --close "$old_public/tcp" >/dev/null 2>&1 || true
             ok "Firewall: $old_public closed — $name is served on $public now"
         fi
     fi
@@ -591,6 +600,154 @@ do_unwire() {
     ok "Removed $name's Nginx site"
 }
 
+# ── start / stop / update ────────────────────────────────────────────────────
+nginx_version() { nginx -v 2>&1 | sed -n 's/^.*nginx\///p'; }
+
+wait_active() {
+    for _ in $(seq 1 15); do systemctl is-active --quiet nginx && return 0; sleep 1; done
+    return 1
+}
+
+do_start() {
+    command -v nginx >/dev/null 2>&1 || fail "Nginx is not installed"
+    log "Starting Nginx"
+    nginx -t >/dev/null 2>&1 || { nginx -t; fail "The Nginx configuration does not check out"; }
+    systemctl start nginx || { journalctl -u nginx -n 15 --no-pager 2>/dev/null; fail "Nginx did not start"; }
+    wait_active || fail "Nginx did not start"
+    done_ "Nginx is running"
+}
+
+do_stop() {
+    log "Stopping Nginx — the apps behind it are unreachable until it starts again"
+    systemctl stop nginx || fail "Nginx did not stop"
+    done_ "Nginx stopped"
+}
+
+do_update() {
+    command -v nginx >/dev/null 2>&1 || fail "Nginx is not installed"
+    local before after
+    before="$(nginx_version)"
+    log "Updating Nginx${before:+ (now $before)}"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get -o DPkg::Lock::Timeout=120 -qq update >/dev/null 2>&1 || warn "The package lists could not be refreshed"
+    apt-get -o DPkg::Lock::Timeout=120 -qq install -y --only-upgrade nginx || fail "The nginx package did not upgrade"
+    after="$(nginx_version)"
+    if [[ "$before" == "$after" ]]; then ok "Nginx $after is the latest"; else ok "Nginx $before → $after"; fi
+    nginx -t >/dev/null 2>&1 || { nginx -t; fail "The Nginx configuration does not check out"; }
+    log "Restarting Nginx"
+    systemctl restart nginx || { journalctl -u nginx -n 15 --no-pager 2>/dev/null; fail "Nginx did not restart"; }
+    wait_active || fail "Nginx did not come back"
+    done_ "Done — Nginx $after is running"
+}
+
+# ── remove ───────────────────────────────────────────────────────────────────
+# certs.sh's --standalone renewals were switched to Nginx's webroot; without
+# Nginx on port 80 they need their own server again.
+switch_renewal_to_standalone() {
+    local cert="$1" name conf
+    [[ "$cert" == /etc/letsencrypt/live/*/* ]] || return 0
+    name="$(basename "$(dirname "$cert")")"
+    conf="/etc/letsencrypt/renewal/$name.conf"
+    [[ -f "$conf" ]] || return 0
+    python3 - "$conf" <<'PY' && ok "Renewal of $name answers on its own again (standalone)"
+import sys
+path = sys.argv[1]
+out, skip = [], False
+for line in open(path).read().splitlines():
+    s = line.strip()
+    if s.startswith("[[webroot_map]]"):
+        skip = True
+        continue
+    if skip and s.startswith("["):
+        skip = False
+    if skip or s.startswith("authenticator") or s.startswith("webroot_path"):
+        continue
+    out.append(line)
+    if s == "[renewalparams]":
+        out.append("authenticator = standalone")
+open(path, "w").write("\n".join(out) + "\n")
+PY
+}
+
+do_remove() {
+    local rows name port public site cert key unit env failed=0
+    rows=$(apps_table | awk -F'\t' '$3 != ""')
+    [[ -n "$rows" ]] && log "Nginx serves: $(awk -F'\t' '{printf "%s%s", (NR>1?", ":""), $1}' <<< "$rows")"
+
+    # Nginx holds the ports the apps take back: it goes first.
+    if command -v nginx >/dev/null 2>&1; then
+        systemctl stop nginx 2>/dev/null || true
+        systemctl disable nginx >/dev/null 2>&1 || true
+        ok "Nginx stopped"
+    fi
+
+    while IFS=$'\t' read -r name port public; do
+        [[ -n "$name" ]] || continue
+        site="$SITES/$(site_of "$name")"
+        unit="/etc/systemd/system/${name}.service" env="/etc/${name}.env"
+        cert=$(sed -n 's/^\s*ssl_certificate \(.*\);/\1/p' "$site" 2>/dev/null | head -1)
+        key=$(sed -n 's/^\s*ssl_certificate_key \(.*\);/\1/p' "$site" 2>/dev/null | head -1)
+        log "$name serves itself again: HTTPS on $public"
+        if [[ ! -f "$unit" ]]; then warn "$unit not found — $name left as it is"; failed=1; continue; fi
+        systemctl stop "$name" 2>/dev/null || true
+        sed -i -E \
+            -e "s/^Environment=PORT=.*/Environment=PORT=$public/" \
+            -e "s/^Environment=HOST=.*/Environment=HOST=0.0.0.0/" \
+            -e "/^ExecStart=/ s/--port[= ][0-9]+/--port $public/" \
+            -e "/^ExecStart=/ s/--hostname[= ][^ ]+/--hostname 0.0.0.0/" \
+            "$unit"
+        [[ -f "$env" ]] || { touch "$env"; chmod 600 "$env"; }
+        sed -i '/^TLS_CERT_PATH=/d;/^TLS_KEY_PATH=/d;/^PORT=/d;/^HOST=/d' "$env"
+        if [[ -n "$cert" && -f "$cert" && -n "$key" && -f "$key" ]]; then
+            printf 'TLS_CERT_PATH=%s\nTLS_KEY_PATH=%s\n' "$cert" "$key" >> "$env"
+            switch_renewal_to_standalone "$cert"
+        else
+            warn "No certificate found for $name — it will serve plain HTTP until Update Certificates"
+        fi
+        printf 'PORT=%s\nHOST=0.0.0.0\n' "$public" >> "$env"
+        python3 - "$INSTALLED" "$name" "$public" <<'PY'
+import json, sys
+path, name, public = sys.argv[1:4]
+apps = json.load(open(path))
+for a in apps:
+    if a.get("name") == name:
+        a["port"] = public
+        for k in ("public-port", "nginx-bots", "nginx-fail2ban"):
+            a.pop(k, None)
+json.dump(apps, open(path, "w"), indent=2)
+PY
+        rm -f "$site" "$ENABLED/$(site_of "$name")"
+        systemctl daemon-reload
+        systemctl start "$name" || true
+        local up="" code
+        for _ in $(seq 1 30); do
+            code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 2 "https://127.0.0.1:$public/" 2>/dev/null)
+            [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] && { up=1; break; }
+            sleep 1
+        done
+        if [[ -n "$up" ]]; then ok "$name answers on https port $public (HTTP $code)"
+        else warn "$name did not answer on https port $public yet"; journalctl -u "$name" -n 10 --no-pager 2>/dev/null; failed=1; fi
+        # Its private port is nobody's now.
+        if command -v ufw >/dev/null 2>&1 && [[ "$port" != "$public" ]]; then
+            bash "$ROOT/firewall.sh" --close "$port/tcp" >/dev/null 2>&1 || true
+        fi
+    done <<< "$rows"
+
+    rm -f "$ENABLED/$ACME_SITE" "$SITES/$ACME_SITE" "$BOTS_HTTP" "$BOTS_SNIPPET" /etc/nginx/conf.d/p5-upgrade.conf
+    sync_fail2ban
+    if command -v nginx >/dev/null 2>&1; then
+        log "Removing the Nginx package (its /etc/nginx stays, certificates included)"
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get -o DPkg::Lock::Timeout=120 -qq remove -y nginx nginx-core nginx-common >/dev/null 2>&1 \
+            || apt-get -o DPkg::Lock::Timeout=120 -qq remove -y nginx >/dev/null 2>&1 || true
+        command -v nginx >/dev/null 2>&1 && warn "Nginx is still installed" || ok "Nginx removed"
+    fi
+    # Built-in ports are the apps' own now (and 80, for certificates).
+    command -v ufw >/dev/null 2>&1 && { bash "$ROOT/firewall.sh" >/dev/null 2>&1 || true; ok "Firewall: the apps' ports are open"; }
+    (( failed == 0 )) || fail "Nginx is gone, but not every app came back — see above"
+    done_ "Done — Nginx removed"
+}
+
 case "${1:-}" in
     wire)
         [[ $# -ge 3 ]] || fail "usage: nginx.sh wire <name> <app-port> [--public <port>] [--bots] [--fail2ban]"
@@ -608,5 +765,9 @@ case "${1:-}" in
         do_wire "$wire_name" "$wire_port" "$bots" "$f2b" "$public_port" ;;
     certs)  [[ $# -eq 3 ]] || fail "usage: nginx.sh certs <cert> <key>"; do_certs "$2" "$3" ;;
     unwire) [[ $# -eq 2 ]] || fail "usage: nginx.sh unwire <name>"; do_unwire "$2" ;;
-    *) sed -n '2,20p' "$0"; exit 2 ;;
+    start)  do_start ;;
+    stop)   do_stop ;;
+    update) do_update ;;
+    remove) do_remove ;;
+    *) sed -n '2,26p' "$0"; exit 2 ;;
 esac

@@ -50,17 +50,26 @@ root systemd service on port 5005 and exposes:
                       to that table (only the difference), in the background
     GET  /firewall-log the current (or last) firewall run: {log, finished, returncode}
     GET  /squid       Setup Squid's starting point: {whitelist: [domains, sorted] —
-                      the upplet's list in effect, or the squid/whitelist.txt
+                      the upplet's list in effect, or the utilities/squid/whitelist.txt
                       template before the first setup; whitelistSource:
                       "upplet" | "template"; current: {port, user, whitelist}
                       of the proxy set up already, or null}
     POST /squid       {user, password, port, whitelist: bool, domains: [...]} —
-                      run squid/setup.sh with them, in the background;
+                      run squid.sh setup with them, in the background;
                       {keep_credentials: true} instead of user and password
                       changes the rest and keeps the proxy's credentials
     GET  /squid-log   the current (or last) Squid setup: {log, finished, returncode}
     GET  /utilities   what is set up on the upplet besides apps: {squid: {port,
                       user, whitelist} | null, nginx: [apps behind Nginx]}
+    GET  /utilities   (also) each one's version and service state: squid
+                      {…, version, service}, nginxInfo {version, service} |
+                      null when Nginx is not installed
+    POST /utility     {"name": squid|nginx, "op": start|stop|update|uninstall}
+                      — squid.sh / nginx.sh <op> (uninstall: remove), in the
+                      background; followed through
+                      /utility-log {name, op, log, finished, returncode}
+    POST /squid-password {"password": ...} — a new password for the proxy's
+                      user (htpasswd), in effect at once; nothing else changes
     GET  /ports       what listens on the upplet: {ports: {"<port>": process}}
                       (ss -ltnp) — read-only, so the token is enough: Setup
                       Nginx's port check does not need /command's allowed IP
@@ -215,10 +224,10 @@ FIREWALL_SCRIPT = os.path.join(APP_DIR, "firewall.sh")
 FIREWALL_LOG = os.path.join(DATA_DIR, "firewall.log")
 FIREWALL_STATUS = os.path.join(DATA_DIR, "firewall_status.json")
 FIREWALL_DONE = "[p5agent] firewall finished rc="
-# Setup Squid: squid/setup.sh (an authenticated, optionally domain-whitelisted
+# Setup Squid: squid.sh setup (an authenticated, optionally domain-whitelisted
 # forward proxy), run as a job and followed like a firewall save.
-SQUID_SCRIPT = os.path.join(APP_DIR, "squid", "setup.sh")
-SQUID_WHITELIST = os.path.join(APP_DIR, "squid", "whitelist.txt")
+SQUID_SCRIPT = os.path.join(APP_DIR, "utilities", "squid", "squid.sh")
+SQUID_WHITELIST = os.path.join(APP_DIR, "utilities", "squid", "whitelist.txt")
 SQUID_CONF = "/etc/squid/squid.conf"
 SQUID_PASSWD = "/etc/squid/passwd"
 SQUID_WHITELIST_LIVE = "/etc/squid/whitelist.txt"   # the list in effect (setup.sh installs it)
@@ -228,6 +237,14 @@ SQUID_DONE = "[p5agent] squid finished rc="
 SQUID_USER_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 # A dstdomain entry: a host name, a leading dot for "and its subdomains".
 SQUID_DOMAIN_RE = re.compile(r"^\.?[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?(?:\.[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?)*$")
+# A utility's app-card actions (start, stop, update, uninstall): its own
+# script's subcommand, one job at a time, followed like a Squid setup.
+NGINX_SCRIPT = os.path.join(APP_DIR, "utilities", "nginx", "nginx.sh")
+UTILITY_SCRIPTS = {"squid": SQUID_SCRIPT, "nginx": NGINX_SCRIPT}
+UTILITY_LOG = os.path.join(DATA_DIR, "utility.log")
+UTILITY_STATUS = os.path.join(DATA_DIR, "utility_status.json")
+UTILITY_DONE = "[p5agent] utility finished rc="
+UTILITY_OPS = ("start", "stop", "update", "uninstall")
 SETUP_LOG = os.path.join(DATA_DIR, "setup.log")
 INSTALLED_APPS = os.path.join(DATA_DIR, "installed_apps.json")
 APPS_DIR = os.environ.get("P5AGENT_APPS_DIR", "/opt")      # where install_app.sh puts apps
@@ -343,6 +360,31 @@ def squid_status():
         log = status["log"]
         status["log"] = log[:log.rfind(SQUID_DONE)].rstrip("\n") + "\n"
     return status
+
+
+def utility_status():
+    status = job_status(UTILITY_STATUS, UTILITY_LOG, UTILITY_DONE, "p5agent-utility")
+    if status.get("finished") and not status.get("interrupted"):
+        log = status["log"]
+        status["log"] = log[:log.rfind(UTILITY_DONE)].rstrip("\n") + "\n"
+    return status
+
+
+def service_state(unit):
+    """systemctl is-active's word for a unit: active, inactive, failed, …"""
+    rc, out = run(["systemctl", "is-active", unit])
+    word = (out or "").strip().splitlines()[-1].strip() if (out or "").strip() else ""
+    known = ("active", "inactive", "failed", "activating", "deactivating", "reloading")
+    return word if word in known else "unknown"
+
+
+def utility_version(name):
+    """The installed version of squid or nginx, or "" when it is not there."""
+    if not shutil.which(name):
+        return ""
+    rc, out = run([name, "-v"])
+    m = re.search(r"Version (\S+)", out or "") if name == "squid" else re.search(r"nginx/(\S+)", out or "")
+    return m.group(1) if m else ""
 
 
 def nginx_in_use():
@@ -564,7 +606,7 @@ def squid_remove(text):
 def squid_whitelist_report():
     """`proxy --whitelist | -wl`: the whitelist as Squid has it loaded, asked
     from Squid's cache manager (its configuration, open to 127.0.0.1 only —
-    see squid/setup.sh). When Squid does not answer, the file it reads is
+    see squid.sh). When Squid does not answer, the file it reads is
     shown instead, and said so. Returns (rc, output)."""
     current = squid_current()
     if not current:
@@ -1141,7 +1183,7 @@ class Handler(BaseHTTPRequestHandler):
     ROUTES = ("/update", "/command", "/install-app", "/progress",
               "/supported", "/apps", "/certs", "/certs-log", "/info", "/app",
               "/app-log", "/firewall", "/firewall-log", "/squid", "/squid-log", "/utilities",
-              "/ports")
+              "/ports", "/utility", "/utility-log", "/squid-password")
     # Only running arbitrary commands is locked to the allowed source IP; every
     # other operation needs just the token.
     IP_RESTRICTED = ("/command",)
@@ -1181,6 +1223,9 @@ class Handler(BaseHTTPRequestHandler):
                 "/squid-log": self._do_squid_log,
                 "/utilities": self._do_utilities,
                 "/ports": self._do_ports,
+                "/utility": self._do_utility,
+                "/utility-log": self._do_utility_log,
+                "/squid-password": self._do_squid_password,
             }[path]()
         except Exception as exc:  # noqa: BLE001 - never leak a traceback as 500 HTML
             try:
@@ -1624,12 +1669,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _do_squid(self):
         """GET: the default whitelist and the proxy already set up, if any.
-        POST: run squid/setup.sh with the dashboard's settings — started here,
+        POST: run squid.sh setup with the dashboard's settings — started here,
         followed through /squid-log. The password reaches the script in its
         environment only; it is never written to disk except as the bcrypt
         hash in /etc/squid/passwd, and never logged."""
         if not os.path.isfile(SQUID_SCRIPT):
-            return self._send(500, {"error": "squid/setup.sh not found"})
+            return self._send(500, {"error": "squid.sh not found"})
         if self.command == "GET":
             # The repo's whitelist.txt is a template for the first setup; once
             # Squid is set up, the list in effect is what gets edited. (A setup
@@ -1705,12 +1750,12 @@ class Handler(BaseHTTPRequestHandler):
                         " with %d whitelisted domain(s)" % len(domains) if use_whitelist else ", no whitelist"))
         with open(SQUID_STATUS, "w") as fh:
             json.dump({"started_at": int(time.time()), "port": port, "user": user}, fh)
-        runner = ('exec >>"$1" 2>&1 </dev/null; bash "$2"; rc=$?; '
+        runner = ('exec >>"$1" 2>&1 </dev/null; bash "$2" setup; rc=$?; '
                   '[ -n "$3" ] && rm -f "$3"; printf "\\n%s%s\\n" "$4" "$rc"')
         try:
             subprocess.Popen(
                 ["bash", "-c", runner, "p5agent-squid", SQUID_LOG, SQUID_SCRIPT, request, SQUID_DONE],
-                cwd=os.path.dirname(SQUID_SCRIPT),
+                cwd=APP_DIR,
                 env=dict(os.environ, HOME="/root", DEBIAN_FRONTEND="noninteractive", **extra),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -1733,13 +1778,100 @@ class Handler(BaseHTTPRequestHandler):
 
     def _do_utilities(self):
         """What is set up here besides apps — for the dashboard's upplet menu:
-        Squid (as squid/setup.sh left it) and the apps behind Nginx."""
+        Squid (as squid.sh setup left it) and the apps behind Nginx."""
         try:
             apps = json.loads(read_file(INSTALLED_APPS) or "[]")
         except ValueError:
             apps = []
         wired = [str(a.get("name")) for a in apps if isinstance(a, dict) and a.get("public-port")]
-        return self._send(200, {"squid": squid_current(), "nginx": wired})
+        squid = squid_current()
+        if squid:
+            squid = dict(squid, version=utility_version("squid"), service=service_state("squid"))
+        nginx_info = None
+        if shutil.which("nginx"):
+            nginx_info = {"version": utility_version("nginx"), "service": service_state("nginx")}
+        job = utility_status()
+        running = {"name": job.get("name"), "op": job.get("op")} if job and not job.get("finished") else None
+        return self._send(200, {"squid": squid, "nginx": wired, "nginxInfo": nginx_info, "job": running})
+
+    def _do_utility(self):
+        """POST {name, op}: a utility's card action, as a job: squid.sh or
+        nginx.sh with that subcommand (uninstall is their remove)."""
+        if self.command != "POST":
+            return self._send(405, {"error": "POST only"})
+        try:
+            req = json.loads(self._body().decode("utf-8", "replace") or "{}")
+        except ValueError:
+            return self._send(400, {"error": "body must be JSON"})
+        name, op = str(req.get("name") or ""), str(req.get("op") or "")
+        if name not in ("squid", "nginx") or op not in UTILITY_OPS:
+            return self._send(400, {"error": "name must be squid or nginx, op one of %s" % ", ".join(UTILITY_OPS)})
+        if name == "squid" and not squid_current():
+            return self._send(409, {"error": "Squid is not set up on this upplet"})
+        if name == "nginx" and not shutil.which("nginx"):
+            return self._send(409, {"error": "Nginx is not installed on this upplet"})
+        busy = utility_status()
+        if busy and not busy.get("finished"):
+            done = {"start": "started", "stop": "stopped", "update": "updated", "uninstall": "uninstalled"}
+            return self._send(409, {"error": "%s is being %s already" % (
+                {"squid": "Squid", "nginx": "Nginx"}.get(busy.get("name"), busy.get("name")),
+                done.get(busy.get("op"), busy.get("op")))})
+        squid_job = squid_status()
+        if name == "squid" and squid_job and not squid_job.get("finished"):
+            return self._send(409, {"error": "Squid is being set up"})
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(UTILITY_LOG, "w") as fh:
+            fh.write("[p5agent] %s %s\n" % (name, op))
+        with open(UTILITY_STATUS, "w") as fh:
+            json.dump({"started_at": int(time.time()), "name": name, "op": op}, fh)
+        if name == "squid" and op == "uninstall":
+            # Squid's timed whitelist entries go with it.
+            with RULES_LOCK:
+                timed_rules_save([r for r in timed_rules_load() if r["kind"] != "proxy"])
+        runner = 'exec >>"$1" 2>&1 </dev/null; bash "$2" "$3"; rc=$?; printf "\\n%s%s\\n" "$4" "$rc"'
+        try:
+            subprocess.Popen(
+                ["bash", "-c", runner, "p5agent-utility", UTILITY_LOG, UTILITY_SCRIPTS[name],
+                 "remove" if op == "uninstall" else op, UTILITY_DONE],
+                cwd=APP_DIR,
+                env=dict(os.environ, HOME="/root", DEBIAN_FRONTEND="noninteractive"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,   # survive the agent and this request
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._send(500, {"error": "failed to start: %s %s" % (name, op), "detail": str(exc)})
+        return self._send(200, {"status": "started"})
+
+    def _do_utility_log(self):
+        """The current (or last) utility action: {name, op, log, finished, returncode}."""
+        return self._send(200, utility_status())
+
+    def _do_squid_password(self):
+        """POST {password}: a new password for the proxy's user, at once."""
+        if self.command != "POST":
+            return self._send(405, {"error": "POST only"})
+        try:
+            req = json.loads(self._body().decode("utf-8", "replace") or "{}")
+        except ValueError:
+            return self._send(400, {"error": "body must be JSON"})
+        password = str(req.get("password") or "")
+        if not password or len(password) > 128 or any(c in password for c in "\r\n\0"):
+            return self._send(400, {"error": "a password of 1 to 128 characters, on one line, is required"})
+        current = squid_current()
+        if not current or not current.get("user"):
+            return self._send(409, {"error": "Squid is not set up on this upplet"})
+        busy = squid_status()
+        if busy and not busy.get("finished"):
+            return self._send(409, {"error": "Squid is being set up"})
+        # On stdin, not the command line: no other process sees it.
+        proc = subprocess.run(["bash", SQUID_SCRIPT, "password", current["user"]], cwd=APP_DIR,
+                              input=(password + "\n").encode("utf-8"), capture_output=True, timeout=60)
+        out = (proc.stdout or b"").decode("utf-8", "replace") + (proc.stderr or b"").decode("utf-8", "replace")
+        if proc.returncode != 0:
+            return self._send(500, {"error": "the password was not changed",
+                                    "detail": re.sub(r"\x1b\[[0-9;]*m", "", out).strip()})
+        return self._send(200, {"user": current["user"]})
 
     def _do_squid_log(self):
         """The current (or last) Squid setup: {log, finished, returncode}."""

@@ -317,7 +317,7 @@ fi
 # Apps behind Nginx: Nginx serves the certificate, they keep speaking HTTP.
 PROXIED=$(proxied_apps)
 if [[ -n "$PROXIED" ]]; then
-    bash "$(dirname "$0")/nginx.sh" certs "$CERT" "$KEY" >&2 \
+    bash "$(dirname "$0")/utilities/nginx/nginx.sh" certs "$CERT" "$KEY" >&2 \
         || fail "The certificate is in place, but Nginx did not take it"
 fi
 
