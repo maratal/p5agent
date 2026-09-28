@@ -15,7 +15,9 @@ nothing to install. The idle process uses roughly 12–18 MB of RAM.
 | GET / POST | `/update`      | yes  | any        | `git pull` this checkout, then run its `update.sh`. |
 | GET / POST | `/command`     | yes  | restricted | Save the request body to `/tmp/command_<dd_mm_yy_hh_mm_ss>.sh`, make it executable, and run it as **root**. |
 | POST       | `/install-app` | yes  | any        | Launch `install_app.sh` in the background to install an app + dependencies. Returns once the job is spawned. |
-| GET        | `/progress`    | yes  | any        | The live install log (`setup.log`). Empty when nothing is installing. Poll it (~every 5s) to follow an install. |
+| POST       | `/install-util` | yes | any        | Install a utility (`squid`, `nginx`): `install_util.sh` runs `utilities/<name>/<name>.sh install` in the background, through the same lock, `/progress` and `setup.log` as an app install. |
+| GET        | `/progress`    | yes  | any        | The current install — app or utility: `{app, kind, started_at, completed?}`. Empty when nothing is installing. Poll it (~every 5s) to follow an install. |
+| GET        | `/setup-log`   | yes  | any        | The current (or last) install's log, only what the caller lacks: `?from=<lines it has>&id=<log id>` → `{id, from, next, lines, installing}`. A different `id` (a new install) starts over from 0. |
 | GET        | `/supported`   | yes  | any        | The `supported_deps.json` registry of installable dependencies. |
 | GET        | `/apps`        | yes  | any        | The `installed_apps.json` list of installed apps, each with `service` (its `systemctl is-active` state) and `backup` (whether `<apps dir>/<name>_backup` exists). |
 | POST       | `/app`         | yes  | restricted | Run an operation on one installed app through `app_ops.sh`: `start`, `stop`, `backup`, `update`, `rollback` or `uninstall`. Answers when it is done — except `update`, which runs in the background. |
@@ -163,19 +165,48 @@ timestamps:
    systemd service from the request's `app-cmd` — running as that user with
    `AmbientCapabilities=CAP_NET_BIND_SERVICE` so it can bind 443. (`app-type`
    selects the builder.)
-4. **Records the app** in `installed_apps.json` and writes `Setup completed.`,
-   then moves `setup.log` to `<tmp>/p5agent_setup_<timestamp>.log` (so `/progress`
-   goes empty — the signal that nothing is running).
+4. **Records the app** in `installed_apps.json`, logs
+   `<name> installation completed` as the log's last line and releases the
+   install lock.
 
 A version may be appended after a space (e.g. `swift 6`, `ruby 3.4.5`). Most
 dependencies install via apt; `swift` is fetched from swift.org. The full,
 current list comes from `/supported`.
 
-**Progress & concurrency.** While an install runs, `setup.log` is updated and
-served by `/progress`. A second `/install-app` while one is active is a no-op.
-If `setup.log` is stale (untouched > 10 min), the next run waits 30s and, if
-still unchanged, treats the previous install as failed — archiving it to
-`<tmp>/p5agent_setup_<timestamp>-failed.log` and clearing `setup.log`.
+**Progress & concurrency.** One install runs at a time, app or utility: the
+agent takes the lock (`pending_install.json`) when it accepts a request and a
+second `/install-app` or `/install-util` meanwhile is refused with `409`.
+`setup.log` holds the current install, every line timestamped, starting with
+`<name> installation started` and ending with `<name> installation completed`
+or `<name> installation failed`. It stays after the install ends — for View
+Setup Log — until the next install is accepted, which moves it to
+`<tmp>/p5agent_setup_<timestamp>.log` (`-failed.log` for a failed one). A run
+with no log activity for 30 minutes is marked failed by the agent.
+`/setup-log` hands it out incrementally: the caller says how many lines it has
+(`from`) of which log (`id`), and gets only the rest.
+
+### `/install-util`
+
+A utility is installed like an app: `install_util.sh <name> [args]` runs
+`utilities/<name>/<name>.sh install [args]` detached, its output timestamped
+into `setup.log`.
+
+```bash
+# Squid: an authenticated forward proxy (password in the environment only)
+curl -X POST "https://<ip>:5005/install-util" -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"name": "squid", "user": "squiduser", "password": "…", "port": 3128,
+          "whitelist": true, "domains": [".github.com"]}'
+# (`"keep_credentials": true` instead of user/password keeps those of a Squid set up already.)
+
+# Nginx in front of an installed app (port 0: picked on the upplet)
+curl -X POST "https://<ip>:5005/install-util" -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"name": "nginx", "app": "chatserver", "port": 0, "public_port": 443,
+          "bots": true, "fail2ban": false}'
+```
+
+`POST /squid` and `POST /app {op: "nginx"}` are the same installs.
 
 ## Authorization
 
@@ -219,13 +250,14 @@ certificate (for the droplet's IP) under `/opt/p5agent/certs`.
 | `agent.py` | repo | The HTTP agent. |
 | `update.sh` | repo | Restarts the service to apply a pulled update. |
 | `install_app.sh` | repo | Backgrounded app installer (deps + clone + setup). |
+| `install_util.sh` | repo | Backgrounded utility installer: `utilities/<name>/<name>.sh install`, logged like an app install. |
 | `app_support/common.sh` | repo | Helpers shared by `install_app.sh` and `app_ops.sh`: `create_service`, and `app_version_line` (asks the app's `/api/info` which version is running — logged at the end of an install, an update and a rollback). |
 | `app_ops.sh` | repo | Start, stop, back up, update, roll back or uninstall one installed app; run by `/app`. |
 | `install_swift.sh` | repo | Dedicated Swift installer; referenced by the `swift` entry's `install-cmd`. |
 | `app_support/install_<type>_app.sh` | repo | Standard minimal builder per app type (swift, nodejs, python, ruby, go, php, java), used when a cloned repo has no `setup.sh`/`install.sh`. It builds the app and creates its systemd service. |
 | `app_support/wire_<dbtype>.sh` | repo | Per-database-type wiring (postgresql, mysql, mariadb, sqlite): creates the app's database/user and writes `/etc/<name>.env` (loaded by the service). Used for repos with no installer of their own. |
 | `supported_deps.json` | repo | Registry of installable dependencies: `name`, `display-name`, `icon-url`, and a `package-manager` (+ optional `package`) or `install-cmd`. Served by `/supported`. |
-| `setup.log` | data dir | Live install log; served by `/progress`. |
+| `setup.log` | data dir | The current (or last) install's log, app or utility; served by `/setup-log`, archived to `<tmp>` when the next install starts. |
 | `installed_apps.json` | data dir | Installed apps (`name`, `product-name`, `path`, `port`, `dependencies`, and for updates `app-type`, `app-cmd`, `demo`, `source`); served by `/apps`. |
 | `app_update.log`, `app_update_status.json` | data dir | The current (or last) app update; served by `/app-log`. |
 | `p5agent-restart-apps.sh` | `/etc/letsencrypt/renewal-hooks/deploy` | Restarts every installed app after a certificate renewal; written by `certs.sh`. |

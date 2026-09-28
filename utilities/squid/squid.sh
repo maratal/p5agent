@@ -3,9 +3,10 @@
 # squid.sh — Squid on an upplet (utilities/squid/ in p5agent): an authenticated,
 # optionally domain-whitelisted forward proxy. Its card in the dashboard runs everything but a manual setup.
 #
-#   squid.sh [setup]          set it up (or again: port, whitelist, credentials)
+#   squid.sh [install|setup]  set it up (or again: port, whitelist, credentials)
 #                             — with no settings in the environment it asks for
-#                             the username and password
+#                             the username and password. `install` is what
+#                             p5agent's install_util.sh runs (/install-util).
 #   squid.sh start | stop     the service
 #   squid.sh update           upgrade the package, then restart
 #   squid.sh remove           stop it, purge the package and /etc/squid (config,
@@ -127,7 +128,7 @@ do_password() {
 }
 
 case "${1:-setup}" in
-    setup) ;;                                  # below
+    install|setup) ;;                          # below
     start|stop|update|remove)
         [[ $EUID -eq 0 ]] || fail "run as root (sudo $0 $1)"
         "do_$1"; exit 0 ;;

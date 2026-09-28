@@ -9,15 +9,17 @@
 # demos/python) and it is copied, not cloned. Run detached by the
 # agent; it is the single owner of the install lifecycle.
 #
-# Everything is logged, line-by-line with timestamps, to $SETUP_LOG, which the
-# agent serves as the "log" field of /progress. The AGENT owns the install
-# lifecycle: it takes the lock (pending_install.json) before spawning this
-# script, refuses concurrent installs, and decides the outcome —
+# Everything is logged, line-by-line with timestamps, to $SETUP_LOG — the same
+# log a utility's install (install_util.sh) writes; the agent serves it through
+# /setup-log and archives it to <tmp> when the next install is accepted. The AGENT owns the
+# install lifecycle: it takes the lock (pending_install.json) before spawning
+# this script, refuses concurrent installs, and decides the outcome —
 #   completed: the log's LAST line is "<name> installation completed" (written
 #              at the very end below, upon which pending_install.json is
-#              removed; the log stays until the next accepted install);
-#   failed:    fail() archives the log and removes the lock, so /progress
-#              drops back to {} — the polling peer's failure signal. A run
+#              removed);
+#   failed:    fail() logs why and "<name> installation failed", and removes
+#              the lock, so /progress drops back to {} — the polling peer's
+#              failure signal. The log stays until the next install. A run
 #              that dies silently is cleared by the agent's 30-minute stall rule.
 
 REQ="${1:?usage: install_app.sh <request.json>}"
@@ -39,12 +41,7 @@ logline()  { printf '[%s] %s\n' "$(ts)" "$*" >> "$SETUP_LOG"; }
 stamp()    { while IFS= read -r line; do printf '[%s] %s\n' "$(ts)" "$line"; done >> "$SETUP_LOG"; }
 runlog()   { bash -c "$1" 2>&1 | stamp; return "${PIPESTATUS[0]}"; }
 
-archive() {  # archive() <suffix>  — move the log out of the way
-    cp "$SETUP_LOG" "$TMP_DIR/p5agent_setup_$(date +%Y%m%d_%H%M%S)${1:-}.log" 2>/dev/null || true
-    rm -f "$SETUP_LOG"
-}
-
-fail() { logline "$*"; archive "-failed"; rm -f "$PENDING"; exit 1; }
+fail() { logline "$*"; logline "${name:-app} installation failed"; rm -f "$PENDING"; exit 1; }
 
 # create_service — shared with app_ops.sh (an update rebuilds the same way).
 # shellcheck source=app_support/common.sh
@@ -146,8 +143,7 @@ if isinstance(d,str): d=[x for x in re.split(r'[,\n]',d) if x.strip()]
 for x in d: print(str(x).strip())
 " "$REQ")
 
-# ── Start a fresh log ────────────────────────────────────────────────────────
-: > "$SETUP_LOG"
+# ── This install's section of the log (headed by the agent) ────────────────
 logline "Setup started for ${product:-$name}"
 
 # ── Install dependencies ─────────────────────────────────────────────────────

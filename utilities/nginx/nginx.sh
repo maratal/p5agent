@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # nginx.sh — puts Nginx in front of installed apps (utilities/nginx/ in p5agent).
 #
-#   nginx.sh wire <name> <app-port> [--public <port>] [--bots] [--fail2ban]
+#   nginx.sh install|wire <name> <app-port> [--public <port>] [--bots] [--fail2ban]
 #                                     move the app to <app-port> (plain HTTP,
 #                                     loopback only) and let Nginx serve its old
 #                                     port over HTTPS, plus port 80. 0 picks the
@@ -749,8 +749,10 @@ PY
 }
 
 case "${1:-}" in
-    wire)
-        [[ $# -ge 3 ]] || fail "usage: nginx.sh wire <name> <app-port> [--public <port>] [--bots] [--fail2ban]"
+    # install: what p5agent's install_util.sh runs (/install-util nginx) —
+    # the same as wire.
+    wire|install)
+        [[ $# -ge 3 ]] || fail "usage: nginx.sh install <name> <app-port> [--public <port>] [--bots] [--fail2ban]"
         wire_name="$2" wire_port="$3" bots=0 f2b=0 public_port=""
         shift 3
         while [[ $# -gt 0 ]]; do

@@ -29,20 +29,26 @@ root systemd service on port 5005 and exposes:
                       and its dependencies; returns 200 once the job is launched.
                       One install runs at a time: the request is recorded in
                       pending_install.json the moment it is accepted, and a
-                      second request is refused with 409 while one is running
+                      second request (either kind) is refused with 409 while one is running
+    POST /install-util {"name": squid|nginx, …its settings} — install a utility:
+                      install_util.sh runs utilities/<name>/<name>.sh install in
+                      the background, exactly as an app install is run (the
+                      same lock, /progress and setup.log)
     GET  /progress    current install status as JSON:
-                      { "app", "started_at", "log"?, "completed"? } — {} when idle
+                      { "app", "kind", "started_at", "completed"? } — {} when idle
+    GET  /setup-log   the current (or last) install's log, only what the caller
+                      lacks: ?from=<lines it has>&id=<log id> ->
+                      { id, from, next, lines, installing }
     GET  /supported   the supported_deps.json registry
     GET  /apps        the installed_apps.json list, each app with "service"
                       (systemctl is-active) and "backup" (a rollback is possible)
     POST /app         one installed app's lifecycle, via app_ops.sh:
-                      {"op": start|stop|backup|update|rollback|uninstall|nginx, "name": ...,
-                       "drop_db": bool (uninstall), "port": int (nginx: the
-                       app's new private port, 0 = pick one), "public_port":
-                       int (nginx: the port it serves the app on), "bots": bool,
-                       "fail2ban": bool (nginx: bot protection, on or off)} -> {returncode, output};
-                      update and nginx run in the background -> {"status": "started"}
-    GET  /app-log     the current (or last) app job — an update or an nginx wire:
+                      {"op": start|stop|backup|update|rollback|uninstall, "name": ...,
+                       "drop_db": bool (uninstall)} -> {returncode, output};
+                      update runs in the background -> {"status": "started"}.
+                      ("op": "nginx" is still taken: /install-util nginx for
+                      that app.)
+    GET  /app-log     the current (or last) app update:
                       {name, op, started_at, log, finished, returncode} — {} if none
     GET  /firewall    the firewall table as ufw has it (firewall.sh --plan): each
                       port with the addresses it is open to, built-in ones marked
@@ -55,17 +61,16 @@ root systemd service on port 5005 and exposes:
                       "upplet" | "template"; current: {port, user, whitelist}
                       of the proxy set up already, or null}
     POST /squid       {user, password, port, whitelist: bool, domains: [...]} —
-                      run squid.sh setup with them, in the background;
-                      {keep_credentials: true} instead of user and password
-                      changes the rest and keeps the proxy's credentials
-    GET  /squid-log   the current (or last) Squid setup: {log, finished, returncode}
+                      the same as /install-util squid; {keep_credentials: true}
+                      instead of user and password changes the rest and keeps
+                      the proxy's credentials
     GET  /utilities   what is set up on the upplet besides apps: {squid: {port,
                       user, whitelist} | null, nginx: [apps behind Nginx]}
     GET  /utilities   (also) each one's version and service state: squid
                       {…, version, service}, nginxInfo {version, service} |
                       null when Nginx is not installed
     POST /utility     {"name": squid|nginx, "op": start|stop|update|uninstall}
-                      — squid.sh / nginx.sh <op> (uninstall: remove), in the
+                      — utilities/<name>/<name>.sh <op> (uninstall: remove), in the
                       background; followed through
                       /utility-log {name, op, log, finished, returncode}
     POST /squid-password {"password": ...} — a new password for the proxy's
@@ -97,6 +102,7 @@ cannot leak into access logs, proxies, or browser history:
     Authorization: Bearer <TOKEN>
 """
 
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -110,7 +116,7 @@ import threading
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 TOKEN = os.environ.get("P5AGENT_TOKEN", "")
 # The agent operates on its own checkout, so the install dir/name is never
@@ -224,16 +230,13 @@ FIREWALL_SCRIPT = os.path.join(APP_DIR, "firewall.sh")
 FIREWALL_LOG = os.path.join(DATA_DIR, "firewall.log")
 FIREWALL_STATUS = os.path.join(DATA_DIR, "firewall_status.json")
 FIREWALL_DONE = "[p5agent] firewall finished rc="
-# Setup Squid: squid.sh setup (an authenticated, optionally domain-whitelisted
-# forward proxy), run as a job and followed like a firewall save.
+# Squid (an authenticated, optionally domain-whitelisted forward proxy): set up
+# — installed, or changed — through /install-util, like any install.
 SQUID_SCRIPT = os.path.join(APP_DIR, "utilities", "squid", "squid.sh")
 SQUID_WHITELIST = os.path.join(APP_DIR, "utilities", "squid", "whitelist.txt")
 SQUID_CONF = "/etc/squid/squid.conf"
 SQUID_PASSWD = "/etc/squid/passwd"
 SQUID_WHITELIST_LIVE = "/etc/squid/whitelist.txt"   # the list in effect (setup.sh installs it)
-SQUID_LOG = os.path.join(DATA_DIR, "squid.log")
-SQUID_STATUS = os.path.join(DATA_DIR, "squid_status.json")
-SQUID_DONE = "[p5agent] squid finished rc="
 SQUID_USER_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 # A dstdomain entry: a host name, a leading dot for "and its subdomains".
 SQUID_DOMAIN_RE = re.compile(r"^\.?[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?(?:\.[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?)*$")
@@ -245,22 +248,33 @@ UTILITY_LOG = os.path.join(DATA_DIR, "utility.log")
 UTILITY_STATUS = os.path.join(DATA_DIR, "utility_status.json")
 UTILITY_DONE = "[p5agent] utility finished rc="
 UTILITY_OPS = ("start", "stop", "update", "uninstall")
+# Every installation — an app (/install-app) or a utility (/install-util) —
+# logs to setup.log, every line timestamped. It holds the current install, or
+# the last one until the next is accepted: then it is archived to
+# <tmp>/p5agent_setup_<stamp>[-failed].log. /setup-log serves it a few lines
+# at a time (only those the caller does not have yet).
 SETUP_LOG = os.path.join(DATA_DIR, "setup.log")
+SETUP_TS_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] ")
+FAILED_SUFFIX = " installation failed"
+INSTALL_UTIL_SCRIPT = os.path.join(APP_DIR, "install_util.sh")
+UTILITY_NAMES = ("squid", "nginx")
 INSTALLED_APPS = os.path.join(DATA_DIR, "installed_apps.json")
 APPS_DIR = os.environ.get("P5AGENT_APPS_DIR", "/opt")      # where install_app.sh puts apps
 APP_OPS_SCRIPT = os.path.join(APP_DIR, "app_ops.sh")
 APP_OPS = ("start", "stop", "backup", "update", "rollback", "uninstall", "nginx")
 # The ops that run as a background job, one at a time, followed through /app-log.
-APP_JOBS = ("update", "nginx")
+# ("nginx" is an install of Nginx in front of the app: /install-util runs it.)
+APP_JOBS = ("update",)
 # An update is a job like a certificate run: a rebuild can take far longer than
 # a request may stay open, so /app starts it and /app-log follows it.
 APP_UPDATE_LOG = os.path.join(DATA_DIR, "app_update.log")
 APP_UPDATE_STATUS = os.path.join(DATA_DIR, "app_update_status.json")
 APP_UPDATE_DONE = "[p5agent] update finished rc="
-# The install lock/status record, written the moment /install-app accepts a
-# request: {"app": <name>, "started_at": <unix ts>}. While it exists no second
-# install is accepted. install_app.sh removes it right after logging the
-# completion marker; a failed install is cleared here (stall rule) or by fail().
+# The install lock/status record, written the moment /install-app or
+# /install-util accepts a request: {"app": <name>, "kind": "app"|"utility",
+# "started_at": <unix ts>}. While it exists no second install of either kind is
+# accepted. The install script removes it right after logging the completion
+# marker; a failed install is cleared by its fail() or here (stall rule).
 PENDING_INSTALL = os.path.join(DATA_DIR, "pending_install.json")
 INSTALL_STALL_SECS = 1800  # no log activity for 30 min → the install failed
 
@@ -354,12 +368,19 @@ def firewall_status():
     return status
 
 
-def squid_status():
-    status = job_status(SQUID_STATUS, SQUID_LOG, SQUID_DONE, "p5agent-squid")
-    if status.get("finished") and not status.get("interrupted"):
-        log = status["log"]
-        status["log"] = log[:log.rfind(SQUID_DONE)].rstrip("\n") + "\n"
-    return status
+def install_busy():
+    """Why no install can start now — one (an app's or a utility's) is
+    running — or ""."""
+    current = install_status()
+    if current and not current.get("completed"):
+        return "%s installation is in progress" % current["app"]
+    return ""
+
+
+def installing(name):
+    """Whether `name` (an app or a utility) is being installed right now."""
+    current = install_status()
+    return bool(current and not current.get("completed") and current.get("app") == name)
 
 
 def utility_status():
@@ -678,6 +699,10 @@ def squid_timed_report():
 # dropped as covered — put back when it goes]}.
 TIMED_RULES = os.path.join(DATA_DIR, "timed_rules.json")
 RULES_LOCK = threading.RLock()      # the aliases and the revoker, one at a time
+# Requests are served on threads: checking that nothing is installing and
+# taking the install lock (pending_install.json) must be one step, or two
+# requests arriving together could both start.
+INSTALL_ACCEPT_LOCK = threading.Lock()
 REVOKE_EVERY = 60
 
 
@@ -836,7 +861,7 @@ def running_job():
     if installing and not installing.get("completed"):
         return "the installation of %s" % installing.get("app", "an app")
     for label, status in (("an app job", app_update_status()), ("a certificate run", certs_status()),
-                          ("a firewall update", firewall_status()), ("the Squid setup", squid_status())):
+                          ("a firewall update", firewall_status())):
         if status and not status.get("finished"):
             if label == "an app job":
                 label = "%s's %s" % (status.get("name", "an app"), "update" if status.get("op") == "update" else status.get("op", "job"))
@@ -880,22 +905,75 @@ def app_name_from_request(req):
     return base[:-4] if base.endswith(".git") else base
 
 
-def clear_install(failed=False):
-    """Drop pending_install.json; archive setup.log out of the way."""
-    if os.path.exists(SETUP_LOG):
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        suffix = "-failed" if failed else ""
+def setup_logline(text):
+    """One line in setup.log, stamped as the install scripts stamp theirs."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(SETUP_LOG, "a") as fh:
+        fh.write("[%s] %s\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text))
+
+
+def archive_setup_log():
+    """Move the last install's log out of the way — to
+    <tmp>/p5agent_setup_<stamp>.log, "-failed" before .log when it failed —
+    as the next install is accepted. Until then it stays for View Setup Log."""
+    if not os.path.exists(SETUP_LOG):
+        return
+    lines = read_file(SETUP_LOG).rstrip().splitlines()
+    suffix = "-failed" if lines and FAILED_SUFFIX in lines[-1] else ""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    try:
+        os.replace(SETUP_LOG, os.path.join(TMP_DIR, "p5agent_setup_%s%s.log" % (stamp, suffix)))
+    except OSError:
         try:
-            os.replace(SETUP_LOG, os.path.join(TMP_DIR, "p5agent_setup_%s%s.log" % (stamp, suffix)))
+            os.remove(SETUP_LOG)
         except OSError:
-            try:
-                os.remove(SETUP_LOG)
-            except OSError:
-                pass
+            pass
+
+
+def clear_install(failed=False, name=None, reason=None):
+    """Drop pending_install.json. A failure the install script could not log
+    itself (it never started, or went quiet) is logged here; the log stays
+    until the next install archives it."""
+    if failed and name:
+        setup_logline("%s%s%s" % (name, FAILED_SUFFIX, ": " + reason if reason else ""))
     try:
         os.remove(PENDING_INSTALL)
     except OSError:
         pass
+
+
+def setup_log_lines():
+    """setup.log as a list of lines, each with its timestamp: a line written
+    without one (a stray write, a line broken by a carriage return) takes the
+    one before it — the first, the file's own time."""
+    try:
+        fallback = datetime.fromtimestamp(os.stat(SETUP_LOG).st_mtime).strftime("[%Y-%m-%d %H:%M:%S] ")
+    except OSError:
+        return []
+    lines = []
+    for line in read_file(SETUP_LOG).rstrip("\n").split("\n"):
+        stamped = SETUP_TS_RE.match(line)
+        if stamped:
+            fallback = stamped.group(0)
+        elif line.strip():
+            line = fallback + line
+        else:
+            continue
+        lines.append(line)
+    return lines
+
+
+def setup_log_id():
+    """Which install's log setup.log holds — the file (each install starts
+    a new one; the last is moved away) and its first line — so a caller
+    holding lines of another knows to start over."""
+    try:
+        with open(SETUP_LOG) as fh:
+            first = fh.readline().strip()
+            inode = os.fstat(fh.fileno()).st_ino
+    except OSError:
+        return ""
+    return hashlib.sha1(("%d:%s" % (inode, first)).encode("utf-8", "replace")).hexdigest()[:12] if first else ""
 
 
 COMPLETED_SUFFIX = " installation completed"
@@ -935,10 +1013,13 @@ def install_status():
                  install_app.sh removes pending_install.json right after
                  logging it, so a completed install is reported from the log
                  alone (which stays until the next accepted install)
-      failed     pending exists but there was no log activity (setup.log
-                 mtime, else started_at) for more than 30 minutes → cleared
-                 here; the polling peer learns of the failure by /progress
-                 dropping back to {}
+      failed     the script's fail() logs "<name> installation failed" and
+                 removes the lock; or pending exists but there was no log
+                 activity (setup.log mtime, else started_at) for more than
+                 30 minutes → cleared here. Either way the polling peer learns
+                 of the failure by /progress dropping back to {}
+
+    "kind" is "app" or "utility". The log itself is /setup-log's.
     """
     log = read_file(SETUP_LOG)
     raw = read_file(PENDING_INSTALL)
@@ -949,8 +1030,8 @@ def install_status():
         app = completed_app(log)
         if not app:
             return None
-        return {"app": app, "started_at": log_started_at(log),
-                "log": log, "completed": True}
+        return {"app": app, "kind": "utility" if app in UTILITY_NAMES else "app",
+                "started_at": log_started_at(log), "completed": True}
 
     try:
         pending = json.loads(raw)
@@ -961,9 +1042,8 @@ def install_status():
         clear_install(failed=True)  # unreadable record — drop it
         return None
 
-    status = {"app": app, "started_at": int(pending.get("started_at") or 0)}
-    if log:
-        status["log"] = log
+    status = {"app": app, "kind": pending.get("kind") or "app",
+              "started_at": int(pending.get("started_at") or 0)}
     if completed_app(log) == app:
         # Marker logged, lock removal not observed yet (tiny race) — done.
         status["completed"] = True
@@ -975,10 +1055,117 @@ def install_status():
     except OSError:
         pass
     if time.time() - last > INSTALL_STALL_SECS:
-        clear_install(failed=True)
+        clear_install(failed=True, name=app, reason="no progress for %d minutes" % (INSTALL_STALL_SECS // 60))
         return None
     return status
 
+
+
+class InstallRefused(Exception):
+    """A request /install-util turns down: (HTTP status, message)."""
+
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def squid_install(req):
+    """/install-util squid: squid.sh install with the dashboard's settings.
+    Returns (args, env, files to remove if it never starts). The password
+    reaches the script in its environment only; it is never written to disk
+    except as the bcrypt hash in /etc/squid/passwd, and never logged."""
+    if not os.path.isfile(SQUID_SCRIPT):
+        raise InstallRefused(500, "squid.sh not found")
+    keep = req.get("keep_credentials") is True
+    current_setup = squid_current()
+    if keep and not current_setup:
+        raise InstallRefused(409, "Squid is not set up here — there are no credentials to keep")
+    user = str(req.get("user") or "").strip() if not keep else (current_setup.get("user") or "")
+    password = str(req.get("password") or "") if not keep else "kept"
+    use_whitelist = bool(req.get("whitelist"))
+    try:
+        port = int(req.get("port"))
+    except (TypeError, ValueError):
+        port = 0
+    if not SQUID_USER_RE.match(user):
+        raise InstallRefused(400, "the username may have letters, digits, '.', '_' and '-' only")
+    if not password or len(password) > 128 or any(c in password for c in "\r\n\0"):
+        raise InstallRefused(400, "a password of 1 to 128 characters, on one line, is required")
+    if not 1024 <= port <= 65535 or port == PORT:
+        raise InstallRefused(400, "pick a port from 1024 to 65535, other than the agent's %d" % PORT)
+    domains = []
+    if use_whitelist:
+        raw = req.get("domains")
+        if not isinstance(raw, list) or not raw or len(raw) > 5000:
+            raise InstallRefused(400, "the whitelist needs at least one domain")
+        domains = squid_whitelist_domains("\n".join(str(d) for d in raw))
+        bad = [d for d in domains if len(d) > 253 or not SQUID_DOMAIN_RE.match(d)]
+        if bad:
+            raise InstallRefused(400, "not a domain name: %s" % bad[0])
+    if nginx_in_use():
+        raise InstallRefused(409, "Nginx and Squid can't be installed on the same upplet")
+    holder = listening_ports().get(port)
+    if holder and holder != "squid":
+        raise InstallRefused(409, "port %d is in use by %s" % (port, holder))
+
+    env = {"PROXY_PORT": str(port), "SQUID_MANAGED": "1",
+           "SQUID_WHITELIST": "1" if use_whitelist else "0"}
+    if keep:
+        env["SQUID_KEEP_PASSWD"] = "1"
+    else:
+        env.update({"PROXY_USER": user, "PROXY_PASS": password})
+    files = []
+    if use_whitelist:
+        path = os.path.join(TMP_DIR, "squid_whitelist_%s.txt" % datetime.now().strftime("%d_%m_%y_%H_%M_%S"))
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write("\n".join(domains) + "\n")
+        env["WHITELIST_FILE"] = path       # install_util.sh removes it when done
+        files.append(path)
+    summary = "port %d, user %s%s, %s" % (port, user, " (credentials kept)" if keep else "",
+                                         "%d whitelisted domain(s)" % len(domains) if use_whitelist else "no whitelist")
+    return [], env, files, summary
+
+
+def nginx_install(req):
+    """/install-util nginx: Nginx in front of an installed app (nginx.sh
+    install <app> <app-port> …) — or, for an app behind it already, a change
+    of how it is served."""
+    app = str(req.get("app") or "")
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", app):
+        raise InstallRefused(400, "a valid app name is required")
+    try:
+        apps = json.loads(read_file(INSTALLED_APPS) or "[]")
+    except ValueError:
+        apps = []
+    if not any(isinstance(a, dict) and a.get("name") == app for a in apps):
+        raise InstallRefused(409, "%s is not installed on this upplet" % app)
+    if squid_current():
+        raise InstallRefused(409, "Nginx and Squid can't be installed on the same upplet")
+    updating = app_update_status()
+    if updating and not updating.get("finished") and updating.get("name") == app:
+        raise InstallRefused(409, "%s is being updated" % app)
+    port = req.get("port")
+    # 0: nginx.sh picks the port.
+    if not isinstance(port, int) or isinstance(port, bool) or not (port == 0 or 1024 <= port <= 65535):
+        raise InstallRefused(400, "port must be 0 or a number from 1024 to 65535")
+    args = [app, str(port)]
+    # The port Nginx serves the app on; left out, it stays where it is.
+    public = req.get("public_port")
+    if public is not None:
+        if not isinstance(public, int) or isinstance(public, bool) or not 1 <= public <= 65535 or public in (80, PORT):
+            raise InstallRefused(400, "public_port must be a number from 1 to 65535, not 80 or %d" % PORT)
+        args += ["--public", str(public)]
+    # Bot protection is set on every run: a flag left out turns it off.
+    if req.get("bots") is True:
+        args.append("--bots")
+        if req.get("fail2ban") is True:
+            args.append("--fail2ban")
+    return args, {}, [], "in front of %s" % app
+
+
+UTILITY_INSTALLS = {"squid": squid_install, "nginx": nginx_install}
 
 
 # ---- /info ---------------------------------------------------------------
@@ -1180,9 +1367,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._dispatch()
 
-    ROUTES = ("/update", "/command", "/install-app", "/progress",
+    ROUTES = ("/update", "/command", "/install-app", "/install-util", "/progress", "/setup-log",
               "/supported", "/apps", "/certs", "/certs-log", "/info", "/app",
-              "/app-log", "/firewall", "/firewall-log", "/squid", "/squid-log", "/utilities",
+              "/app-log", "/firewall", "/firewall-log", "/squid", "/utilities",
               "/ports", "/utility", "/utility-log", "/squid-password")
     # Only running arbitrary commands is locked to the allowed source IP; every
     # other operation needs just the token.
@@ -1209,7 +1396,9 @@ class Handler(BaseHTTPRequestHandler):
                 "/update": self._do_update,
                 "/command": self._do_command,
                 "/install-app": self._do_install_app,
+                "/install-util": self._do_install_util,
                 "/progress": self._do_progress,
+                "/setup-log": self._do_setup_log,
                 "/supported": self._do_supported,
                 "/apps": self._do_apps,
                 "/certs": self._do_certs,
@@ -1220,7 +1409,6 @@ class Handler(BaseHTTPRequestHandler):
                 "/firewall": self._do_firewall,
                 "/firewall-log": self._do_firewall_log,
                 "/squid": self._do_squid,
-                "/squid-log": self._do_squid_log,
                 "/utilities": self._do_utilities,
                 "/ports": self._do_ports,
                 "/utility": self._do_utility,
@@ -1418,10 +1606,6 @@ class Handler(BaseHTTPRequestHandler):
         if not os.path.isfile(INSTALL_SCRIPT):
             return self._send(500, {"error": "install_app.sh not found"})
 
-        current = install_status()
-        if current and not current.get("completed"):
-            return self._send(409, {"error": "%s installation is in progress" % current["app"]})
-
         name = app_name_from_request(req)
         if not name:
             return self._send(400, {"error": "cannot derive the app name"})
@@ -1430,32 +1614,106 @@ class Handler(BaseHTTPRequestHandler):
         req_path = os.path.join(TMP_DIR, "install_request_%s.json" % ts)
         with open(req_path, "w") as fh:
             json.dump(req, fh)
+        return self._start_install("app", name, ["bash", INSTALL_SCRIPT, req_path], files=[req_path])
 
-        # Take the lock the moment the request is accepted: archive the previous
-        # (completed) install's leftovers and record the new one.
-        clear_install()
+    def _do_install_util(self):
+        """POST {name: squid|nginx, …its settings}: install a utility — its
+        own script's `install`, run by install_util.sh exactly as an app's
+        install is run: the same lock, /progress and setup.log."""
+        if self.command != "POST":
+            return self._send(405, {"error": "POST only"})
+        try:
+            req = json.loads(self._body().decode("utf-8", "replace") or "{}")
+        except ValueError:
+            return self._send(400, {"error": "body must be JSON"})
+        if not isinstance(req, dict):
+            return self._send(400, {"error": "body must be a JSON object"})
+        return self._install_util(str(req.get("name") or ""), req)
+
+    def _install_util(self, name, req):
+        if name not in UTILITY_INSTALLS:
+            return self._send(400, {"error": "name must be one of " + ", ".join(UTILITY_NAMES)})
+        if not os.path.isfile(INSTALL_UTIL_SCRIPT):
+            return self._send(500, {"error": "install_util.sh not found"})
+        busy = install_busy()
+        if busy:
+            return self._send(409, {"error": busy})
+        try:
+            args, env, files, summary = UTILITY_INSTALLS[name](req)
+        except InstallRefused as refused:
+            return self._send(refused.status, {"error": refused.message})
+        return self._start_install("utility", name, ["bash", INSTALL_UTIL_SCRIPT, name] + args,
+                                   env=env, files=files, note=summary)
+
+
+    def _start_install(self, kind, name, argv, env=None, files=(), note=""):
+        """Take the install lock the moment a request is accepted, start its
+        setup.log, and launch the install detached — one pipeline for apps and
+        utilities alike, one install at a time."""
+        with INSTALL_ACCEPT_LOCK:
+            return self._start_install_locked(kind, name, argv, env, files, note)
+
+    def _start_install_locked(self, kind, name, argv, env, files, note):
+        busy = install_busy()
+        if busy:
+            for path in files:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            return self._send(409, {"error": busy})
+        clear_install()                   # a finished install's lock, if left
+        archive_setup_log()               # the last install's log: to <tmp>
+        setup_logline("%s installation started" % name)
+        if note:
+            setup_logline("Settings: " + note)
         with open(PENDING_INSTALL, "w") as fh:
-            json.dump({"app": name, "started_at": int(time.time())}, fh)
-
+            json.dump({"app": name, "kind": kind, "started_at": int(time.time())}, fh)
         try:
             subprocess.Popen(
-                ["bash", INSTALL_SCRIPT, req_path],
+                argv,
                 cwd=APP_DIR,
-                env=dict(os.environ, HOME="/root"),
+                env=dict(os.environ, HOME="/root", DEBIAN_FRONTEND="noninteractive", **(env or {})),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,  # survive the agent and this request
             )
         except Exception as exc:  # noqa: BLE001
-            clear_install(failed=True)  # release the lock — nothing is running
-            return self._send(500, {"error": "failed to launch installer",
-                                    "detail": str(exc)})
-        return self._send(200, {"status": "started", "app": name})
+            clear_install(failed=True, name=name, reason="the installer did not start (%s)" % exc)
+            for path in files:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            return self._send(500, {"error": "failed to launch the installer", "detail": str(exc)})
+        return self._send(200, {"status": "started", "app": name, "kind": kind})
 
     def _do_progress(self):
         """Return the current install status as JSON:
-        { "app", "started_at", "log"?, "completed"? } — {} when idle."""
+        { "app", "kind", "started_at", "completed"? } — {} when idle.
+        Its log is /setup-log's."""
         return self._send(200, install_status() or {})
+
+    def _do_setup_log(self):
+        """The current (or last) install's log, only the lines the caller
+        lacks: ?from=<lines it has>&id=<the id it had them for>. Answers
+        {id, from, next, lines, installing}: `lines` start at `from` (0 when
+        `id` names another install's log — start over), `next` is the count to
+        ask from next time; `installing` is {app, kind} while one runs."""
+        query = parse_qs(urlparse(self.path).query)
+        lines = setup_log_lines()
+        log_id = setup_log_id()
+        try:
+            start = max(0, int((query.get("from") or ["0"])[0]))
+        except ValueError:
+            start = 0
+        if (query.get("id") or [""])[0] != log_id or start > len(lines):
+            start = 0
+        current = install_status()
+        running = {"app": current["app"], "kind": current.get("kind")} \
+            if current and not current.get("completed") else None
+        return self._send(200, {"id": log_id, "from": start, "next": len(lines),
+                                "lines": lines[start:], "installing": running})
 
     def _do_supported(self):
         """Return the supported dependencies registry."""
@@ -1496,30 +1754,12 @@ class Handler(BaseHTTPRequestHandler):
         updating = app_update_status()
         if updating and not updating.get("finished"):
             if op in APP_JOBS or updating.get("name") == name:
-                return self._send(409, {"error": "%s is being %s" % (
-                    updating.get("name"), "set up behind Nginx" if updating.get("op") == "nginx" else "updated")})
+                return self._send(409, {"error": "%s is being updated" % updating.get("name")})
         if op == "update":
             return self._start_app_job(name, "update")
         if op == "nginx":
-            if squid_current():
-                return self._send(409, {"error": "Nginx and Squid can't be installed on the same upplet"})
-            port = req.get("port")
-            # 0: nginx.sh picks the port.
-            if not isinstance(port, int) or isinstance(port, bool) or not (port == 0 or 1024 <= port <= 65535):
-                return self._send(400, {"error": "port must be 0 or a number from 1024 to 65535"})
-            # Bot protection is set on every run: a flag left out turns it off.
-            flags = ["--port", str(port)]
-            # The port Nginx serves the app on; left out, it stays where it is.
-            public = req.get("public_port")
-            if public is not None:
-                if not isinstance(public, int) or isinstance(public, bool) or not 1 <= public <= 65535 or public in (80, PORT):
-                    return self._send(400, {"error": "public_port must be a number from 1 to 65535, not 80 or %d" % PORT})
-                flags += ["--public", str(public)]
-            if req.get("bots") is True:
-                flags.append("--bots")
-                if req.get("fail2ban") is True:
-                    flags.append("--fail2ban")
-            return self._start_app_job(name, "nginx", flags)
+            # An install of Nginx in front of the app: /install-util's.
+            return self._install_util("nginx", dict(req, app=name))
         cmd = ["bash", APP_OPS_SCRIPT, op, name]
         if op == "uninstall" and req.get("drop_db") is True:
             cmd.append("--drop-db")
@@ -1669,10 +1909,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _do_squid(self):
         """GET: the default whitelist and the proxy already set up, if any.
-        POST: run squid.sh setup with the dashboard's settings — started here,
-        followed through /squid-log. The password reaches the script in its
-        environment only; it is never written to disk except as the bcrypt
-        hash in /etc/squid/passwd, and never logged."""
+        POST: the same as /install-util squid (see squid_install)."""
         if not os.path.isfile(SQUID_SCRIPT):
             return self._send(500, {"error": "squid.sh not found"})
         if self.command == "GET":
@@ -1690,85 +1927,12 @@ class Handler(BaseHTTPRequestHandler):
                 "nginx": nginx_in_use() or None,     # set: Setup Squid is refused here
             })
 
+        # POST: an install of Squid, like /install-util squid.
         try:
             req = json.loads(self._body().decode("utf-8", "replace") or "{}")
         except ValueError:
             return self._send(400, {"error": "body must be JSON"})
-        keep = req.get("keep_credentials") is True
-        current_setup = squid_current()
-        if keep and not current_setup:
-            return self._send(409, {"error": "Squid is not set up here — there are no credentials to keep"})
-        user = str(req.get("user") or "").strip() if not keep else (current_setup.get("user") or "")
-        password = str(req.get("password") or "") if not keep else "kept"
-        use_whitelist = bool(req.get("whitelist"))
-        try:
-            port = int(req.get("port"))
-        except (TypeError, ValueError):
-            port = 0
-        if not SQUID_USER_RE.match(user):
-            return self._send(400, {"error": "the username may have letters, digits, '.', '_' and '-' only"})
-        if not password or len(password) > 128 or any(c in password for c in "\r\n\0"):
-            return self._send(400, {"error": "a password of 1 to 128 characters, on one line, is required"})
-        if not 1024 <= port <= 65535 or port == PORT:
-            return self._send(400, {"error": "pick a port from 1024 to 65535, other than the agent's %d" % PORT})
-        domains = []
-        if use_whitelist:
-            raw = req.get("domains")
-            if not isinstance(raw, list) or not raw or len(raw) > 5000:
-                return self._send(400, {"error": "the whitelist needs at least one domain"})
-            domains = squid_whitelist_domains("\n".join(str(d) for d in raw))
-            bad = [d for d in domains if len(d) > 253 or not SQUID_DOMAIN_RE.match(d)]
-            if bad:
-                return self._send(400, {"error": "not a domain name: %s" % bad[0]})
-        nginx = nginx_in_use()
-        if nginx:
-            return self._send(409, {"error": "Nginx and Squid can't be installed on the same upplet"})
-        holder = listening_ports().get(port)
-        if holder and holder != "squid":
-            return self._send(409, {"error": "port %d is in use by %s" % (port, holder)})
-        current = squid_status()
-        if current and not current.get("finished"):
-            return self._send(409, {"error": "Squid is being set up already"})
-
-        os.makedirs(DATA_DIR, exist_ok=True)
-        extra = {"PROXY_PORT": str(port), "SQUID_MANAGED": "1",
-                 "SQUID_WHITELIST": "1" if use_whitelist else "0"}
-        if keep:
-            extra["SQUID_KEEP_PASSWD"] = "1"
-        else:
-            extra.update({"PROXY_USER": user, "PROXY_PASS": password})
-        request = ""
-        if use_whitelist:
-            request = os.path.join(TMP_DIR, "squid_whitelist_%s.txt" % datetime.now().strftime("%d_%m_%y_%H_%M_%S"))
-            fd = os.open(request, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w") as fh:
-                fh.write("\n".join(domains) + "\n")
-            extra["WHITELIST_FILE"] = request
-        with open(SQUID_LOG, "w") as fh:
-            fh.write("[p5agent] setting up Squid on port %d for user %s%s%s\n"
-                     % (port, user, " (credentials kept)" if keep else "",
-                        " with %d whitelisted domain(s)" % len(domains) if use_whitelist else ", no whitelist"))
-        with open(SQUID_STATUS, "w") as fh:
-            json.dump({"started_at": int(time.time()), "port": port, "user": user}, fh)
-        runner = ('exec >>"$1" 2>&1 </dev/null; bash "$2" setup; rc=$?; '
-                  '[ -n "$3" ] && rm -f "$3"; printf "\\n%s%s\\n" "$4" "$rc"')
-        try:
-            subprocess.Popen(
-                ["bash", "-c", runner, "p5agent-squid", SQUID_LOG, SQUID_SCRIPT, request, SQUID_DONE],
-                cwd=APP_DIR,
-                env=dict(os.environ, HOME="/root", DEBIAN_FRONTEND="noninteractive", **extra),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,   # survive the agent and this request
-            )
-        except Exception as exc:  # noqa: BLE001
-            if request:
-                try:
-                    os.remove(request)
-                except OSError:
-                    pass
-            return self._send(500, {"error": "failed to start the Squid setup", "detail": str(exc)})
-        return self._send(200, {"status": "started"})
+        return self._install_util("squid", req if isinstance(req, dict) else {})
 
     def _do_ports(self):
         """GET: every TCP port something listens on, with the process."""
@@ -1804,7 +1968,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return self._send(400, {"error": "body must be JSON"})
         name, op = str(req.get("name") or ""), str(req.get("op") or "")
-        if name not in ("squid", "nginx") or op not in UTILITY_OPS:
+        if name not in UTILITY_NAMES or op not in UTILITY_OPS:
             return self._send(400, {"error": "name must be squid or nginx, op one of %s" % ", ".join(UTILITY_OPS)})
         if name == "squid" and not squid_current():
             return self._send(409, {"error": "Squid is not set up on this upplet"})
@@ -1816,9 +1980,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(409, {"error": "%s is being %s already" % (
                 {"squid": "Squid", "nginx": "Nginx"}.get(busy.get("name"), busy.get("name")),
                 done.get(busy.get("op"), busy.get("op")))})
-        squid_job = squid_status()
-        if name == "squid" and squid_job and not squid_job.get("finished"):
-            return self._send(409, {"error": "Squid is being set up"})
+        if installing(name):
+            return self._send(409, {"error": "%s is being installed" % {"squid": "Squid", "nginx": "Nginx"}[name]})
         os.makedirs(DATA_DIR, exist_ok=True)
         with open(UTILITY_LOG, "w") as fh:
             fh.write("[p5agent] %s %s\n" % (name, op))
@@ -1861,8 +2024,7 @@ class Handler(BaseHTTPRequestHandler):
         current = squid_current()
         if not current or not current.get("user"):
             return self._send(409, {"error": "Squid is not set up on this upplet"})
-        busy = squid_status()
-        if busy and not busy.get("finished"):
+        if installing("squid"):
             return self._send(409, {"error": "Squid is being set up"})
         # On stdin, not the command line: no other process sees it.
         proc = subprocess.run(["bash", SQUID_SCRIPT, "password", current["user"]], cwd=APP_DIR,
@@ -1872,10 +2034,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(500, {"error": "the password was not changed",
                                     "detail": re.sub(r"\x1b\[[0-9;]*m", "", out).strip()})
         return self._send(200, {"user": current["user"]})
-
-    def _do_squid_log(self):
-        """The current (or last) Squid setup: {log, finished, returncode}."""
-        return self._send(200, squid_status())
 
     def _do_certs_log(self):
         """The current (or last) certificate run: its domain, its output so far,
