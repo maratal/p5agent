@@ -30,6 +30,12 @@ root systemd service on port 5005 and exposes:
                       One install runs at a time: the request is recorded in
                       pending_install.json the moment it is accepted, and a
                       second request (either kind) is refused with 409 while one is running
+    GET  /static-site the static site Nginx serves with no app behind it:
+                      {root, port, exists, files, bytes, updated, placeholder}
+    POST /static-site replace that site's files with the gzipped tar in the
+                      body (<=64 MB, the dashboard's folder attach): only plain
+                      files and directories, no path leaving the site, swapped
+                      in once it has unpacked -> {files, bytes, …}
     POST /install-util {"name": squid|nginx, …its settings} — install a utility:
                       install_util.sh runs utilities/<name>/<name>.sh install in
                       the background, exactly as an app install is run (the
@@ -66,7 +72,8 @@ root systemd service on port 5005 and exposes:
                       the proxy's credentials
     GET  /utilities   what is set up on the upplet besides apps: {squid: {port,
                       user, whitelist} | null, nginx: [apps behind Nginx]}
-    GET  /utilities   (also) each one's version and service state: squid
+    GET  /utilities   (also) the static site as "site" (/static-site's report) when
+                      Nginx serves one, and each one's version and service state: squid
                       {…, version, service}, nginxInfo {version, service} |
                       null when Nginx is not installed
     POST /utility     {"name": squid|nginx, "op": start|stop|update|uninstall}
@@ -258,6 +265,13 @@ SETUP_TS_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] ")
 FAILED_SUFFIX = " installation failed"
 INSTALL_UTIL_SCRIPT = os.path.join(APP_DIR, "install_util.sh")
 UTILITY_NAMES = ("squid", "nginx")
+# The static site: what Nginx serves with no app behind it (nginx.sh static).
+# Its files arrive through /static-site as a gzipped tar and live here.
+SITE_ROOT = os.environ.get("P5AGENT_SITE_ROOT", "/var/www/html")
+STATIC_SITE_CONF = "/etc/nginx/sites-available/p5-static.conf"
+SITE_MAX_BYTES = 64 * 1024 * 1024      # the upload itself, compressed
+SITE_MAX_UNPACKED = 256 * 1024 * 1024  # what it may unpack to
+SITE_MAX_FILES = 5000
 INSTALLED_APPS = os.path.join(DATA_DIR, "installed_apps.json")
 APPS_DIR = os.environ.get("P5AGENT_APPS_DIR", "/opt")      # where install_app.sh puts apps
 APP_OPS_SCRIPT = os.path.join(APP_DIR, "app_ops.sh")
@@ -277,6 +291,95 @@ APP_UPDATE_DONE = "[p5agent] update finished rc="
 # marker; a failed install is cleared by its fail() or here (stall rule).
 PENDING_INSTALL = os.path.join(DATA_DIR, "pending_install.json")
 INSTALL_STALL_SECS = 1800  # no log activity for 30 min → the install failed
+
+
+def static_site_port():
+    """The port nginx.sh serves the static site on, or None when there is no
+    static site on this upplet."""
+    try:
+        with open(STATIC_SITE_CONF) as fh:
+            m = re.search(r"^\s*listen\s+(\d+)\s+ssl", fh.read(), re.M)
+    except OSError:
+        return None
+    return int(m.group(1)) if m else None
+
+
+def site_status():
+    """What the static site holds: its file count, total size and newest
+    change. `placeholder` is nginx.sh's own "nothing here yet" page, which is
+    not content the user put there."""
+    files = total = newest = 0
+    for base, dirs, names in os.walk(SITE_ROOT):
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(base, d))]
+        for name in names:
+            path = os.path.join(base, name)
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            files += 1
+            total += st.st_size
+            newest = max(newest, int(st.st_mtime))
+    placeholder = False
+    if files == 1:
+        try:
+            with open(os.path.join(SITE_ROOT, "index.html")) as fh:
+                placeholder = "Nothing here yet" in fh.read(2048)
+        except OSError:
+            # nginx.sh removes the package's own welcome page, but an upplet
+            # whose Nginx was installed by hand may still have it.
+            placeholder = os.path.isfile(os.path.join(SITE_ROOT, "index.nginx-debian.html"))
+    return {"root": SITE_ROOT, "port": static_site_port(), "exists": os.path.isdir(SITE_ROOT),
+            "files": files, "bytes": total, "updated": newest or None, "placeholder": placeholder}
+
+
+def unpack_site(archive, dest):
+    """Unpack a gzipped tar of the site's files into `dest` (which must not
+    exist yet). Only plain files and directories are taken, and only at paths
+    that stay inside: an absolute path, a `..` segment, a symlink, a hard link
+    or a device in the archive is refused outright rather than skipped, since
+    any of them means the archive is not what it claims to be. Returns
+    (files, bytes)."""
+    import tarfile
+    files = total = 0
+    os.makedirs(dest, 0o755)
+    with tarfile.open(archive, "r:gz") as tar:
+        for member in tar:
+            if member.name.startswith("/") or os.path.isabs(member.name):
+                raise ValueError("absolute path in the archive: %s" % member.name)
+            # Split rather than strip: ".." has to survive to be caught, which
+            # a character-set strip of "./" would quietly eat.
+            parts = [part for part in member.name.replace("\\", "/").split("/") if part not in ("", ".")]
+            if any(part == ".." for part in parts):
+                raise ValueError("path outside the site: %s" % member.name)
+            name = "/".join(parts)
+            if not name:
+                continue
+            if member.issym() or member.islnk():
+                raise ValueError("link in the archive: %s" % member.name)
+            if not (member.isfile() or member.isdir()):
+                raise ValueError("not a file or directory: %s" % member.name)
+            target = os.path.join(dest, name)
+            # Belt and braces: the resolved path must still be under dest.
+            if os.path.relpath(target, dest).startswith(".."):
+                raise ValueError("path outside the site: %s" % member.name)
+            if member.isdir():
+                os.makedirs(target, 0o755, exist_ok=True)
+                continue
+            files += 1
+            total += member.size
+            if files > SITE_MAX_FILES:
+                raise ValueError("more than %d files" % SITE_MAX_FILES)
+            if total > SITE_MAX_UNPACKED:
+                raise ValueError("more than %d MB unpacked" % (SITE_MAX_UNPACKED // (1024 * 1024)))
+            os.makedirs(os.path.dirname(target) or dest, 0o755, exist_ok=True)
+            src = tar.extractfile(member)
+            if src is None:
+                continue
+            with open(target, "wb") as out:
+                shutil.copyfileobj(src, out, 64 * 1024)
+            os.chmod(target, 0o644)
+    return files, total
 
 
 def run(cmd, cwd=None, extra_env=None):
@@ -1131,7 +1234,18 @@ def squid_install(req):
 def nginx_install(req):
     """/install-util nginx: Nginx in front of an installed app (nginx.sh
     install <app> <app-port> …) — or, for an app behind it already, a change
-    of how it is served."""
+    of how it is served. With {"static": true} there is no app at all: Nginx
+    serves /var/www/html (nginx.sh install static <port>)."""
+    if squid_current():
+        raise InstallRefused(409, "Nginx and Squid can't be installed on the same upplet")
+    # No app in front of it: Nginx serves /var/www/html itself.
+    if req.get("static") is True:
+        port = req.get("port")
+        if port is None:
+            port = 443
+        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535 or port in (80, PORT):
+            raise InstallRefused(400, "port must be a number from 1 to 65535, not 80 or %d" % PORT)
+        return ["static", str(port)], {}, [], "static site on port %d" % port
     app = str(req.get("app") or "")
     if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", app):
         raise InstallRefused(400, "a valid app name is required")
@@ -1141,8 +1255,6 @@ def nginx_install(req):
         apps = []
     if not any(isinstance(a, dict) and a.get("name") == app for a in apps):
         raise InstallRefused(409, "%s is not installed on this upplet" % app)
-    if squid_current():
-        raise InstallRefused(409, "Nginx and Squid can't be installed on the same upplet")
     updating = app_update_status()
     if updating and not updating.get("finished") and updating.get("name") == app:
         raise InstallRefused(409, "%s is being updated" % app)
@@ -1370,7 +1482,7 @@ class Handler(BaseHTTPRequestHandler):
     ROUTES = ("/update", "/command", "/install-app", "/install-util", "/progress", "/setup-log",
               "/supported", "/apps", "/certs", "/certs-log", "/info", "/app",
               "/app-log", "/firewall", "/firewall-log", "/squid", "/utilities",
-              "/ports", "/utility", "/utility-log", "/squid-password")
+              "/ports", "/utility", "/utility-log", "/squid-password", "/static-site")
     # Only running arbitrary commands is locked to the allowed source IP; every
     # other operation needs just the token.
     IP_RESTRICTED = ("/command",)
@@ -1397,6 +1509,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/command": self._do_command,
                 "/install-app": self._do_install_app,
                 "/install-util": self._do_install_util,
+                "/static-site": self._do_static_site,
                 "/progress": self._do_progress,
                 "/setup-log": self._do_setup_log,
                 "/supported": self._do_supported,
@@ -1615,6 +1728,79 @@ class Handler(BaseHTTPRequestHandler):
         with open(req_path, "w") as fh:
             json.dump(req, fh)
         return self._start_install("app", name, ["bash", INSTALL_SCRIPT, req_path], files=[req_path])
+
+    def _do_static_site(self):
+        """GET: what the static site holds. POST: replace it with the gzipped
+        tar in the body — the dashboard's folder attach, packed in the browser.
+
+        The body is streamed to a file rather than read into memory: a site is
+        far bigger than any other request this agent takes."""
+        if self.command == "GET":
+            return self._send(200, site_status())
+        if self.command != "POST":
+            return self._send(405, {"error": "GET or POST only"})
+        if static_site_port() is None:
+            return self._send(409, {"error": "this upplet has no static site — install Nginx without an app first"})
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            length = 0
+        if length <= 0:
+            return self._send(400, {"error": "the archive is the request body (Content-Length required)"})
+        if length > SITE_MAX_BYTES:
+            return self._send(413, {"error": "the archive is larger than %d MB" % (SITE_MAX_BYTES // (1024 * 1024))})
+
+        os.makedirs(TMP_DIR, exist_ok=True)
+        archive = os.path.join(TMP_DIR, "site_%s.tar.gz" % datetime.now().strftime("%d_%m_%y_%H_%M_%S"))
+        staged = SITE_ROOT + ".new"
+        previous = SITE_ROOT + ".old"
+        try:
+            read = 0
+            with open(archive, "wb") as out:
+                while read < length:
+                    chunk = self.rfile.read(min(256 * 1024, length - read))
+                    if not chunk:
+                        break
+                    read += len(chunk)
+                    out.write(chunk)
+            # The body is in hand: _send_raw must not try to read it again.
+            self._body_data = b""
+            if read != length:
+                return self._send(400, {"error": "the upload ended early (%d of %d bytes)" % (read, length)})
+
+            shutil.rmtree(staged, ignore_errors=True)
+            try:
+                files, total = unpack_site(archive, staged)
+            except ValueError as refused:
+                shutil.rmtree(staged, ignore_errors=True)
+                return self._send(400, {"error": "the archive was refused: %s" % refused})
+            except Exception as exc:  # noqa: BLE001 — a corrupt or truncated gzip
+                shutil.rmtree(staged, ignore_errors=True)
+                return self._send(400, {"error": "the archive could not be read", "detail": str(exc)})
+            if files == 0:
+                shutil.rmtree(staged, ignore_errors=True)
+                return self._send(400, {"error": "the archive holds no files"})
+
+            # Swap it in: the site is never half-written, and the old files are
+            # only dropped once the new ones are in place.
+            os.makedirs(os.path.dirname(SITE_ROOT) or "/", exist_ok=True)
+            shutil.rmtree(previous, ignore_errors=True)
+            if os.path.isdir(SITE_ROOT):
+                os.rename(SITE_ROOT, previous)
+            try:
+                os.rename(staged, SITE_ROOT)
+            except OSError:
+                if os.path.isdir(previous):     # put the old site back
+                    os.rename(previous, SITE_ROOT)
+                raise
+            shutil.rmtree(previous, ignore_errors=True)
+            os.chmod(SITE_ROOT, 0o755)
+        finally:
+            try:
+                os.remove(archive)
+            except OSError:
+                pass
+        return self._send(200, dict(site_status(), files=files, bytes=total))
 
     def _do_install_util(self):
         """POST {name: squid|nginx, …its settings}: install a utility — its
@@ -1942,7 +2128,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _do_utilities(self):
         """What is set up here besides apps — for the dashboard's upplet menu:
-        Squid (as squid.sh setup left it) and the apps behind Nginx."""
+        Squid (as squid.sh setup left it), the apps behind Nginx, and the
+        static site when Nginx serves one with no app behind it."""
         try:
             apps = json.loads(read_file(INSTALLED_APPS) or "[]")
         except ValueError:
@@ -1954,9 +2141,11 @@ class Handler(BaseHTTPRequestHandler):
         nginx_info = None
         if shutil.which("nginx"):
             nginx_info = {"version": utility_version("nginx"), "service": service_state("nginx")}
+        site = site_status() if static_site_port() is not None else None
         job = utility_status()
         running = {"name": job.get("name"), "op": job.get("op")} if job and not job.get("finished") else None
-        return self._send(200, {"squid": squid, "nginx": wired, "nginxInfo": nginx_info, "job": running})
+        return self._send(200, {"squid": squid, "nginx": wired, "nginxInfo": nginx_info,
+                                "site": site, "job": running})
 
     def _do_utility(self):
         """POST {name, op}: a utility's card action, as a job: squid.sh or

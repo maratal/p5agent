@@ -19,7 +19,8 @@
 #                               still a built-in port (an app uses it)
 #
 # Built-in ports: SSH (22), the agent (5005), 80 (ACME http-01, Nginx's
-# redirect) and each installed app's port — its public-port when it is behind
+# redirect), the static site's port when Nginx serves /var/www/html with no app
+# behind it, and each installed app's port — its public-port when it is behind
 # Nginx. On a Squid upplet (squid.sh), which never has Nginx, the proxy
 # port is built-in instead of 80: Setup Squid closes 80 and nothing here opens
 # it again. They can be restricted to addresses but not removed. Any list of
@@ -108,8 +109,22 @@ def squid_port():
     m = re.search(r"^http_port\s+(\d+)", conf, re.M)
     return int(m.group(1)) if m else None
 
+def static_site_port():
+    """The port Nginx serves the static site on (/var/www/html), when
+    nginx.sh wrote that site, else None. With no app installed it is the only
+    thing holding 443 open."""
+    try:
+        conf = open("/etc/nginx/sites-available/p5-static.conf").read()
+    except OSError:
+        return None
+    m = re.search(r"^\s*listen\s+(\d+)\s+ssl", conf, re.M)
+    return int(m.group(1)) if m else None
+
 def builtin():
     rows = {(22, "tcp"): "SSH", (agent_port, "tcp"): "p5agent"}
+    site = static_site_port()
+    if site:
+        rows[(site, "tcp")] = "static site (nginx)"
     proxy = squid_port()
     if proxy:
         rows[(proxy, "tcp")] = "Squid proxy"

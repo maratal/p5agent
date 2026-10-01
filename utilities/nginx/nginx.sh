@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# nginx.sh — puts Nginx in front of installed apps (utilities/nginx/ in p5agent).
+# nginx.sh — puts Nginx in front of installed apps, or serves a static site with
+# no app behind it at all (utilities/nginx/ in p5agent).
 #
 #   nginx.sh install|wire <name> <app-port> [--public <port>] [--bots] [--fail2ban]
 #                                     move the app to <app-port> (plain HTTP,
@@ -13,6 +14,13 @@
 #                                     --bots / --fail2ban: see "Bot protection"
 #                                     below; leaving a flag out on a re-run
 #                                     turns that protection off again
+#   nginx.sh static [port]            no app in front: Nginx serves the files in
+#                                     /var/www/html over HTTPS on [port] (443 by
+#                                     default), plus port 80. A directory is
+#                                     served through its index.html, index.htm
+#                                     or main.html, in that order. An empty one
+#                                     gets a placeholder page; the dashboard's
+#                                     attach (the agent's /static-site) fills it
 #   nginx.sh certs <cert> <key>       point every Nginx-served app at this
 #                                     certificate and reload (run by certs.sh)
 #   nginx.sh unwire <name>            drop the app's Nginx site (run by uninstall)
@@ -30,6 +38,7 @@
 #   :80    /.well-known/acme-challenge/ from $WEBROOT (certbot --webroot), and a
 #          redirect to https for everything else
 #   :<p>   TLS with the app's certificate, proxied to http://127.0.0.1:<app-port>
+#   :<p>   TLS serving $SITE_ROOT from disk, for the static site
 #
 # The app's installed_apps.json entry keeps its new private port as "port" and
 # gains "public-port" — the port Nginx serves it on, which is what the dashboard
@@ -62,9 +71,12 @@ AGENT_PORT="${P5AGENT_PORT:-5005}"
 [[ -f /etc/p5agent.env ]] && AGENT_PORT="$(sed -n 's/^P5AGENT_PORT=//p' /etc/p5agent.env | head -n1)" && AGENT_PORT="${AGENT_PORT:-5005}"
 
 WEBROOT="/var/www/p5-acme"
+SITE_ROOT="/var/www/html"                          # the static site's files
 SITES="/etc/nginx/sites-available"
 ENABLED="/etc/nginx/sites-enabled"
 ACME_SITE="p5-acme.conf"
+STATIC_SITE="p5-static.conf"
+STATIC_PORT=443                                    # where the static site is served
 CERT_DIR="/etc/nginx/p5"
 BOTS_HTTP="/etc/nginx/conf.d/p5-bots.conf"         # http{} level: zones and maps
 BOTS_SNIPPET="/etc/nginx/snippets/p5-bots.conf"    # included by an app's server{}
@@ -100,6 +112,18 @@ fail() { printf '\033[1;31m✗ %s\033[0m\n' "$*"; exit 1; }
 [[ "$(id -u)" -eq 0 ]] || fail "nginx.sh must be run as root"
 
 site_of() { printf 'p5-app-%s.conf' "$1"; }
+
+# Every p5 site that serves TLS: the apps' and the static one.
+tls_sites() {
+    local f
+    for f in "$SITES"/p5-app-*.conf "$SITES/$STATIC_SITE"; do [[ -f "$f" ]] && printf '%s\n' "$f"; done
+}
+
+# The port the static site is served on, empty when there is no static site.
+static_port() {
+    [[ -f "$SITES/$STATIC_SITE" ]] || return 0
+    sed -n 's/^\s*listen \([0-9]\+\) ssl.*/\1/p' "$SITES/$STATIC_SITE" | head -1
+}
 
 # The IPv6 twin of a listen line — only where the kernel has IPv6, since Nginx
 # refuses to start on a [::] socket it cannot open.
@@ -194,7 +218,7 @@ sync_fail2ban() {  # sync_fail2ban [<name> <1|0|drop>]
     fi
     if ! command -v fail2ban-client >/dev/null 2>&1; then
         log "Installing fail2ban"
-        DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 -qq install -y fail2ban >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 -qq install -y fail2ban || true
         command -v fail2ban-client >/dev/null 2>&1 || { warn "fail2ban did not install — no bans"; return 0; }
     fi
     cat > "$JAIL_FILTER" <<'CONF'
@@ -251,7 +275,7 @@ reload_nginx() {
 # something is served on 443 (otherwise there is nowhere sensible to send it).
 write_acme_site() {
     local redirect='return 404;'
-    if grep -qsE '^\s*listen 443 ssl' "$SITES"/p5-app-*.conf; then
+    if tls_sites | xargs -r grep -qsE '^\s*listen 443 ssl'; then
         redirect='return 301 https://$host$request_uri;'
     fi
     mkdir -p "$WEBROOT"
@@ -314,10 +338,15 @@ install_nginx() {
     else
         log "Installing Nginx"
         export DEBIAN_FRONTEND=noninteractive
-        apt-get -o DPkg::Lock::Timeout=120 -qq update >/dev/null 2>&1
-        # Installing starts it on port 80 with the stock site; that is replaced below.
-        apt-get -o DPkg::Lock::Timeout=120 -qq install -y nginx >/dev/null 2>&1 || true
-        command -v nginx >/dev/null 2>&1 || fail "Nginx did not install"
+        # apt's own messages stay in the output (quiet: errors and warnings
+        # only) — when it fails, they are the reason, and the install's log
+        # is where anyone will look for it.
+        apt-get -o DPkg::Lock::Timeout=120 -qq update || warn "The package lists could not be refreshed"
+        # Installing starts it on port 80 with the stock site; that is replaced
+        # below. A start that fails there (80 taken) fails the package's own
+        # setup, but the binary is in place — which is what counts here.
+        apt-get -o DPkg::Lock::Timeout=120 -qq install -y nginx || warn "apt reported a problem installing nginx (above)"
+        command -v nginx >/dev/null 2>&1 || fail "Nginx did not install — apt's messages above say why"
         ok "Nginx installed"
     fi
     rm -f "$ENABLED/default"
@@ -377,9 +406,11 @@ do_wire() {
     local clash
     clash=$(apps_table | awk -F'\t' -v n="$name" -v p="$new_port" '$1 != n && ($2 == p || $3 == p) {print $1}' | head -1)
     [[ -z "$clash" ]] || fail "Port $new_port is already used by $clash"
+    [[ "$new_port" != "$(static_port)" ]] || fail "Port $new_port serves the static site"
     if [[ "$public" != "$old_public" ]]; then
         clash=$(apps_table | awk -F'\t' -v n="$name" -v p="$public" '$1 != n && ($2 == p || $3 == p) {print $1}' | head -1)
         [[ -z "$clash" ]] || fail "Port $public is already used by $clash"
+        [[ "$public" != "$(static_port)" ]] || fail "Port $public serves the static site"
         # Free, unless it is this app's own port — which it is leaving.
         if [[ "$public" != "$cur_port" ]] && ss -ltnH "sport = :$public" 2>/dev/null | grep -q .; then
             fail "Something is already listening on port $public"
@@ -573,19 +604,148 @@ restore() {
     rm -rf "$bak"
 }
 
+# ── static ───────────────────────────────────────────────────────────────────
+# Nginx with no app in front of it: it serves $SITE_ROOT itself. The upload
+# that fills that directory is the agent's (/static-site); this only builds the site.
+write_placeholder() {
+    cat > "$SITE_ROOT/index.html" <<'HTML'
+<!doctype html>
+<meta charset="utf-8">
+<title>Nothing here yet</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html { color-scheme: dark light; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center;
+         font: 16px/1.6 system-ui, sans-serif; }
+  div { max-width: 32rem; padding: 2rem; text-align: center; }
+  code { font-size: 0.95em; }
+  p { opacity: 0.7; }
+</style>
+<div>
+  <h1>Nothing here yet</h1>
+  <p>Nginx serves this upplet's files from <code>/var/www/html</code>.
+     Attach a folder in the dashboard, or copy files here, to replace this page.</p>
+</div>
+HTML
+    chmod 644 "$SITE_ROOT/index.html"
+}
+
+
+do_static() {
+    local port="${1:-$STATIC_PORT}"
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || fail "Not a port: $port"
+    (( port != AGENT_PORT )) || fail "Port $port is the agent's"
+    (( port != 80 )) || fail "Port 80 answers certificate challenges and redirects to https"
+
+    # An app served on that port would lose it: Nginx takes the first site that
+    # claims a port as its default_server, and two default_servers do not load.
+    local clash
+    clash=$(apps_table | awk -F'\t' -v p="$port" '($3 != "" ? $3 : $2) == p {print $1}')
+    [[ -z "$clash" ]] || fail "Port $port serves $clash — give the static site another port"
+
+    log "Nginx will serve $SITE_ROOT on $port (HTTPS), with 80 for certificates and the redirect"
+    install_nginx
+
+    mkdir -p "$SITE_ROOT"
+    # The nginx package drops its own welcome page here. It is not this site's
+    # content, and serving it would say Nginx works rather than that the site
+    # is empty.
+    rm -f "$SITE_ROOT/index.nginx-debian.html"
+    if [[ -z "$(find "$SITE_ROOT" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+        write_placeholder
+        ok "Wrote a placeholder page — the site has no files yet"
+    else
+        ok "Serving the files already in $SITE_ROOT"
+    fi
+
+    # The certificate: the one this site has, else any another p5 site serves
+    # (Update Certificates hands the real one to every site), else self-signed.
+    local cert="" key="" f
+    if [[ -f "$SITES/$STATIC_SITE" ]]; then
+        cert=$(sed -n 's/^\s*ssl_certificate \(.*\);/\1/p' "$SITES/$STATIC_SITE" | head -1)
+        key=$(sed -n 's/^\s*ssl_certificate_key \(.*\);/\1/p' "$SITES/$STATIC_SITE" | head -1)
+    fi
+    if [[ -z "$cert" || ! -f "$cert" ]]; then
+        f=$(tls_sites | head -1)
+        if [[ -n "$f" ]]; then
+            cert=$(sed -n 's/^\s*ssl_certificate \(.*\);/\1/p' "$f" | head -1)
+            key=$(sed -n 's/^\s*ssl_certificate_key \(.*\);/\1/p' "$f" | head -1)
+        fi
+    fi
+    if [[ -z "$cert" || -z "$key" || ! -f "$cert" || ! -f "$key" ]]; then
+        log "No certificate on record — making a self-signed one"
+        out=$(bash "$ROOT/certs.sh" self-signed --cert "$CERT_DIR/site.crt" --key "$CERT_DIR/site.key" 2>&1) \
+            || { printf '%s\n' "$out"; fail "Could not make a certificate"; }
+        cert="$CERT_DIR/site.crt"; key="$CERT_DIR/site.key"
+    fi
+    ok "Certificate: $cert"
+
+    local bak=""
+    [[ -f "$SITES/$STATIC_SITE" ]] && { bak=$(mktemp /tmp/p5-static-XXXXXX); cp -a "$SITES/$STATIC_SITE" "$bak"; }
+
+    log "Writing $SITES/$STATIC_SITE"
+    cat > "$SITES/$STATIC_SITE" <<CONF
+# Written by p5agent's nginx.sh — edits here are lost the next time it runs.
+server {
+    listen $port ssl default_server;
+$(listen6 "$port ssl default_server")
+    server_name _;
+    ssl_certificate $cert;
+    ssl_certificate_key $key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    root $SITE_ROOT;
+    # In order: a site whose entry page is main.html is served as it is.
+    index index.html index.htm main.html;
+    autoindex off;
+    # A directory without an index, or a path that is not there, is a 404 —
+    # never a listing of the files.
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+CONF
+    ln -sf "$SITES/$STATIC_SITE" "$ENABLED/$STATIC_SITE"
+    write_acme_site
+    if ! nginx -t >/dev/null 2>&1; then
+        nginx -t
+        if [[ -n "$bak" ]]; then cp -a "$bak" "$SITES/$STATIC_SITE"; rm -f "$bak"
+        else rm -f "$SITES/$STATIC_SITE" "$ENABLED/$STATIC_SITE"; fi
+        write_acme_site
+        fail "The Nginx configuration did not check out — nothing was changed"
+    fi
+    rm -f "$bak"
+    ok "Nginx configuration checks out"
+
+    systemctl enable nginx >/dev/null 2>&1 || true
+    systemctl restart nginx || fail "Nginx did not start — 'journalctl -u nginx' says why"
+    wait_active || fail "Nginx did not come up"
+    ok "Nginx is running"
+
+    if command -v ufw >/dev/null 2>&1; then
+        bash "$ROOT/firewall.sh" >/dev/null 2>&1 || true
+        ok "Firewall: port $port is open"
+    fi
+
+    local code
+    code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "https://127.0.0.1:$port/" 2>/dev/null)
+    [[ "$code" == 200 ]] || warn "The site answered HTTP ${code:-nothing} on 127.0.0.1:$port"
+    done_ "Done — https on port $port serves $SITE_ROOT"
+}
+
 # ── certs ────────────────────────────────────────────────────────────────────
 do_certs() {
     local cert="$1" key="$2" n=0 f
     [[ -f "$cert" && -f "$key" ]] || fail "Certificate not found: $cert"
-    for f in "$SITES"/p5-app-*.conf; do
-        [[ -f "$f" ]] || continue
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
         sed -i -E "s#^(\s*)ssl_certificate .*;#\1ssl_certificate $cert;#; s#^(\s*)ssl_certificate_key .*;#\1ssl_certificate_key $key;#" "$f"
         n=$((n + 1))
-    done
-    (( n > 0 )) || { ok "No apps behind Nginx"; return 0; }
+    done <<< "$(tls_sites)"
+    (( n > 0 )) || { ok "Nothing is served through Nginx"; return 0; }
     reload_nginx || fail "Nginx rejected the new certificate"
     switch_renewal_to_webroot "$cert"
-    ok "Nginx serves $cert for $n app(s)"
+    ok "Nginx serves $cert for $n site(s)"
 }
 
 # ── unwire ───────────────────────────────────────────────────────────────────
@@ -733,6 +893,10 @@ PY
         fi
     done <<< "$rows"
 
+    if [[ -f "$SITES/$STATIC_SITE" ]]; then
+        rm -f "$SITES/$STATIC_SITE" "$ENABLED/$STATIC_SITE"
+        ok "The static site is gone — its files stay in $SITE_ROOT"
+    fi
     rm -f "$ENABLED/$ACME_SITE" "$SITES/$ACME_SITE" "$BOTS_HTTP" "$BOTS_SNIPPET" /etc/nginx/conf.d/p5-upgrade.conf
     sync_fail2ban
     if command -v nginx >/dev/null 2>&1; then
@@ -752,6 +916,13 @@ case "${1:-}" in
     # install: what p5agent's install_util.sh runs (/install-util nginx) —
     # the same as wire.
     wire|install)
+        # install_util.sh runs "<script> install <args…>", so the static site
+        # arrives here too: install static [port].
+        if [[ "${2:-}" == static ]]; then
+            [[ $# -le 3 ]] || fail "usage: nginx.sh install static [port]"
+            do_static "${3:-$STATIC_PORT}"
+            exit 0
+        fi
         [[ $# -ge 3 ]] || fail "usage: nginx.sh install <name> <app-port> [--public <port>] [--bots] [--fail2ban]"
         wire_name="$2" wire_port="$3" bots=0 f2b=0 public_port=""
         shift 3
@@ -765,11 +936,13 @@ case "${1:-}" in
             shift
         done
         do_wire "$wire_name" "$wire_port" "$bots" "$f2b" "$public_port" ;;
+    # static: Nginx with no app in front of it — it serves $SITE_ROOT itself.
+    static) [[ $# -le 2 ]] || fail "usage: nginx.sh static [port]"; do_static "${2:-$STATIC_PORT}" ;;
     certs)  [[ $# -eq 3 ]] || fail "usage: nginx.sh certs <cert> <key>"; do_certs "$2" "$3" ;;
     unwire) [[ $# -eq 2 ]] || fail "usage: nginx.sh unwire <name>"; do_unwire "$2" ;;
     start)  do_start ;;
     stop)   do_stop ;;
     update) do_update ;;
     remove) do_remove ;;
-    *) sed -n '2,26p' "$0"; exit 2 ;;
+    *) sed -n '2,32p' "$0"; exit 2 ;;
 esac

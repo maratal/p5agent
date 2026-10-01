@@ -314,9 +314,10 @@ if systemctl list-unit-files certbot.timer >/dev/null 2>&1; then
         || log "Could not enable certbot.timer — renewals will not run unattended"
 fi
 
-# Apps behind Nginx: Nginx serves the certificate, they keep speaking HTTP.
+# Whatever Nginx serves takes the certificate: the apps behind it, and the
+# static site, which is there with no app at all.
 PROXIED=$(proxied_apps)
-if [[ -n "$PROXIED" ]]; then
+if [[ -n "$PROXIED" || -f /etc/nginx/sites-available/p5-static.conf ]]; then
     bash "$(dirname "$0")/utilities/nginx/nginx.sh" certs "$CERT" "$KEY" >&2 \
         || fail "The certificate is in place, but Nginx did not take it"
 fi
