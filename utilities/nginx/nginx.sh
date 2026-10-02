@@ -2,7 +2,8 @@
 # nginx.sh — puts Nginx in front of installed apps, or serves a static site with
 # no app behind it at all (utilities/nginx/ in p5agent).
 #
-#   nginx.sh install|wire <name> <app-port> [--public <port>] [--bots] [--fail2ban]
+#   nginx.sh install|wire <name> <app-port> [--public <port>] [--domain <name>]
+#                                     [--bots] [--fail2ban]
 #                                     move the app to <app-port> (plain HTTP,
 #                                     loopback only) and let Nginx serve its old
 #                                     port over HTTPS, plus port 80. 0 picks the
@@ -11,27 +12,45 @@
 #                                     --public: the port Nginx serves the app on
 #                                     instead (the old one is closed); left out,
 #                                     it stays where it is
+#                                     --domain: the name Nginx serves the app
+#                                     for (its server_name), so several apps
+#                                     share one port — see "Several sites on
+#                                     one port" below. "" takes it away; left
+#                                     out, the app keeps the one it has
 #                                     --bots / --fail2ban: see "Bot protection"
 #                                     below; leaving a flag out on a re-run
 #                                     turns that protection off again
-#   nginx.sh static [port]            no app in front: Nginx serves the files in
+#   nginx.sh install sites [--public <port>] [--bots] [--fail2ban]
+#                          <name>:<app-port>[:<domain>] …
+#                                     the same for several apps at once, all
+#                                     on one public port (each keeps its own
+#                                     when --public is left out), each with
+#                                     its own domain — what the dashboard's
+#                                     Install / Setup Nginx send
+#   nginx.sh static [port] [--domain <name>]
+#                                     no app in front: Nginx serves the files in
 #                                     /var/www/html over HTTPS on [port] (443 by
 #                                     default), plus port 80. A directory is
 #                                     served through its index.html, index.htm
 #                                     or main.html, in that order. An empty one
 #                                     gets a placeholder page; the dashboard's
 #                                     attach (the agent's /static-site) fills it
-#   nginx.sh certs <cert> <key>       point every Nginx-served app at this
-#                                     certificate and reload (run by certs.sh)
+#   nginx.sh certs <cert> <key>       point the sites the certificate is for at
+#                                     it (by domain; the sites without one when
+#                                     it is for none of them) and reload (run
+#                                     by certs.sh)
 #   nginx.sh unwire <name>            drop the app's Nginx site (run by uninstall)
 #   nginx.sh start | stop             the service (its card's Start / Stop)
 #   nginx.sh update                   upgrade the package, check the config, restart
 #   nginx.sh remove                   take Nginx away (the dashboard's Uninstall on
 #                                     its card): every app behind it serves itself
-#                                     again — HTTPS on the port Nginx served it on,
-#                                     with the certificate Nginx used — then Nginx
-#                                     is stopped, disabled and its package removed
-#                                     (its config and /etc/nginx/p5 certificates stay)
+#                                     again — HTTPS on the port Nginx served it on
+#                                     (apps that shared a port by domain: the one
+#                                     without a domain keeps it, the others take
+#                                     their private port), with the certificate
+#                                     Nginx used — then Nginx is stopped, disabled
+#                                     and its package removed (its config and
+#                                     /etc/nginx/p5 certificates stay)
 #
 # The layout it builds is the usual one:
 #
@@ -42,7 +61,16 @@
 #
 # The app's installed_apps.json entry keeps its new private port as "port" and
 # gains "public-port" — the port Nginx serves it on, which is what the dashboard
-# links to and what firewall.sh opens. The app's own port stays closed.
+# links to and what firewall.sh opens — and "nginx-domain" when it has one. The
+# app's own port stays closed.
+#
+# Several sites on one port: a site with a domain answers only for that name
+# (server_name), so any number of them share a port — 443 for all of them is
+# the usual layout. On each port, the one site without a domain (if any) is
+# the default_server: it answers for an IP, and for any name no other site
+# claims. Two sites without a domain, or two for the same name, can't share a
+# port; that is checked before anything changes. A certificate goes to the
+# sites whose name it is for (nginx.sh certs).
 #
 # Wiring is all-or-nothing: the app's unit, env file and entry are saved first,
 # and put back if Nginx does not come up.
@@ -129,7 +157,106 @@ static_port() {
 # refuses to start on a [::] socket it cannot open.
 listen6() { [[ -f /proc/net/if_inet6 ]] && printf '    listen [::]:%s;' "$1"; }
 
-# Every app's name, port and public-port (empty when not behind Nginx), tab-separated.
+# A site's server_name — empty for the catch-all "_".
+site_domain() {
+    [[ -f "$1" ]] || return 0
+    sed -n 's/^\s*server_name \([^;]*\);/\1/p' "$1" | head -1 | sed 's/^_$//'
+}
+static_domain() { site_domain "$SITES/$STATIC_SITE"; }
+
+# A host name Nginx can serve: letters, digits and hyphens in dot-separated
+# labels, at least two of them. Lowercase only (the callers lowercase first).
+DOMAIN_RE='^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]([a-z0-9-]*[a-z0-9])?$'
+check_domain() {
+    [[ -z "$1" ]] && return 0
+    [[ ${#1} -le 253 && "$1" =~ $DOMAIN_RE ]] || fail "Not a domain name: $1"
+}
+
+# The listen options of a site: the one without a domain is its port's
+# default_server — what answers for an IP, or a name no other site there has.
+listen_opts() { printf '%s ssl%s' "$1" "$([[ -z "$2" ]] && printf ' default_server')"; }
+
+# How a site on a shared port is told apart, for messages.
+for_whom() { if [[ -n "$1" ]]; then printf 'for %s' "$1"; else printf 'as its default site (no domain)'; fi; }
+
+# What keeps a site for <domain> off <port>: an app listening there itself,
+# an app's private port, or a site Nginx serves there for the same name
+# (no domain counts as one name: the port's default). Prints who, or nothing.
+# <self>: the app being set up — or "static" — which never stands in its own way.
+port_holder() {
+    local port="$1" domain="${2,,}" self="$3" n p pub d
+    while IFS=$'\t' read -r n p pub d; do
+        [[ -n "$n" && "$n" != "$self" ]] || continue
+        if [[ "$p" == "$port" ]]; then printf '%s' "$n"; return; fi
+        if [[ "$pub" == "$port" && "$d" == "$domain" ]]; then printf '%s' "$n"; return; fi
+    done <<< "$(apps_table)"
+    if [[ "$self" != static && "$(static_port)" == "$port" && "$(static_domain)" == "$domain" ]]; then
+        printf 'the static site'
+    fi
+}
+
+# Whether anything but <self> is served on <port> — before closing it.
+port_used_by_others() {  # port_used_by_others <port> <self>
+    local n p pub d
+    while IFS=$'\t' read -r n p pub d; do
+        [[ -n "$n" && "$n" != "$2" ]] || continue
+        [[ "$p" == "$1" || "$pub" == "$1" ]] && return 0
+    done <<< "$(apps_table)"
+    [[ "$2" != static && "$(static_port)" == "$1" ]]
+}
+
+# The process listening on a port, or nothing.
+listener_on() {
+    ss -ltnpH "sport = :$1" 2>/dev/null | grep -o 'users:(("[^"]*"' | head -1 | sed 's/^users:(("//; s/"$//'
+}
+
+# The HTTP status https://<domain or 127.0.0.1>:<port>/ answers with from
+# here — by name when there is one, so Nginx picks that site.
+probe() {  # probe <port> [domain]
+    local port="$1" domain="${2:-}"
+    if [[ -n "$domain" ]]; then
+        curl --noproxy '*' -sk -o /dev/null -w '%{http_code}' --max-time 5 --resolve "$domain:$port:127.0.0.1" \
+            "https://$domain:$port/" 2>/dev/null
+    else
+        curl --noproxy '*' -sk -o /dev/null -w '%{http_code}' --max-time 5 "https://127.0.0.1:$port/" 2>/dev/null
+    fi
+}
+
+# The names a certificate is for (its subjectAltName DNS entries), lowercased;
+# for a Let's Encrypt one openssl can't read, the name of its live/ directory.
+cert_names() {
+    local names
+    names=$(openssl x509 -in "$1" -noout -ext subjectAltName 2>/dev/null \
+        | tr ',' '\n' | sed -n 's/^\s*DNS:\(.*\)$/\1/p' | tr 'A-Z' 'a-z')
+    if [[ -z "$names" && "$1" == /etc/letsencrypt/live/*/* ]]; then
+        names="$(basename "$(dirname "$1")")"
+    fi
+    printf '%s' "$names"
+}
+
+# Whether one of <names> (cert_names) covers <domain>, a wildcard one label deep.
+cert_covers() {
+    local n base
+    while IFS= read -r n; do
+        [[ -n "$n" ]] || continue
+        [[ "$n" == "$2" ]] && return 0
+        if [[ "$n" == '*.'* ]]; then
+            base="${n#\*.}"
+            [[ "$2" == *".$base" && "${2%".$base"}" != *.* ]] && return 0
+        fi
+    done <<< "$1"
+    return 1
+}
+
+# The Let's Encrypt certificate for a name, when certs.sh has obtained one:
+# "<cert>\t<key>", or nothing.
+le_cert_for() {
+    local dir="/etc/letsencrypt/live/$1"
+    [[ -n "$1" && -f "$dir/fullchain.pem" && -f "$dir/privkey.pem" ]] && printf '%s\t%s' "$dir/fullchain.pem" "$dir/privkey.pem"
+}
+
+# Every app's name, port, public-port (empty when not behind Nginx) and Nginx
+# domain (empty when none), tab-separated.
 apps_table() {
     python3 - "$INSTALLED" <<'PY'
 import json, sys
@@ -138,7 +265,8 @@ try:
 except Exception:
     apps = []
 for a in apps:
-    print("%s\t%s\t%s" % (a.get("name", ""), a.get("port", "") or "443", a.get("public-port", "")))
+    print("%s\t%s\t%s\t%s" % (a.get("name", ""), a.get("port", "") or "443", a.get("public-port", ""),
+                            str(a.get("nginx-domain") or "").lower()))
 PY
 }
 
@@ -374,12 +502,16 @@ pick_port() {
 
 # ── wire ─────────────────────────────────────────────────────────────────────
 do_wire() {
-    local name="$1" new_port="$2" bots="$3" f2b="$4" new_public="${5:-}"
+    # domain: "-" keeps the one the app has (a caller from before domains).
+    local name="$1" new_port="$2" bots="$3" f2b="$4" new_public="${5:-}" domain="${6--}"
     [[ "$bots" == 1 || "$f2b" != 1 ]] || fail "fail2ban bans what bot protection refuses — turn bot protection on too"
-    local row cur_port public
+    local row cur_port public cur_domain
     row=$(apps_table | awk -F'\t' -v n="$name" '$1 == n')
     [[ -n "$row" ]] || fail "No installed app named '$name'"
-    IFS=$'\t' read -r _ cur_port public <<< "$row"
+    IFS=$'\t' read -r _ cur_port public cur_domain <<< "$row"
+    [[ "$domain" == - ]] && domain="$cur_domain"
+    domain="${domain,,}"
+    check_domain "$domain"
 
     if [[ "$new_port" == 0 ]]; then
         new_port=$(pick_port "$name" "$cur_port" "$public")
@@ -402,19 +534,19 @@ do_wire() {
     (( public != AGENT_PORT )) || fail "Port $public is the agent's"
     (( new_port != public )) || fail "The app's new port must differ from the port Nginx takes ($public)"
 
-    # Not a port another app has, privately or through Nginx.
-    local clash
+    # The private port: no other app's, privately or through Nginx.
+    local clash holder
     clash=$(apps_table | awk -F'\t' -v n="$name" -v p="$new_port" '$1 != n && ($2 == p || $3 == p) {print $1}' | head -1)
     [[ -z "$clash" ]] || fail "Port $new_port is already used by $clash"
     [[ "$new_port" != "$(static_port)" ]] || fail "Port $new_port serves the static site"
-    if [[ "$public" != "$old_public" ]]; then
-        clash=$(apps_table | awk -F'\t' -v n="$name" -v p="$public" '$1 != n && ($2 == p || $3 == p) {print $1}' | head -1)
-        [[ -z "$clash" ]] || fail "Port $public is already used by $clash"
-        [[ "$public" != "$(static_port)" ]] || fail "Port $public serves the static site"
-        # Free, unless it is this app's own port — which it is leaving.
-        if [[ "$public" != "$cur_port" ]] && ss -ltnH "sport = :$public" 2>/dev/null | grep -q .; then
-            fail "Something is already listening on port $public"
-        fi
+    # The public port: shared only by sites Nginx tells apart by name.
+    clash=$(port_holder "$public" "$domain" "$name")
+    [[ -z "$clash" ]] || fail "Port $public already serves $clash $(for_whom "$domain") — give $name another domain or public port"
+    # Free, unless it is this app's own port (which it is leaving) or Nginx's
+    # (another site there, told apart by name).
+    if [[ "$public" != "$cur_port" ]]; then
+        holder=$(listener_on "$public")
+        [[ -z "$holder" || "$holder" == nginx ]] || fail "Something is already listening on port $public ($holder)"
     fi
     if [[ "$new_port" != "$cur_port" ]] && ss -ltnH "sport = :$new_port" 2>/dev/null | grep -q .; then
         fail "Something is already listening on port $new_port"
@@ -423,13 +555,17 @@ do_wire() {
     local unit="/etc/systemd/system/${name}.service" env="/etc/${name}.env"
     [[ -f "$unit" ]] || fail "$unit not found"
 
-    log "Nginx will serve $name on $public (HTTPS) and 80; $name moves to 127.0.0.1:$new_port (HTTP)"
+    log "Nginx will serve $name on $public (HTTPS)${domain:+ for $domain} and 80; $name moves to 127.0.0.1:$new_port (HTTP)"
     install_nginx
 
-    # The certificate the app serves now becomes Nginx's. A re-wire finds it in
-    # the app's existing site instead; with neither, a self-signed one is made.
-    local cert="" key=""
-    if [[ -f "$env" ]]; then
+    # The certificate: Let's Encrypt's for the app's domain when certs.sh has
+    # one; else the one the app serves now, which becomes Nginx's. A re-wire
+    # finds it in the app's existing site instead; with neither, a self-signed
+    # one is made.
+    local cert="" key="" le
+    le=$(le_cert_for "$domain")
+    [[ -n "$le" ]] && IFS=$'\t' read -r cert key <<< "$le"
+    if [[ -z "$cert" && -f "$env" ]]; then
         cert=$(sed -n 's/^TLS_CERT_PATH=//p' "$env" | tail -1)
         key=$(sed -n 's/^TLS_KEY_PATH=//p' "$env" | tail -1)
     fi
@@ -444,6 +580,9 @@ do_wire() {
         cert="$CERT_DIR/$name.crt"; key="$CERT_DIR/$name.key"
     fi
     ok "Certificate: $cert"
+    if [[ -n "$domain" ]] && ! cert_covers "$(cert_names "$cert")" "$domain"; then
+        warn "That certificate is not for $domain — browsers will warn until Update Certificates gets one for it"
+    fi
 
     # Save what is about to change, so a failure can put it all back.
     local bak; bak=$(mktemp -d /tmp/p5-nginx-XXXXXX)
@@ -456,9 +595,9 @@ do_wire() {
     cat > "$SITES/$(site_of "$name")" <<CONF
 # Written by p5agent's nginx.sh for $name — edits here are lost the next time it runs.
 server {
-    listen $public ssl default_server;
-$(listen6 "$public ssl default_server")
-    server_name _;
+    listen $(listen_opts "$public" "$domain");
+$(listen6 "$(listen_opts "$public" "$domain")")
+    server_name ${domain:-_};
     ssl_certificate $cert;
     ssl_certificate_key $key;
     ssl_protocols TLSv1.2 TLSv1.3;
@@ -505,9 +644,9 @@ CONF
         touch "$env"; chmod 600 "$env"
     fi
     printf 'PORT=%s\nHOST=127.0.0.1\n' "$new_port" >> "$env"
-    python3 - "$INSTALLED" "$name" "$new_port" "$public" "$bots" "$f2b" <<'PY'
+    python3 - "$INSTALLED" "$name" "$new_port" "$public" "$bots" "$f2b" "$domain" <<'PY'
 import json, sys
-path, name, port, public, bots, f2b = sys.argv[1:7]
+path, name, port, public, bots, f2b, domain = sys.argv[1:8]
 apps = json.load(open(path))
 for a in apps:
     if a.get("name") == name:
@@ -515,6 +654,10 @@ for a in apps:
         a["public-port"] = public
         a["nginx-bots"] = bots == "1"
         a["nginx-fail2ban"] = f2b == "1"
+        if domain:
+            a["nginx-domain"] = domain
+        else:
+            a.pop("nginx-domain", None)
 json.dump(apps, open(path, "w"), indent=2)
 PY
     systemctl daemon-reload
@@ -539,7 +682,7 @@ PY
         restore "$name" "$bak"
         fail "Nginx did not start — everything was put back as it was"
     fi
-    ok "Nginx serves $name on port $public"
+    ok "Nginx serves $name on port $public $(for_whom "$domain")"
 
     # The entry now has public-port: firewall.sh opens it and 80 if they have no
     # rule yet (a restriction from Firewall Settings stays), and the private
@@ -548,9 +691,14 @@ PY
         bash "$ROOT/firewall.sh" >/dev/null 2>&1 || true
         bash "$ROOT/firewall.sh" --close "$new_port/tcp" >/dev/null 2>&1 || true
         ok "Firewall: $public and 80 open, $new_port closed"
+        # The port it leaves stays open while another site is served there.
         if [[ "$old_public" != "$public" && "$old_public" != "$new_port" ]]; then
-            bash "$ROOT/firewall.sh" --close "$old_public/tcp" >/dev/null 2>&1 || true
-            ok "Firewall: $old_public closed — $name is served on $public now"
+            if port_used_by_others "$old_public" "$name"; then
+                ok "Firewall: $old_public stays open — other sites are served there"
+            else
+                bash "$ROOT/firewall.sh" --close "$old_public/tcp" >/dev/null 2>&1 || true
+                ok "Firewall: $old_public closed — $name is served on $public now"
+            fi
         fi
     fi
 
@@ -568,17 +716,72 @@ PY
     # the 502/503/504 Nginx gives when it cannot reach the app behind it.
     local code=""
     for _ in $(seq 1 5); do
-        code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "https://127.0.0.1:$public/" 2>/dev/null)
+        code=$(probe "$public" "$domain")
         [[ "$code" =~ ^[1-4][0-9][0-9]$|^50[01]$ ]] && break
         sleep 1
     done
     if [[ "$code" =~ ^[1-4][0-9][0-9]$|^50[01]$ ]]; then
-        done_ "Done — https on port $public reaches $name through Nginx (HTTP $code)"
+        done_ "Done — https://${domain:-<this upplet>}:$public reaches $name through Nginx (HTTP $code)"
     elif [[ "$code" =~ ^50[234]$ ]]; then
         warn "Nginx answers on $public, but cannot reach $name behind it (HTTP $code)"
     else
         warn "Nginx is running, but https://127.0.0.1:$public did not answer"
     fi
+}
+
+# ── sites: several apps at once ──────────────────────────────────────────────
+# Each <name>:<app-port>[:<domain>] is wired as `wire` would, one after the
+# other, all on <public> (each keeps its own when it is empty). The list is
+# checked as a whole first — one app without a domain per port, no name or
+# private port twice — so a mistake in it changes nothing. Each wire is still
+# all-or-nothing on its own: if one fails, those before it stay done.
+do_sites() {  # do_sites <bots> <f2b> <public|""> <entry>…
+    local bots="$1" f2b="$2" public="$3"; shift 3
+    (( $# )) || fail "No apps to put behind Nginx"
+    [[ -z "$public" || "$public" =~ ^[0-9]+$ ]] || fail "Not a port: $public"
+    local entry name port domain row cur_port cur_public
+    local names=" " ports=" " domains=" " defaults=0 first=() named=() plain=()
+    for entry in "$@"; do
+        IFS=: read -r name port domain <<< "$entry"
+        domain="${domain,,}"
+        [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "Not an app name: $name"
+        [[ "$port" =~ ^[0-9]+$ ]] || fail "The new port for $name must be a number (0 picks one)"
+        check_domain "$domain"
+        [[ "$names" != *" $name "* ]] || fail "$name is listed twice"
+        names+="$name "
+        if [[ "$port" != 0 ]]; then
+            [[ "$ports" != *" $port "* ]] || fail "Port $port is given to two apps"
+            ports+="$port "
+        fi
+        row=$(apps_table | awk -F'\t' -v n="$name" '$1 == n')
+        [[ -n "$row" ]] || fail "No installed app named '$name'"
+        IFS=$'\t' read -r _ cur_port cur_public _ <<< "$row"
+        if [[ -n "$public" ]]; then
+            if [[ -z "$domain" ]]; then
+                defaults=$((defaults + 1))
+                (( defaults == 1 )) || fail "Only one app on port $public can go without a domain — it answers for every name the others don't have"
+            else
+                [[ "$domains" != *" $domain "* ]] || fail "$domain is given to two apps"
+                domains+="$domain "
+            fi
+        fi
+        # In an order that never has two sites in each other's way: an app
+        # still serving the shared port itself moves off it first, then those
+        # with a domain, then the one without.
+        if [[ -n "$public" && -z "$cur_public" && "$cur_port" == "$public" ]]; then first+=("$name:$port:$domain")
+        elif [[ -n "$domain" ]]; then named+=("$name:$port:$domain")
+        else plain+=("$name:$port:$domain"); fi
+    done
+    local all=("${first[@]}" "${named[@]}" "${plain[@]}") i=0
+    for entry in "${all[@]}"; do
+        i=$((i + 1))
+        IFS=: read -r name port domain <<< "$entry"
+        (( ${#all[@]} == 1 )) || log "── $name ($i of ${#all[@]})"
+        # A subshell: wire's fail() ends that wire, then the list stops here.
+        ( do_wire "$name" "$port" "$bots" "$f2b" "$public" "$domain" ) \
+            || fail "$name was not put behind Nginx$( (( i < ${#all[@]} )) && printf ' — the apps after it were left as they are')"
+    done
+    (( ${#all[@]} == 1 )) || done_ "Done — Nginx serves ${#all[@]} apps${public:+ on port $public}"
 }
 
 # Put the app back the way it was before a failed wire.
@@ -632,18 +835,22 @@ HTML
 
 
 do_static() {
-    local port="${1:-$STATIC_PORT}"
+    # domain: "-" keeps the one the site has.
+    local port="${1:-$STATIC_PORT}" domain="${2--}"
+    [[ "$domain" == - ]] && domain="$(static_domain)"
+    domain="${domain,,}"
+    check_domain "$domain"
     [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || fail "Not a port: $port"
     (( port != AGENT_PORT )) || fail "Port $port is the agent's"
     (( port != 80 )) || fail "Port 80 answers certificate challenges and redirects to https"
 
-    # An app served on that port would lose it: Nginx takes the first site that
-    # claims a port as its default_server, and two default_servers do not load.
+    # An app served on that port for the same name (or both without one) would
+    # lose it: two default_servers on one port do not load.
     local clash
-    clash=$(apps_table | awk -F'\t' -v p="$port" '($3 != "" ? $3 : $2) == p {print $1}')
-    [[ -z "$clash" ]] || fail "Port $port serves $clash — give the static site another port"
+    clash=$(port_holder "$port" "$domain" static)
+    [[ -z "$clash" ]] || fail "Port $port serves $clash $(for_whom "$domain") — give the static site another port or domain"
 
-    log "Nginx will serve $SITE_ROOT on $port (HTTPS), with 80 for certificates and the redirect"
+    log "Nginx will serve $SITE_ROOT on $port (HTTPS)${domain:+ for $domain}, with 80 for certificates and the redirect"
     install_nginx
 
     mkdir -p "$SITE_ROOT"
@@ -658,10 +865,13 @@ do_static() {
         ok "Serving the files already in $SITE_ROOT"
     fi
 
-    # The certificate: the one this site has, else any another p5 site serves
-    # (Update Certificates hands the real one to every site), else self-signed.
-    local cert="" key="" f
-    if [[ -f "$SITES/$STATIC_SITE" ]]; then
+    # The certificate: Let's Encrypt's for its domain, else the one this site
+    # has, else any another p5 site serves (Update Certificates hands the real
+    # one to every site), else self-signed.
+    local cert="" key="" f le
+    le=$(le_cert_for "$domain")
+    [[ -n "$le" ]] && IFS=$'\t' read -r cert key <<< "$le"
+    if [[ -z "$cert" && -f "$SITES/$STATIC_SITE" ]]; then
         cert=$(sed -n 's/^\s*ssl_certificate \(.*\);/\1/p' "$SITES/$STATIC_SITE" | head -1)
         key=$(sed -n 's/^\s*ssl_certificate_key \(.*\);/\1/p' "$SITES/$STATIC_SITE" | head -1)
     fi
@@ -687,9 +897,9 @@ do_static() {
     cat > "$SITES/$STATIC_SITE" <<CONF
 # Written by p5agent's nginx.sh — edits here are lost the next time it runs.
 server {
-    listen $port ssl default_server;
-$(listen6 "$port ssl default_server")
-    server_name _;
+    listen $(listen_opts "$port" "$domain");
+$(listen6 "$(listen_opts "$port" "$domain")")
+    server_name ${domain:-_};
     ssl_certificate $cert;
     ssl_certificate_key $key;
     ssl_protocols TLSv1.2 TLSv1.3;
@@ -728,21 +938,34 @@ CONF
     fi
 
     local code
-    code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "https://127.0.0.1:$port/" 2>/dev/null)
-    [[ "$code" == 200 ]] || warn "The site answered HTTP ${code:-nothing} on 127.0.0.1:$port"
-    done_ "Done — https on port $port serves $SITE_ROOT"
+    code=$(probe "$port" "$domain")
+    [[ "$code" == 200 ]] || warn "The site answered HTTP ${code:-nothing} on ${domain:-127.0.0.1}:$port"
+    done_ "Done — https on port $port serves $SITE_ROOT $(for_whom "$domain")"
 }
 
 # ── certs ────────────────────────────────────────────────────────────────────
+# A certificate goes to the sites whose domain it is for. When it is for none
+# of them, it goes to the sites without a domain — the default ones, reached
+# by the upplet's own name — as it always did.
 do_certs() {
-    local cert="$1" key="$2" n=0 f
+    local cert="$1" key="$2" n=0 f d names
+    local matched=() plain=() targets=()
     [[ -f "$cert" && -f "$key" ]] || fail "Certificate not found: $cert"
+    names=$(cert_names "$cert")
     while IFS= read -r f; do
         [[ -n "$f" ]] || continue
-        sed -i -E "s#^(\s*)ssl_certificate .*;#\1ssl_certificate $cert;#; s#^(\s*)ssl_certificate_key .*;#\1ssl_certificate_key $key;#" "$f"
-        n=$((n + 1))
+        d=$(site_domain "$f")
+        if [[ -z "$d" ]]; then plain+=("$f")
+        elif cert_covers "$names" "$d"; then matched+=("$f"); fi
     done <<< "$(tls_sites)"
-    (( n > 0 )) || { ok "Nothing is served through Nginx"; return 0; }
+    if (( ${#matched[@]} )); then targets=("${matched[@]}"); else targets=("${plain[@]}"); fi
+    for f in "${targets[@]}"; do
+        sed -i -E "s#^(\s*)ssl_certificate .*;#\1ssl_certificate $cert;#; s#^(\s*)ssl_certificate_key .*;#\1ssl_certificate_key $key;#" "$f"
+        d=$(site_domain "$f")
+        ok "$(basename "$f" .conf | sed 's/^p5-app-//; s/^p5-static$/the static site/') takes it${d:+ ($d)}"
+        n=$((n + 1))
+    done
+    (( n > 0 )) || { ok "No site Nginx serves is for $(tr '\n' ' ' <<< "$names")— nothing changed"; return 0; }
     reload_nginx || fail "Nginx rejected the new certificate"
     switch_renewal_to_webroot "$cert"
     ok "Nginx serves $cert for $n site(s)"
@@ -830,8 +1053,10 @@ PY
 }
 
 do_remove() {
-    local rows name port public site cert key unit env failed=0
-    rows=$(apps_table | awk -F'\t' '$3 != ""')
+    local rows name port public domain serve site cert key unit env failed=0 claimed=" "
+    # The app without a domain goes first on its port: it is the one that
+    # keeps it. Others served there by name can't all have it back.
+    rows=$(apps_table | awk -F'\t' '$3 != ""' | sort -t$'\t' -k4,4)
     [[ -n "$rows" ]] && log "Nginx serves: $(awk -F'\t' '{printf "%s%s", (NR>1?", ":""), $1}' <<< "$rows")"
 
     # Nginx holds the ports the apps take back: it goes first.
@@ -841,19 +1066,25 @@ do_remove() {
         ok "Nginx stopped"
     fi
 
-    while IFS=$'\t' read -r name port public; do
+    while IFS=$'\t' read -r name port public domain; do
         [[ -n "$name" ]] || continue
         site="$SITES/$(site_of "$name")"
         unit="/etc/systemd/system/${name}.service" env="/etc/${name}.env"
         cert=$(sed -n 's/^\s*ssl_certificate \(.*\);/\1/p' "$site" 2>/dev/null | head -1)
         key=$(sed -n 's/^\s*ssl_certificate_key \(.*\);/\1/p' "$site" 2>/dev/null | head -1)
-        log "$name serves itself again: HTTPS on $public"
+        serve="$public"
+        if [[ "$claimed" == *" $public "* ]]; then
+            serve="$port"
+            warn "$name shared port $public with another app — it serves itself on $port instead"
+        fi
+        claimed+="$serve "
+        log "$name serves itself again: HTTPS on $serve"
         if [[ ! -f "$unit" ]]; then warn "$unit not found — $name left as it is"; failed=1; continue; fi
         systemctl stop "$name" 2>/dev/null || true
         sed -i -E \
-            -e "s/^Environment=PORT=.*/Environment=PORT=$public/" \
+            -e "s/^Environment=PORT=.*/Environment=PORT=$serve/" \
             -e "s/^Environment=HOST=.*/Environment=HOST=0.0.0.0/" \
-            -e "/^ExecStart=/ s/--port[= ][0-9]+/--port $public/" \
+            -e "/^ExecStart=/ s/--port[= ][0-9]+/--port $serve/" \
             -e "/^ExecStart=/ s/--hostname[= ][^ ]+/--hostname 0.0.0.0/" \
             "$unit"
         [[ -f "$env" ]] || { touch "$env"; chmod 600 "$env"; }
@@ -864,15 +1095,15 @@ do_remove() {
         else
             warn "No certificate found for $name — it will serve plain HTTP until Update Certificates"
         fi
-        printf 'PORT=%s\nHOST=0.0.0.0\n' "$public" >> "$env"
-        python3 - "$INSTALLED" "$name" "$public" <<'PY'
+        printf 'PORT=%s\nHOST=0.0.0.0\n' "$serve" >> "$env"
+        python3 - "$INSTALLED" "$name" "$serve" <<'PY'
 import json, sys
 path, name, public = sys.argv[1:4]
 apps = json.load(open(path))
 for a in apps:
     if a.get("name") == name:
         a["port"] = public
-        for k in ("public-port", "nginx-bots", "nginx-fail2ban"):
+        for k in ("public-port", "nginx-bots", "nginx-fail2ban", "nginx-domain"):
             a.pop(k, None)
 json.dump(apps, open(path, "w"), indent=2)
 PY
@@ -881,14 +1112,14 @@ PY
         systemctl start "$name" || true
         local up="" code
         for _ in $(seq 1 30); do
-            code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 2 "https://127.0.0.1:$public/" 2>/dev/null)
+            code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 2 "https://127.0.0.1:$serve/" 2>/dev/null)
             [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] && { up=1; break; }
             sleep 1
         done
-        if [[ -n "$up" ]]; then ok "$name answers on https port $public (HTTP $code)"
-        else warn "$name did not answer on https port $public yet"; journalctl -u "$name" -n 10 --no-pager 2>/dev/null; failed=1; fi
+        if [[ -n "$up" ]]; then ok "$name answers on https port $serve (HTTP $code)"
+        else warn "$name did not answer on https port $serve yet"; journalctl -u "$name" -n 10 --no-pager 2>/dev/null; failed=1; fi
         # Its private port is nobody's now.
-        if command -v ufw >/dev/null 2>&1 && [[ "$port" != "$public" ]]; then
+        if command -v ufw >/dev/null 2>&1 && [[ "$port" != "$serve" ]]; then
             bash "$ROOT/firewall.sh" --close "$port/tcp" >/dev/null 2>&1 || true
         fi
     done <<< "$rows"
@@ -912,37 +1143,68 @@ PY
     done_ "Done — Nginx removed"
 }
 
+# static [port] [--domain <name>]
+parse_static() {
+    local port="" domain="-"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain) [[ $# -ge 2 ]] || fail "--domain needs a name (\"\" for none)"; domain="$2"; shift ;;
+            --*) fail "Unknown option: $1" ;;
+            *) [[ -z "$port" ]] || fail "usage: nginx.sh static [port] [--domain <name>]"; port="$1" ;;
+        esac
+        shift
+    done
+    do_static "${port:-$STATIC_PORT}" "$domain"
+}
+
 case "${1:-}" in
     # install: what p5agent's install_util.sh runs (/install-util nginx) —
     # the same as wire.
     wire|install)
         # install_util.sh runs "<script> install <args…>", so the static site
-        # arrives here too: install static [port].
+        # and the list arrive here too: install static …, install sites ….
         if [[ "${2:-}" == static ]]; then
-            [[ $# -le 3 ]] || fail "usage: nginx.sh install static [port]"
-            do_static "${3:-$STATIC_PORT}"
+            shift 2
+            parse_static "$@"
             exit 0
         fi
-        [[ $# -ge 3 ]] || fail "usage: nginx.sh install <name> <app-port> [--public <port>] [--bots] [--fail2ban]"
-        wire_name="$2" wire_port="$3" bots=0 f2b=0 public_port=""
+        if [[ "${2:-}" == sites ]]; then
+            shift 2
+            bots=0 f2b=0 public_port="" entries=()
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --bots) bots=1 ;;
+                    --fail2ban) f2b=1 ;;
+                    --public) [[ $# -ge 2 ]] || fail "--public needs a port"; public_port="$2"; shift ;;
+                    --*) fail "Unknown option: $1" ;;
+                    *) entries+=("$1") ;;
+                esac
+                shift
+            done
+            do_sites "$bots" "$f2b" "$public_port" "${entries[@]}"
+            exit $?
+        fi
+        [[ $# -ge 3 ]] || fail "usage: nginx.sh install <name> <app-port> [--public <port>] [--domain <name>] [--bots] [--fail2ban]"
+        wire_name="$2" wire_port="$3" bots=0 f2b=0 public_port="" wire_domain="-"
         shift 3
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 --bots) bots=1 ;;
                 --fail2ban) f2b=1 ;;
                 --public) [[ $# -ge 2 ]] || fail "--public needs a port"; public_port="$2"; shift ;;
+                --domain) [[ $# -ge 2 ]] || fail "--domain needs a name (\"\" for none)"; wire_domain="$2"; shift ;;
                 *) fail "Unknown option: $1" ;;
             esac
             shift
         done
-        do_wire "$wire_name" "$wire_port" "$bots" "$f2b" "$public_port" ;;
+        do_wire "$wire_name" "$wire_port" "$bots" "$f2b" "$public_port" "$wire_domain" ;;
     # static: Nginx with no app in front of it — it serves $SITE_ROOT itself.
-    static) [[ $# -le 2 ]] || fail "usage: nginx.sh static [port]"; do_static "${2:-$STATIC_PORT}" ;;
+    static) shift; parse_static "$@" ;;
     certs)  [[ $# -eq 3 ]] || fail "usage: nginx.sh certs <cert> <key>"; do_certs "$2" "$3" ;;
     unwire) [[ $# -eq 2 ]] || fail "usage: nginx.sh unwire <name>"; do_unwire "$2" ;;
     start)  do_start ;;
     stop)   do_stop ;;
     update) do_update ;;
     remove) do_remove ;;
-    *) sed -n '2,32p' "$0"; exit 2 ;;
+    *) sed -n '2,53p' "$0"; exit 2 ;;
 esac

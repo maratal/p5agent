@@ -31,7 +31,7 @@ root systemd service on port 5005 and exposes:
                       pending_install.json the moment it is accepted, and a
                       second request (either kind) is refused with 409 while one is running
     GET  /static-site the static site Nginx serves with no app behind it:
-                      {root, port, exists, files, bytes, updated, placeholder}
+                      {root, port, domain, exists, files, bytes, updated, placeholder}
     POST /static-site replace that site's files with the gzipped tar in the
                       body (<=64 MB, the dashboard's folder attach): only plain
                       files and directories, no path leaving the site, swapped
@@ -39,7 +39,10 @@ root systemd service on port 5005 and exposes:
     POST /install-util {"name": squid|nginx, …its settings} — install a utility:
                       install_util.sh runs utilities/<name>/<name>.sh install in
                       the background, exactly as an app install is run (the
-                      same lock, /progress and setup.log)
+                      same lock, /progress and setup.log). Nginx takes
+                      {sites: [{app, port, domain}], public_port, bots,
+                      fail2ban} — several apps on one port, by domain — or
+                      {static: true, port, domain}
     GET  /progress    current install status as JSON:
                       { "app", "kind", "started_at", "completed"? } — {} when idle
     GET  /setup-log   the current (or last) install's log, only what the caller
@@ -304,6 +307,17 @@ def static_site_port():
     return int(m.group(1)) if m else None
 
 
+def static_site_domain():
+    """The domain the static site is served for, "" when it answers for any
+    name (or there is no static site)."""
+    try:
+        with open(STATIC_SITE_CONF) as fh:
+            m = re.search(r"^\s*server_name\s+([^;\s]+)\s*;", fh.read(), re.M)
+    except OSError:
+        return ""
+    return m.group(1) if m and m.group(1) != "_" else ""
+
+
 def site_status():
     """What the static site holds: its file count, total size and newest
     change. `placeholder` is nginx.sh's own "nothing here yet" page, which is
@@ -329,7 +343,8 @@ def site_status():
             # nginx.sh removes the package's own welcome page, but an upplet
             # whose Nginx was installed by hand may still have it.
             placeholder = os.path.isfile(os.path.join(SITE_ROOT, "index.nginx-debian.html"))
-    return {"root": SITE_ROOT, "port": static_site_port(), "exists": os.path.isdir(SITE_ROOT),
+    return {"root": SITE_ROOT, "port": static_site_port(), "domain": static_site_domain(),
+            "exists": os.path.isdir(SITE_ROOT),
             "files": files, "bytes": total, "updated": newest or None, "placeholder": placeholder}
 
 
@@ -1231,50 +1246,120 @@ def squid_install(req):
     return [], env, files, summary
 
 
+# The name a site is served for (nginx.sh's server_name): dot-separated
+# labels of letters, digits and hyphens. Lowercased before it is checked.
+NGINX_DOMAIN_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z](?:[a-z0-9-]*[a-z0-9])?$")
+
+
+def nginx_domain(value, what):
+    """A request's domain for a site: "" for none, else a valid host name."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise InstallRefused(400, "%s: the domain must be text" % what)
+    domain = value.strip().lower().rstrip(".")
+    if domain and (len(domain) > 253 or not NGINX_DOMAIN_RE.match(domain)):
+        raise InstallRefused(400, "%s: not a domain name: %s" % (what, value.strip()))
+    return domain
+
+
+def nginx_port_arg(value, what):
+    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 65535 or value in (80, PORT):
+        raise InstallRefused(400, "%s must be a number from 1 to 65535, not 80 or %d" % (what, PORT))
+    return value
+
+
 def nginx_install(req):
-    """/install-util nginx: Nginx in front of an installed app (nginx.sh
-    install <app> <app-port> …) — or, for an app behind it already, a change
-    of how it is served. With {"static": true} there is no app at all: Nginx
-    serves /var/www/html (nginx.sh install static <port>)."""
+    """/install-util nginx: Nginx in front of installed apps — or, for apps
+    behind it already, a change of how they are served.
+
+    {"sites": [{app, port, domain}…], public_port, bots, fail2ban}: several
+    apps on one public port, told apart by domain (nginx.sh install sites).
+    {"app", "port", "domain"?, "public_port"?, …}: one app (nginx.sh install
+    <app> <port> …); without "domain" it keeps the one it has.
+    {"static": true, "port", "domain"?}: no app at all — Nginx serves
+    /var/www/html (nginx.sh install static <port>)."""
     if squid_current():
         raise InstallRefused(409, "Nginx and Squid can't be installed on the same upplet")
     # No app in front of it: Nginx serves /var/www/html itself.
     if req.get("static") is True:
         port = req.get("port")
-        if port is None:
-            port = 443
-        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535 or port in (80, PORT):
-            raise InstallRefused(400, "port must be a number from 1 to 65535, not 80 or %d" % PORT)
-        return ["static", str(port)], {}, [], "static site on port %d" % port
-    app = str(req.get("app") or "")
-    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", app):
-        raise InstallRefused(400, "a valid app name is required")
+        port = nginx_port_arg(443 if port is None else port, "port")
+        args = ["static", str(port)]
+        if "domain" in req:
+            args += ["--domain", nginx_domain(req.get("domain"), "the static site")]
+        domain = args[-1] if "domain" in req else ""
+        return args, {}, [], "static site on port %d%s" % (port, " for " + domain if domain else "")
+
     try:
         apps = json.loads(read_file(INSTALLED_APPS) or "[]")
     except ValueError:
         apps = []
-    if not any(isinstance(a, dict) and a.get("name") == app for a in apps):
-        raise InstallRefused(409, "%s is not installed on this upplet" % app)
+    installed = {a.get("name") for a in apps if isinstance(a, dict)}
     updating = app_update_status()
-    if updating and not updating.get("finished") and updating.get("name") == app:
-        raise InstallRefused(409, "%s is being updated" % app)
-    port = req.get("port")
-    # 0: nginx.sh picks the port.
-    if not isinstance(port, int) or isinstance(port, bool) or not (port == 0 or 1024 <= port <= 65535):
-        raise InstallRefused(400, "port must be 0 or a number from 1024 to 65535")
+    updating = updating.get("name") if updating and not updating.get("finished") else None
+
+    def check_app(app, port):
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", app):
+            raise InstallRefused(400, "a valid app name is required")
+        if app not in installed:
+            raise InstallRefused(409, "%s is not installed on this upplet" % app)
+        if updating == app:
+            raise InstallRefused(409, "%s is being updated" % app)
+        # 0: nginx.sh picks the port.
+        if not isinstance(port, int) or isinstance(port, bool) or not (port == 0 or 1024 <= port <= 65535):
+            raise InstallRefused(400, "%s: the port must be 0 or a number from 1024 to 65535" % app)
+
+    # Bot protection is set on every run: a flag left out turns it off.
+    flags = []
+    if req.get("bots") is True:
+        flags.append("--bots")
+        if req.get("fail2ban") is True:
+            flags.append("--fail2ban")
+
+    sites = req.get("sites")
+    if sites is not None:
+        if not isinstance(sites, list) or not sites or len(sites) > 50:
+            raise InstallRefused(400, "sites must list 1 to 50 apps")
+        public = req.get("public_port")
+        public = None if public is None else nginx_port_arg(public, "public_port")
+        entries, seen, ports, domains, defaults = [], set(), set(), set(), 0
+        for site in sites:
+            if not isinstance(site, dict):
+                raise InstallRefused(400, "each site is {app, port, domain}")
+            app, port = str(site.get("app") or ""), site.get("port")
+            check_app(app, port)
+            domain = nginx_domain(site.get("domain"), app)
+            if app in seen:
+                raise InstallRefused(400, "%s is listed twice" % app)
+            seen.add(app)
+            if port:
+                if port in ports or port == public:
+                    raise InstallRefused(400, "port %d is given twice" % port)
+                ports.add(port)
+            if public is not None:
+                if not domain:
+                    defaults += 1
+                    if defaults > 1:
+                        raise InstallRefused(400, "only one app on port %d can go without a domain" % public)
+                elif domain in domains:
+                    raise InstallRefused(400, "%s is given to two apps" % domain)
+                domains.add(domain)
+            entries.append("%s:%d:%s" % (app, port, domain))
+        args = ["sites"] + (["--public", str(public)] if public is not None else []) + flags + entries
+        summary = "in front of %s%s" % (", ".join(sorted(seen)), " on port %d" % public if public is not None else "")
+        return args, {}, [], summary
+
+    app, port = str(req.get("app") or ""), req.get("port")
+    check_app(app, port)
     args = [app, str(port)]
     # The port Nginx serves the app on; left out, it stays where it is.
-    public = req.get("public_port")
-    if public is not None:
-        if not isinstance(public, int) or isinstance(public, bool) or not 1 <= public <= 65535 or public in (80, PORT):
-            raise InstallRefused(400, "public_port must be a number from 1 to 65535, not 80 or %d" % PORT)
-        args += ["--public", str(public)]
-    # Bot protection is set on every run: a flag left out turns it off.
-    if req.get("bots") is True:
-        args.append("--bots")
-        if req.get("fail2ban") is True:
-            args.append("--fail2ban")
-    return args, {}, [], "in front of %s" % app
+    if req.get("public_port") is not None:
+        args += ["--public", str(nginx_port_arg(req.get("public_port"), "public_port"))]
+    # Left out, the app keeps the domain it has.
+    if "domain" in req:
+        args += ["--domain", nginx_domain(req.get("domain"), app)]
+    return args + flags, {}, [], "in front of %s" % app
 
 
 UTILITY_INSTALLS = {"squid": squid_install, "nginx": nginx_install}

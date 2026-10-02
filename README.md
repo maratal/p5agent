@@ -204,9 +204,28 @@ curl -X POST "https://<ip>:5005/install-util" -H "Authorization: Bearer $TOKEN" 
      -H "Content-Type: application/json" \
      -d '{"name": "nginx", "app": "chatserver", "port": 0, "public_port": 443,
           "bots": true, "fail2ban": false}'
+
+# Several apps on one port, told apart by domain. The one without a domain
+# is the port's default: it answers for the IP and any other name.
+curl -X POST "https://<ip>:5005/install-util" -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"name": "nginx", "public_port": 443, "bots": true,
+          "sites": [{"app": "chatserver", "port": 0, "domain": ""},
+                    {"app": "blog", "port": 0, "domain": "blog.example.com"}]}'
+
+# The static site (no app at all), optionally for one domain
+curl -X POST "https://<ip>:5005/install-util" -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"name": "nginx", "static": true, "port": 443, "domain": "www.example.com"}'
 ```
 
 `POST /squid` and `POST /app {op: "nginx"}` are the same installs.
+
+Several sites share a port only when Nginx can tell them apart by name: at
+most one without a domain per port, and no domain twice. That is checked
+before anything changes. A certificate from `/certs` goes to the sites whose
+domain it is for, and to the sites without a domain when it is for none of
+them. An app's `/apps` entry carries `nginx-domain` while it has one.
 
 ## Authorization
 
