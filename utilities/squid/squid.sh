@@ -13,7 +13,8 @@
 #                             passwd, whitelist) and close its port; the
 #                             firewall's built-in ports are the apps' and 80 again
 #   squid.sh password <user>  a new password for <user>, read from stdin (never
-#                             the command line), in effect at once
+#                             the command line), then a restart so it is in
+#                             effect at once (cached logins dropped)
 #
 # setup's environment:
 #         PROXY_PORT      (default 3128)
@@ -123,8 +124,17 @@ do_password() {
     [[ -n "$pass" ]] || fail "no password on stdin"
     printf '%s' "$pass" | htpasswd -i -B "$PASSWD_FILE" "$user" >/dev/null || fail "htpasswd failed"
     unset pass
-    squid -k reconfigure >/dev/null 2>&1 || warn "Squid did not re-read its configuration — restart it to use the new password"
     ok "New password for $user"
+    # A restart, not `squid -k reconfigure`: Squid caches a login for
+    # credentialsttl (2 hours), so only a restart stops the old password at once.
+    # Exit 2: the password IS changed, only the restart failed — p5agent tells
+    # the two apart, so the dashboard keeps (and shows) the new password.
+    if ! systemctl restart squid; then
+        journalctl -u squid -n 15 --no-pager 2>/dev/null
+        printf '\033[1;31m✗ %s\033[0m\n' "Squid did not restart"; exit 2
+    fi
+    wait_active || { printf '\033[1;31m✗ %s\033[0m\n' "Squid did not come back after the restart"; exit 2; }
+    ok "Squid restarted"
 }
 
 case "${1:-setup}" in

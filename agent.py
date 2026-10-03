@@ -84,7 +84,8 @@ root systemd service on port 5005 and exposes:
                       background; followed through
                       /utility-log {name, op, log, finished, returncode}
     POST /squid-password {"password": ...} — a new password for the proxy's
-                      user (htpasswd), in effect at once; nothing else changes
+                      user (htpasswd), then Squid restarts so it is in effect
+                      at once (logins it cached are dropped); nothing else changes
     GET  /ports       what listens on the upplet: {ports: {"<port>": process}}
                       (ss -ltnp) — read-only, so the token is enough: Setup
                       Nginx's port check does not need /command's allowed IP
@@ -2325,7 +2326,8 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, utility_status())
 
     def _do_squid_password(self):
-        """POST {password}: a new password for the proxy's user, at once."""
+        """POST {password}: a new password for the proxy's user, then a Squid
+        restart so the old one stops working at once."""
         if self.command != "POST":
             return self._send(405, {"error": "POST only"})
         try:
@@ -2342,11 +2344,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(409, {"error": "Squid is being set up"})
         # On stdin, not the command line: no other process sees it.
         proc = subprocess.run(["bash", SQUID_SCRIPT, "password", current["user"]], cwd=APP_DIR,
-                              input=(password + "\n").encode("utf-8"), capture_output=True, timeout=60)
+                              input=(password + "\n").encode("utf-8"), capture_output=True, timeout=120)
         out = (proc.stdout or b"").decode("utf-8", "replace") + (proc.stderr or b"").decode("utf-8", "replace")
+        detail = re.sub(r"\x1b\[[0-9;]*m", "", out).strip()
+        if proc.returncode == 2:
+            # The password is changed; only the restart that applies it at once failed.
+            return self._send(200, {"user": current["user"], "restartError": detail})
         if proc.returncode != 0:
             return self._send(500, {"error": "the password was not changed",
-                                    "detail": re.sub(r"\x1b\[[0-9;]*m", "", out).strip()})
+                                    "detail": detail})
         return self._send(200, {"user": current["user"]})
 
     def _do_certs_log(self):
