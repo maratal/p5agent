@@ -2102,9 +2102,22 @@ class Handler(BaseHTTPRequestHandler):
             req = json.loads(raw) if raw else {}
         except ValueError:
             return self._send(400, {"error": "body must be JSON"})
-        domain = str(req.get("domain", "")).strip().lower().rstrip(".")
-        if not DOMAIN_RE.match(domain):
+        # {"domains": [...]} — or "domain", one name or several comma-separated:
+        # a certificate for each, one after another in this one run.
+        raw_list = req.get("domains")
+        if not isinstance(raw_list, list):
+            raw_list = str(req.get("domain", "")).split(",")
+        domains = []
+        for item in raw_list:
+            name = str(item).strip().lower().rstrip(".")
+            if name and name not in domains:
+                domains.append(name)
+        if not domains or len(domains) > 20:
             return self._send(400, {"error": "a valid domain name is required"})
+        bad = [d for d in domains if not DOMAIN_RE.match(d)]
+        if bad:
+            return self._send(400, {"error": "not a valid domain name: %s" % bad[0]})
+        domain = ", ".join(domains)
         if not os.path.isfile(CERTS_SCRIPT):
             return self._send(500, {"error": "certs.sh not found"})
 
@@ -2120,12 +2133,20 @@ class Handler(BaseHTTPRequestHandler):
             json.dump({"domain": domain, "started_at": int(time.time())}, fh)
 
         # The runner appends the completion marker whatever the script does, so
-        # a crash is still an ending rather than a log that simply stops.
-        runner = 'exec >>"$1" 2>&1; bash "$2" domain "$3"; printf "\\n%s%s\\n" "$4" "$?"'
+        # a crash is still an ending rather than a log that simply stops. Each
+        # domain gets its own certs.sh run: one whose DNS is not ready yet
+        # fails alone, and the run ends failed, naming it.
+        runner = ('exec >>"$1" 2>&1; script=$2 marker=$3; shift 3; n=$# rc=0 failed=""; '
+                  'for d in "$@"; do '
+                  '  [ "$n" -gt 1 ] && printf "\\n── %s\\n" "$d"; '
+                  '  bash "$script" domain "$d" || { rc=$?; failed="$failed $d"; }; '
+                  'done; '
+                  '[ -n "$failed" ] && [ "$n" -gt 1 ] && printf "\\n✗ No certificate for:%s\\n" "$failed"; '
+                  'printf "\\n%s%s\\n" "$marker" "$rc"')
         try:
             subprocess.Popen(
                 ["bash", "-c", runner, "p5agent-certs",
-                 CERTS_LOG, CERTS_SCRIPT, domain, CERTS_DONE],
+                 CERTS_LOG, CERTS_SCRIPT, CERTS_DONE] + domains,
                 cwd=APP_DIR,
                 env=dict(os.environ, HOME="/root", DEBIAN_FRONTEND="noninteractive"),
                 stdout=subprocess.DEVNULL,
@@ -2135,7 +2156,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             return self._send(500, {"error": "failed to start the certificate run",
                                     "detail": str(exc)})
-        return self._send(200, {"status": "started", "domain": domain})
+        return self._send(200, {"status": "started", "domain": domain, "domains": domains})
 
     def _do_firewall(self):
         """GET: the rule table. POST: save the user's rules and apply them —

@@ -22,7 +22,7 @@ nothing to install. The idle process uses roughly 12–18 MB of RAM.
 | GET        | `/apps`        | yes  | any        | The `installed_apps.json` list of installed apps, each with `service` (its `systemctl is-active` state) and `backup` (whether `<apps dir>/<name>_backup` exists). |
 | POST       | `/app`         | yes  | restricted | Run an operation on one installed app through `app_ops.sh`: `start`, `stop`, `backup`, `update`, `rollback` or `uninstall`. Answers when it is done — except `update`, which runs in the background. |
 | GET        | `/app-log`     | yes  | any        | The current (or last) app update: `{name, started_at, log, finished, returncode}`. Poll it (~every 2s) to follow one. |
-| POST       | `/certs`       | yes  | any        | Start a Let's Encrypt run for a domain: obtain or renew, point every installed app at it, restart them. Returns once the job is spawned. |
+| POST       | `/certs`       | yes  | any        | Start a Let's Encrypt run for one domain or several: obtain or renew each, point the apps at it, restart them. Returns once the job is spawned. |
 | GET        | `/certs-log`   | yes  | any        | The current (or last) certificate run: `{domain, log, finished, returncode}`. Poll it (~every 2s) to follow one. |
 | GET        | `/info`        | yes  | any        | The upplet itself: OS, kernel, arch, uptime, memory, disk, this agent's commit, installed versions of the supported dependencies, and the firewall's rules. |
 
@@ -78,6 +78,13 @@ Takes `{"domain": "chat.example.com"}` and launches `certs.sh domain <domain>`,
 which obtains a Let's Encrypt certificate for that name (or renews the existing
 one if it is due), writes `TLS_CERT_PATH` and `TLS_KEY_PATH` into every installed
 app's `/etc/<name>.env`, and restarts each service.
+
+`{"domains": ["chat.example.com", "www.example.com"]}` (or `"domain"` with the
+names comma-separated) runs `certs.sh domain` for each, one after another, in
+the same job and log. Each name gets a certificate of its own, so one whose DNS
+is not ready yet fails alone: the others are still issued, and the run ends
+failed, naming it. Behind Nginx each certificate goes to the sites for that
+name; apps that serve themselves take the one run last.
 
 A job, not a request. Issuing a first certificate installs certbot before it does
 anything else, which takes minutes — longer than a caller will hold a connection
