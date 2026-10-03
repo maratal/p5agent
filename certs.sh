@@ -245,11 +245,15 @@ else
     AUTH=(--standalone)
 fi
 
-# The http-01 challenge is answered on port 80. firewall.sh opens it on new
-# upplets; an upplet provisioned before that still has it closed, and certbot
-# would fail with a timeout that says nothing about the firewall.
+# The http-01 challenge is answered on port 80, which a new upplet keeps
+# closed: it is opened here, for the challenge. Once a certificate is renewed
+# here, firewall.sh counts 80 as built-in and it stays open. If this run ends
+# without one (the request failed), --close takes it away again — unless
+# something else still needs it, which --close leaves open.
 if command -v ufw >/dev/null 2>&1; then
-    bash "$(dirname "$0")/firewall.sh" >/dev/null 2>&1 || true   # 80 is one of its managed rules
+    FIREWALL="$(cd "$(dirname "$0")" && pwd)/firewall.sh"
+    bash "$FIREWALL" --open 80/tcp "ACME http-01 (certificates)" >/dev/null 2>&1 || true
+    trap 'bash "$FIREWALL" --close 80/tcp >/dev/null 2>&1 || true' EXIT
     ok "Port 80 open for the ACME challenge"
 fi
 

@@ -14,16 +14,24 @@
 #                               ({"rules": [{port, proto, from, raw?}]}) — only
 #                               the difference is applied, removals first, so
 #                               a changing rule is briefly closed, never open
+#   firewall.sh --open <port>[/tcp|udp] [label]
+#                               allow that port from anywhere if it has no rule
+#                               yet (a restriction set in Firewall Settings
+#                               stays) — for a port needed before anything on
+#                               disk makes it built-in (80 for a first
+#                               certificate)
 #   firewall.sh --close <port>[/tcp|udp]
 #                               remove every rule for that port — unless it is
 #                               still a built-in port (an app uses it)
 #
-# Built-in ports: SSH (22), the agent (5005), 80 (ACME http-01, Nginx's
-# redirect), the static site's port when Nginx serves /var/www/html with no app
-# behind it, and each installed app's port — its public-port when it is behind
-# Nginx. On a Squid upplet (squid.sh), which never has Nginx, the proxy
-# port is built-in instead of 80: Setup Squid closes 80 and nothing here opens
-# it again. They can be restricted to addresses but not removed. Any list of
+# Built-in ports — the ports what is installed needs, and only while it is
+# installed, so an uninstall can --close them: SSH (22) and the agent (5005)
+# always; 80 while Nginx is set up (its ACME site) or a Let's Encrypt
+# certificate is renewed here (certbot's renewal config); the static site's
+# port while Nginx serves /var/www/html; the proxy port while squid.sh has it
+# set up; and each installed app's port — its public-port when it is behind
+# Nginx. A new upplet has SSH and the agent only. They can be restricted to
+# addresses but not removed. Any list of
 # addresses always includes the dashboard's (P5AGENT_ALLOW_IP, and the address
 # the agent received the request from): it drives the agent and probes every app.
 
@@ -42,12 +50,12 @@ PORT="$(getenvval P5AGENT_PORT)";          PORT="${PORT:-5005}"
 DATA_DIR="$(getenvval P5AGENT_DATA_DIR)";   DATA_DIR="${DATA_DIR:-/var/lib/p5agent}"
 
 case "${1:-}" in
-    ""|--plan|--set|--close) ;;
-    *) echo "usage: firewall.sh [--plan | --set <file> | --close <port>[/proto]]" >&2; exit 2 ;;
+    ""|--plan|--set|--open|--close) ;;
+    *) echo "usage: firewall.sh [--plan | --set <file> | --open <port>[/proto] [label] | --close <port>[/proto]]" >&2; exit 2 ;;
 esac
 
 exec python3 - "$DATA_DIR/installed_apps.json" "$PORT" "$(getenvval P5AGENT_ALLOW_IP)" "$@" <<'PY'
-import ipaddress, json, os, re, subprocess, sys
+import glob, ipaddress, json, os, re, subprocess, sys
 
 installed, agent_port, allow_ip = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 args = sys.argv[4:]
@@ -120,16 +128,30 @@ def static_site_port():
     m = re.search(r"^\s*listen\s+(\d+)\s+ssl", conf, re.M)
     return int(m.group(1)) if m else None
 
+def acme_users():
+    """Who needs port 80: Nginx (nginx.sh's ACME site — the challenges and the
+    redirect to https) and Let's Encrypt renewals (certs.sh) — as a label,
+    or "" when nothing does."""
+    who = []
+    if os.path.exists("/etc/nginx/sites-available/p5-acme.conf"):
+        who.append("Nginx")
+    if glob.glob("/etc/letsencrypt/renewal/*.conf"):
+        who.append("certificates")
+    return " / ".join(who)
+
 def builtin():
     rows = {(22, "tcp"): "SSH", (agent_port, "tcp"): "p5agent"}
+    def put(k, label):
+        rows[k] = rows[k] + ", " + label if k in rows else label
+    acme = acme_users()
+    if acme:
+        put((80, "tcp"), "ACME http-01 (%s)" % acme)
     site = static_site_port()
     if site:
-        rows[(site, "tcp")] = "static site (nginx)"
+        put((site, "tcp"), "static site (nginx)")
     proxy = squid_port()
     if proxy:
-        rows[(proxy, "tcp")] = "Squid proxy"
-    else:
-        rows[(80, "tcp")] = "ACME http-01 / Nginx"
+        put((proxy, "tcp"), "Squid proxy")
     try:
         apps = json.load(open(installed))
     except Exception:
@@ -137,9 +159,7 @@ def builtin():
     for a in apps:
         p = str(a.get("public-port") or a.get("port") or "443").strip()
         if p.isdigit():
-            k = (int(p), "tcp")
-            label = str(a.get("name") or "app") + (" (nginx)" if a.get("public-port") else "")
-            rows[k] = rows[k] + ", " + label if k in rows else label
+            put((int(p), "tcp"), str(a.get("name") or "app") + (" (nginx)" if a.get("public-port") else ""))
     return rows
 
 # ── What ufw has ──────────────────────────────────────────────────────────────
@@ -214,6 +234,19 @@ if mode == "--plan":
     for r in raw:
         rows.append({"raw": r, "label": "added by hand", "managed": False})
     print(json.dumps({"rules": rows, "agent_port": agent_port, "dashboard": dashboard}))
+    sys.exit(0)
+
+# ── open ──────────────────────────────────────────────────────────────────────
+if mode == "--open":
+    spec = (args[1] if len(args) > 1 else "").split("/")
+    if not spec[0].isdigit() or not 1 <= int(spec[0]) <= 65535:
+        fail("usage: firewall.sh --open <port>[/tcp|udp] [label]")
+    k = (int(spec[0]), spec[1] if len(spec) > 1 else "tcp")
+    groups, _ = current()
+    if k in groups:
+        say("✓", "Port %s/%s keeps its rules" % k)
+    else:
+        add(k, "any", args[2] if len(args) > 2 else "custom")
     sys.exit(0)
 
 # ── close ─────────────────────────────────────────────────────────────────────

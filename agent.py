@@ -527,19 +527,31 @@ def utility_version(name):
     return m.group(1) if m else ""
 
 
-def nginx_in_use():
-    """Why this upplet counts as an Nginx one — an app behind Nginx, or Nginx
-    running — or "" when it does not. Squid and Nginx do not share an upplet:
-    a proxy upplet's firewall is SSH, the agent and the proxy port only."""
+def ports_given_out():
+    """{port: who} for every port the upplet has handed out, whether or not
+    something listens on it right now (a stopped service still owns its
+    port): each app's own port, its public-port behind Nginx, the static
+    site's, and Squid's proxy port."""
     try:
         apps = json.loads(read_file(INSTALLED_APPS) or "[]")
     except ValueError:
         apps = []
-    wired = [str(a.get("name")) for a in apps if isinstance(a, dict) and a.get("public-port")]
-    if wired:
-        return "%s %s behind Nginx" % (", ".join(wired), "is" if len(wired) == 1 else "are")
-    rc, _ = run(["systemctl", "is-active", "--quiet", "nginx"])
-    return "Nginx is running" if rc == 0 else ""
+    out = {}
+    for a in apps if isinstance(apps, list) else []:
+        if not isinstance(a, dict):
+            continue
+        name = str(a.get("name") or "an app")
+        for key, who in (("port", name), ("public-port", "Nginx (serving %s)" % name)):
+            value = str(a.get(key) or "").strip()
+            if value.isdigit():
+                out.setdefault(int(value), who)
+    site = static_site_port()
+    if site:
+        out.setdefault(site, "Nginx (the static site)")
+    squid = squid_current()
+    if squid and squid.get("port"):
+        out.setdefault(squid["port"], "Squid")
+    return out
 
 
 def squid_whitelist_domains(text):
@@ -1222,8 +1234,10 @@ def squid_install(req):
         bad = [d for d in domains if len(d) > 253 or not SQUID_DOMAIN_RE.match(d)]
         if bad:
             raise InstallRefused(400, "not a domain name: %s" % bad[0])
-    if nginx_in_use():
-        raise InstallRefused(409, "Nginx and Squid can't be installed on the same upplet")
+    # Never on a port something else on the upplet has, running or not.
+    owner = ports_given_out().get(port)
+    if owner and owner != "Squid":
+        raise InstallRefused(409, "port %d is already used by %s" % (port, owner))
     holder = listening_ports().get(port)
     if holder and holder != "squid":
         raise InstallRefused(409, "port %d is in use by %s" % (port, holder))
@@ -1281,8 +1295,6 @@ def nginx_install(req):
     <app> <port> …); without "domain" it keeps the one it has.
     {"static": true, "port", "domain"?}: no app at all — Nginx serves
     /var/www/html (nginx.sh install static <port>)."""
-    if squid_current():
-        raise InstallRefused(409, "Nginx and Squid can't be installed on the same upplet")
     # No app in front of it: Nginx serves /var/www/html itself.
     if req.get("static") is True:
         port = req.get("port")
@@ -2236,7 +2248,6 @@ class Handler(BaseHTTPRequestHandler):
                 "whitelist": domains or squid_whitelist_domains(read_file(SQUID_WHITELIST)),
                 "whitelistSource": "upplet" if domains else "template",
                 "current": current,
-                "nginx": nginx_in_use() or None,     # set: Setup Squid is refused here
             })
 
         # POST: an install of Squid, like /install-util squid.

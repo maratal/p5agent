@@ -52,7 +52,9 @@
 #                                     their private port), with the certificate
 #                                     Nginx used — then Nginx is stopped, disabled
 #                                     and its package removed (its config and
-#                                     /etc/nginx/p5 certificates stay)
+#                                     /etc/nginx/p5 certificates stay). Its
+#                                     ports close: the static site's, and 80
+#                                     unless a certificate is renewed here
 #
 # The layout it builds is the usual one:
 #
@@ -917,6 +919,12 @@ do_static() {
     [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || fail "Not a port: $port"
     (( port != AGENT_PORT )) || fail "Port $port is the agent's"
     (( port != 80 )) || fail "Port 80 answers certificate challenges and redirects to https"
+    # The port it is served on now: closed below if the site moves off it.
+    local old_port; old_port=$(static_port)
+    if [[ "$port" != "$old_port" ]]; then
+        local holder; holder=$(listener_on "$port")
+        [[ -z "$holder" || "$holder" == nginx ]] || fail "Something is already listening on port $port ($holder)"
+    fi
 
     # An app served on that port for the same name (or both without one) would
     # lose it: two default_servers on one port do not load.
@@ -1009,6 +1017,13 @@ CONF
     if command -v ufw >/dev/null 2>&1; then
         bash "$ROOT/firewall.sh" >/dev/null 2>&1 || true
         ok "Firewall: port $port is open"
+        # The port it moved off: --close leaves it if an app is served there.
+        if [[ -n "$old_port" && "$old_port" != "$port" ]]; then
+            bash "$ROOT/firewall.sh" --close "$old_port/tcp" >/dev/null 2>&1 || true
+            port_used_by_others "$old_port" static \
+                && ok "Firewall: $old_port stays open — other sites are served there" \
+                || ok "Firewall: $old_port closed — the static site is served on $port now"
+        fi
     fi
 
     local code
@@ -1198,6 +1213,7 @@ PY
         fi
     done <<< "$rows"
 
+    local static_was; static_was=$(static_port)
     if [[ -f "$SITES/$STATIC_SITE" ]]; then
         rm -f "$SITES/$STATIC_SITE" "$ENABLED/$STATIC_SITE"
         ok "The static site is gone — its files stay in $SITE_ROOT"
@@ -1211,8 +1227,19 @@ PY
             || apt-get -o DPkg::Lock::Timeout=120 -qq remove -y nginx >/dev/null 2>&1 || true
         command -v nginx >/dev/null 2>&1 && warn "Nginx is still installed" || ok "Nginx removed"
     fi
-    # Built-in ports are the apps' own now (and 80, for certificates).
-    command -v ufw >/dev/null 2>&1 && { bash "$ROOT/firewall.sh" >/dev/null 2>&1 || true; ok "Firewall: the apps' ports are open"; }
+    # Built-in ports are the apps' own now. Nginx's own are nobody's: the
+    # static site's (unless an app serves itself there again) and 80 (unless a
+    # certificate is renewed here) — --close leaves a port something still uses.
+    if command -v ufw >/dev/null 2>&1; then
+        bash "$ROOT/firewall.sh" >/dev/null 2>&1 || true
+        ok "Firewall: the apps' ports are open"
+        local p out
+        for p in $static_was 80; do
+            out=$(bash "$ROOT/firewall.sh" --close "$p/tcp" 2>&1 || true)
+            if [[ "$out" == *"stays open"* ]]; then ok "Firewall: $p stays open — ${out##*— }"
+            else ok "Firewall: $p closed"; fi
+        done
+    fi
     (( failed == 0 )) || fail "Nginx is gone, but not every app came back — see above"
     done_ "Done — Nginx removed"
 }
