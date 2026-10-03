@@ -211,7 +211,9 @@ curl -X POST "https://<ip>:5005/install-util" -H "Authorization: Bearer $TOKEN" 
      -H "Content-Type: application/json" \
      -d '{"name": "nginx", "public_port": 443, "bots": true,
           "sites": [{"app": "chatserver", "port": 0, "domain": ""},
-                    {"app": "blog", "port": 0, "domain": "blog.example.com"}]}'
+                    {"app": "blog", "port": 0, "domain": "blog.example.com"},
+                    {"static": true, "domain": "www.example.com"}]}'
+# ({"static": true, …} among them: the static site, /var/www/html, on the same port.)
 
 # The static site (no app at all), optionally for one domain
 curl -X POST "https://<ip>:5005/install-util" -H "Authorization: Bearer $TOKEN" \

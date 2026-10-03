@@ -1274,7 +1274,8 @@ def nginx_install(req):
     behind it already, a change of how they are served.
 
     {"sites": [{app, port, domain}…], public_port, bots, fail2ban}: several
-    apps on one public port, told apart by domain (nginx.sh install sites).
+    apps on one public port, told apart by domain (nginx.sh install sites);
+    {static: true, domain} among them is the static site (/var/www/html).
     {"app", "port", "domain"?, "public_port"?, …}: one app (nginx.sh install
     <app> <port> …); without "domain" it keeps the one it has.
     {"static": true, "port", "domain"?}: no app at all — Nginx serves
@@ -1324,9 +1325,23 @@ def nginx_install(req):
         public = req.get("public_port")
         public = None if public is None else nginx_port_arg(public, "public_port")
         entries, seen, ports, domains, defaults = [], set(), set(), set(), 0
+        static = None       # the static site's domain, when it is in the list
         for site in sites:
             if not isinstance(site, dict):
-                raise InstallRefused(400, "each site is {app, port, domain}")
+                raise InstallRefused(400, "each site is {app, port, domain} or {static: true, domain}")
+            if site.get("static") is True:
+                if static is not None:
+                    raise InstallRefused(400, "the static site is listed twice")
+                static = nginx_domain(site.get("domain"), "the static site")
+                if public is not None:
+                    if not static:
+                        defaults += 1
+                        if defaults > 1:
+                            raise InstallRefused(400, "only one site on port %d can go without a domain" % public)
+                    elif static in domains:
+                        raise InstallRefused(400, "%s is given twice" % static)
+                    domains.add(static)
+                continue
             app, port = str(site.get("app") or ""), site.get("port")
             check_app(app, port)
             domain = nginx_domain(site.get("domain"), app)
@@ -1346,8 +1361,12 @@ def nginx_install(req):
                     raise InstallRefused(400, "%s is given to two apps" % domain)
                 domains.add(domain)
             entries.append("%s:%d:%s" % (app, port, domain))
-        args = ["sites"] + (["--public", str(public)] if public is not None else []) + flags + entries
-        summary = "in front of %s%s" % (", ".join(sorted(seen)), " on port %d" % public if public is not None else "")
+        args = ["sites"] + (["--public", str(public)] if public is not None else []) + flags
+        if static is not None:
+            args += ["--static", static]
+        args += entries
+        served = sorted(seen) + (["the static site"] if static is not None else [])
+        summary = "in front of %s%s" % (", ".join(served), " on port %d" % public if public is not None else "")
         return args, {}, [], summary
 
     app, port = str(req.get("app") or ""), req.get("port")

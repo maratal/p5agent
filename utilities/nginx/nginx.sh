@@ -21,12 +21,14 @@
 #                                     below; leaving a flag out on a re-run
 #                                     turns that protection off again
 #   nginx.sh install sites [--public <port>] [--bots] [--fail2ban]
-#                          <name>:<app-port>[:<domain>] …
+#                          [--static <domain>] <name>:<app-port>[:<domain>] …
 #                                     the same for several apps at once, all
 #                                     on one public port (each keeps its own
 #                                     when --public is left out), each with
 #                                     its own domain — what the dashboard's
-#                                     Install / Setup Nginx send
+#                                     Install / Setup Nginx send. --static:
+#                                     the static site too, on the same port
+#                                     ("" for no domain: the default)
 #   nginx.sh static [port] [--domain <name>]
 #                                     no app in front: Nginx serves the files in
 #                                     /var/www/html over HTTPS on [port] (443 by
@@ -460,7 +462,41 @@ open(path, "w").write("\n".join(out) + "\n")
 PY
 }
 
+# policy-rc.d answering 101 ("action forbidden") keeps packages from starting
+# their services while they install. Only a file this script wrote is removed.
+POLICY_RC=/usr/sbin/policy-rc.d
+POLICY_MARK="# p5agent nginx.sh — services start after install"
+no_service_starts() {
+    [[ -e "$POLICY_RC" ]] && return 0          # someone else's: leave it be
+    printf '#!/bin/sh\n%s\nexit 101\n' "$POLICY_MARK" > "$POLICY_RC"
+    chmod 755 "$POLICY_RC"
+    trap allow_service_starts EXIT
+}
+allow_service_starts() {
+    grep -qsF "$POLICY_MARK" "$POLICY_RC" && rm -f "$POLICY_RC"
+    return 0
+}
+
+# Port 80 is Nginx's or nobody's — anything else on it would only show up
+# later, as Nginx failing to start.
+port80_free() {
+    local holder; holder=$(listener_on 80)
+    [[ -z "$holder" || "$holder" == nginx ]] \
+        || fail "Port 80 is held by $holder — Nginx needs it for certificates and the redirect to HTTPS. Stop $holder or move it off port 80 first"
+}
+
 install_nginx() {
+    # Nginx needs port 80 (certificates, the redirect). Said before apt runs:
+    # the package's own first start on 80 would fail and leave apt broken.
+    port80_free
+    # A package left half-configured by an earlier run: finish it first.
+    if command -v dpkg >/dev/null 2>&1 && dpkg --audit 2>/dev/null | grep -q .; then
+        log "Finishing an interrupted package install first"
+        no_service_starts
+        dpkg --configure -a 2>&1 | tail -n 20
+        apt-get -o DPkg::Lock::Timeout=120 -qq -f install -y || warn "apt could not fix the broken packages (above)"
+        allow_service_starts
+    fi
     if command -v nginx >/dev/null 2>&1; then
         ok "Nginx is installed ($(nginx -v 2>&1 | sed 's/^.*: //'))"
     else
@@ -470,10 +506,26 @@ install_nginx() {
         # only) — when it fails, they are the reason, and the install's log
         # is where anyone will look for it.
         apt-get -o DPkg::Lock::Timeout=120 -qq update || warn "The package lists could not be refreshed"
-        # Installing starts it on port 80 with the stock site; that is replaced
-        # below. A start that fails there (80 taken) fails the package's own
-        # setup, but the binary is in place — which is what counts here.
-        apt-get -o DPkg::Lock::Timeout=120 -qq install -y nginx || warn "apt reported a problem installing nginx (above)"
+        # The package would start Nginx on port 80 with its stock site. When
+        # that start fails (80 taken), dpkg leaves the package half-configured
+        # and every later apt run stops at "Unmet dependencies". So services
+        # are kept from starting while it installs (policy-rc.d); this script
+        # starts Nginx itself once its own sites are written.
+        no_service_starts
+        if ! apt-get -o DPkg::Lock::Timeout=120 -qq install -y nginx; then
+            # A half-done install from before (this one's or another's) is what
+            # usually stands in the way: finish it, then try again.
+            warn "apt could not install nginx — finishing interrupted installs and fixing dependencies, then trying again"
+            dpkg --configure -a 2>&1 | tail -n 20
+            apt-get -o DPkg::Lock::Timeout=120 -qq -f install -y || true
+            if ! apt-get -o DPkg::Lock::Timeout=120 -qq install -y nginx; then
+                # -qq says that something is broken, not what: name it.
+                warn "apt reported a problem installing nginx (above). What apt finds broken:"
+                apt-get check 2>&1 | grep -v '^Reading\|^Building' | tail -n 20
+                dpkg --audit 2>&1 | tail -n 20
+            fi
+        fi
+        allow_service_starts
         command -v nginx >/dev/null 2>&1 || fail "Nginx did not install — apt's messages above say why"
         ok "Nginx installed"
     fi
@@ -735,9 +787,9 @@ PY
 # checked as a whole first — one app without a domain per port, no name or
 # private port twice — so a mistake in it changes nothing. Each wire is still
 # all-or-nothing on its own: if one fails, those before it stay done.
-do_sites() {  # do_sites <bots> <f2b> <public|""> <entry>…
-    local bots="$1" f2b="$2" public="$3"; shift 3
-    (( $# )) || fail "No apps to put behind Nginx"
+do_sites() {  # do_sites <bots> <f2b> <public|""> <static: "-" none, else its domain> <entry>…
+    local bots="$1" f2b="$2" public="$3" static="$4"; shift 4
+    (( $# )) || [[ "$static" != - ]] || fail "No apps to put behind Nginx"
     [[ -z "$public" || "$public" =~ ^[0-9]+$ ]] || fail "Not a port: $public"
     local entry name port domain row cur_port cur_public
     local names=" " ports=" " domains=" " defaults=0 first=() named=() plain=()
@@ -772,16 +824,38 @@ do_sites() {  # do_sites <bots> <f2b> <public|""> <entry>…
         elif [[ -n "$domain" ]]; then named+=("$name:$port:$domain")
         else plain+=("$name:$port:$domain"); fi
     done
+    # The static site is one more site on the port, after the apps that
+    # move off it and alongside the others with or without a domain.
+    if [[ "$static" != - ]]; then
+        static="${static,,}"
+        check_domain "$static"
+        if [[ -n "$public" ]]; then
+            if [[ -z "$static" ]]; then
+                defaults=$((defaults + 1))
+                (( defaults == 1 )) || fail "Only one site on port $public can go without a domain — the static site or an app, not both"
+            else
+                [[ "$domains" != *" $static "* ]] || fail "$static is given to the static site and an app"
+            fi
+        fi
+        if [[ -n "$static" ]]; then named+=("%static::$static"); else plain+=("%static::"); fi
+    fi
     local all=("${first[@]}" "${named[@]}" "${plain[@]}") i=0
     for entry in "${all[@]}"; do
         i=$((i + 1))
         IFS=: read -r name port domain <<< "$entry"
+        if [[ "$name" == %static ]]; then
+            (( ${#all[@]} == 1 )) || log "── the static site ($i of ${#all[@]})"
+            # Its port: the shared one, else the one it has, else 443.
+            ( do_static "${public:-$(static_port)}" "$domain" ) \
+                || fail "The static site was not set up$( (( i < ${#all[@]} )) && printf ' — the sites after it were left as they are')"
+            continue
+        fi
         (( ${#all[@]} == 1 )) || log "── $name ($i of ${#all[@]})"
         # A subshell: wire's fail() ends that wire, then the list stops here.
         ( do_wire "$name" "$port" "$bots" "$f2b" "$public" "$domain" ) \
-            || fail "$name was not put behind Nginx$( (( i < ${#all[@]} )) && printf ' — the apps after it were left as they are')"
+            || fail "$name was not put behind Nginx$( (( i < ${#all[@]} )) && printf ' — the sites after it were left as they are')"
     done
-    (( ${#all[@]} == 1 )) || done_ "Done — Nginx serves ${#all[@]} apps${public:+ on port $public}"
+    (( ${#all[@]} == 1 )) || done_ "Done — Nginx serves ${#all[@]} sites${public:+ on port $public}"
 }
 
 # Put the app back the way it was before a failed wire.
@@ -1170,9 +1244,10 @@ case "${1:-}" in
         fi
         if [[ "${2:-}" == sites ]]; then
             shift 2
-            bots=0 f2b=0 public_port="" entries=()
+            bots=0 f2b=0 public_port="" static_domain="-" entries=()
             while [[ $# -gt 0 ]]; do
                 case "$1" in
+                    --static) [[ $# -ge 2 ]] || fail "--static needs a domain (\"\" for none)"; static_domain="$2"; shift ;;
                     --bots) bots=1 ;;
                     --fail2ban) f2b=1 ;;
                     --public) [[ $# -ge 2 ]] || fail "--public needs a port"; public_port="$2"; shift ;;
@@ -1181,7 +1256,7 @@ case "${1:-}" in
                 esac
                 shift
             done
-            do_sites "$bots" "$f2b" "$public_port" "${entries[@]}"
+            do_sites "$bots" "$f2b" "$public_port" "$static_domain" "${entries[@]}"
             exit $?
         fi
         [[ $# -ge 3 ]] || fail "usage: nginx.sh install <name> <app-port> [--public <port>] [--domain <name>] [--bots] [--fail2ban]"
