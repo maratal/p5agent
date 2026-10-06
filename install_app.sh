@@ -170,17 +170,18 @@ else:
 PY
 }
 
+# DigitalOcean password-auth droplets flag root's password "must change on
+# first login". That makes PAM abort chfn/adduser inside package postinst
+# scripts (notably postgresql) with "authentication token is no longer valid",
+# failing the whole apt step. Reset root's last-change date so those
+# service-user setups succeed — always, not only for the dependencies here:
+# the app's own install script may apt-install such packages itself.
+runlog "chage -d \"\$(date +%F)\" root || true"
+
 app_services=""   # systemd units of service deps (postgres, redis, …) the app needs
 if (( ${#DEPS[@]} == 0 )); then
     logline "No dependencies requested"
 else
-    # DigitalOcean password-auth droplets flag root's password "must change on
-    # first login". That makes PAM abort chfn/adduser inside package postinst
-    # scripts (notably postgresql) with "authentication token is no longer
-    # valid", failing the whole apt step. Reset root's last-change date so those
-    # service-user setups succeed.
-    runlog "chage -d \"\$(date +%F)\" root || true"
-
     logline "Updating package lists"
     runlog "apt-get update -qq"
     for dep in "${DEPS[@]}"; do
