@@ -2226,6 +2226,25 @@ class Handler(BaseHTTPRequestHandler):
         """Return the supported dependencies registry."""
         return self._send_raw(200, read_file(SUPPORTED_DEPS) or "[]", "application/json")
 
+    @staticmethod
+    def _app_database(app):
+        """The app's database type — postgresql, mysql, mariadb, sqlite — or
+        "": from its dependencies ("postgresql 16" counts), else from the
+        DATABASE_URL in /etc/<name>.env, which an app with an installer of its
+        own may set up without listing the database as a dependency."""
+        types = ("postgresql", "mysql", "mariadb", "sqlite")
+        for dep in app.get("dependencies") or []:
+            word = str(dep).split()[0].lower() if str(dep).strip() else ""
+            if word in types:
+                return word
+        name = str(app.get("name") or "")
+        for line in read_file("/etc/%s.env" % name).splitlines() if re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name) else []:
+            if line.startswith("DATABASE_URL="):
+                scheme = line.split("=", 1)[1].strip().strip("\"'").split(":", 1)[0].lower()
+                return {"postgres": "postgresql", "postgresql": "postgresql", "mysql": "mysql",
+                        "mariadb": "mariadb", "sqlite": "sqlite", "sqlite3": "sqlite"}.get(scheme, "")
+        return ""
+
     def _do_apps(self):
         """Return the installed apps list, each with its service state and
         whether a backup to roll back to exists."""
@@ -2240,6 +2259,7 @@ class Handler(BaseHTTPRequestHandler):
             _, state = run(["systemctl", "is-active", name])
             app["service"] = state.strip() or "unknown"
             app["backup"] = os.path.isdir(os.path.join(APPS_DIR, name + "_backup"))
+            app["database"] = self._app_database(app)
         return self._send(200, apps)
 
     def _do_app(self):
