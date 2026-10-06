@@ -2229,20 +2229,42 @@ class Handler(BaseHTTPRequestHandler):
     @staticmethod
     def _app_database(app):
         """The app's database type — postgresql, mysql, mariadb, sqlite — or
-        "": from its dependencies ("postgresql 16" counts), else from the
-        DATABASE_URL in /etc/<name>.env, which an app with an installer of its
-        own may set up without listing the database as a dependency."""
+        "": from its dependencies ("postgresql 16" counts), else from its
+        /etc/<name>.env — an app with an installer of its own sets its
+        database up without listing it as a dependency. The env file says it
+        by DATABASE_URL, DATABASE_PATH (SQLite), or — as ChatServer's
+        installer writes it — DATABASE_NAME/HOST alone, whose type is told by
+        DATABASE_PORT or by the database server installed here."""
         types = ("postgresql", "mysql", "mariadb", "sqlite")
         for dep in app.get("dependencies") or []:
             word = str(dep).split()[0].lower() if str(dep).strip() else ""
             if word in types:
                 return word
         name = str(app.get("name") or "")
-        for line in read_file("/etc/%s.env" % name).splitlines() if re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name) else []:
-            if line.startswith("DATABASE_URL="):
-                scheme = line.split("=", 1)[1].strip().strip("\"'").split(":", 1)[0].lower()
-                return {"postgres": "postgresql", "postgresql": "postgresql", "mysql": "mysql",
-                        "mariadb": "mariadb", "sqlite": "sqlite", "sqlite3": "sqlite"}.get(scheme, "")
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name):
+            return ""
+        env = {}
+        for line in read_file("/etc/%s.env" % name).splitlines():
+            key, sep, value = line.strip().partition("=")
+            if sep and not key.startswith("#"):
+                env[key.strip()] = value.strip().strip("\"'")
+        scheme = env.get("DATABASE_URL", "").split(":", 1)[0].lower()
+        found = {"postgres": "postgresql", "postgresql": "postgresql", "mysql": "mysql",
+                 "mariadb": "mariadb", "sqlite": "sqlite", "sqlite3": "sqlite"}.get(scheme, "")
+        if found:
+            return found
+        if env.get("DATABASE_PATH"):
+            return "sqlite"
+        if env.get("DATABASE_NAME") or env.get("DATABASE_HOST"):
+            port = env.get("DATABASE_PORT", "")
+            if port == "5432":
+                return "postgresql"
+            if port == "3306":
+                return "mysql"
+            if os.path.isdir("/etc/postgresql") or shutil.which("pg_dump"):
+                return "postgresql"
+            if os.path.isdir("/etc/mysql") or shutil.which("mysqldump"):
+                return "mysql"
         return ""
 
     def _do_apps(self):

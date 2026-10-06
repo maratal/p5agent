@@ -284,6 +284,33 @@ def gunzip(archive, dest):
 
 # ── what an app is made of (both sides) ──────────────────────────────────────
 
+def env_db_type(env):
+    """The database type an app's env file points at, or "": DATABASE_URL's
+    scheme; else DATABASE_PATH (SQLite); else DATABASE_NAME/HOST — the
+    fields ChatServer's own installer writes, with no URL — by DATABASE_PORT,
+    or by which database server is installed here."""
+    url = env.get("DATABASE_URL", "")
+    if url:
+        scheme = urllib.parse.urlsplit(url).scheme.lower()
+        found = {"postgres": "postgresql", "postgresql": "postgresql", "mysql": "mysql",
+                 "mariadb": "mariadb", "sqlite": "sqlite", "sqlite3": "sqlite"}.get(scheme, "")
+        if found:
+            return found
+    if env.get("DATABASE_PATH"):
+        return "sqlite"
+    if env.get("DATABASE_NAME") or env.get("DATABASE_HOST"):
+        port = env.get("DATABASE_PORT", "")
+        if port == "5432":
+            return "postgresql"
+        if port == "3306":
+            return "mysql"
+        if os.path.isdir("/etc/postgresql") or shutil.which("pg_dump"):
+            return "postgresql"
+        if os.path.isdir("/etc/mysql") or shutil.which("mysqldump"):
+            return "mysql"
+    return ""
+
+
 def app_db(app):
     """The app's database as its env file and dependencies describe it:
     {type, name, user, path} (path: SQLite only), or None when it has none."""
@@ -293,10 +320,7 @@ def app_db(app):
     url = env.get("DATABASE_URL", "")
     parsed = urllib.parse.urlsplit(url) if url else None
     scheme = (parsed.scheme if parsed else "").lower()
-    dtype = next((d for d in deps if d in DB_TYPES), "")
-    if not dtype and scheme:
-        dtype = {"postgres": "postgresql", "postgresql": "postgresql", "mysql": "mysql",
-                 "mariadb": "mariadb", "sqlite": "sqlite", "sqlite3": "sqlite"}.get(scheme, "")
+    dtype = next((d for d in deps if d in DB_TYPES), "") or env_db_type(env)
     if not dtype:
         return None
     if dtype == "sqlite":
