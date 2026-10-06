@@ -884,9 +884,9 @@ class Import:
         if squid:
             self.receive("squid", "Squid's credentials and whitelist")
         self.release(True)
-        # The copy's turning point, in blue: the dashboard's log window shows
-        # ANSI colours, and so does a terminal.
-        logline("\x1b[34m✓ Everything is here — %s is no longer involved\x1b[39m" % self.src)
+        # The copy's turning point, in bold blue like the scripts' own steps
+        # (the log window shows ANSI colours, and so does a terminal).
+        logline("\x1b[1;34m✓ Everything is here — %s is no longer involved\x1b[0m" % self.src)
 
     def receive(self, item, what, said=False):
         """One archive from the copied upplet, into this run's folder."""
