@@ -25,6 +25,10 @@ nothing to install. The idle process uses roughly 12–18 MB of RAM.
 | POST       | `/certs`       | yes  | any        | Start a Let's Encrypt run for one domain or several: obtain or renew each, point the apps at it, restart them. Returns once the job is spawned. |
 | GET        | `/certs-log`   | yes  | any        | The current (or last) certificate run: `{domain, log, finished, returncode}`. Poll it (~every 2s) to follow one. |
 | GET        | `/info`        | yes  | any        | The upplet itself: OS, kernel, arch, uptime, memory, disk, this agent's commit, installed versions of the supported dependencies, and the firewall's rules. |
+| GET / POST | `/copy-inventory` | yes | any      | Copy's calculation stage, on the upplet to be copied: disk in use, each app's database size and a guess at its archive (nothing is dumped). A job: POST starts it, GET follows it. |
+| POST       | `/copy-key`    | yes  | any        | Let another upplet copy this one: `{key, peer}` — kept in memory only, gone 5 minutes after its last use. `{revoke: true}` ends it. |
+| POST       | `/copy-start`  | yes  | any        | On the new upplet: copy `{source, key, …}` here — an install (lock, `/progress`, `setup.log`) named `copy`. |
+| GET / POST | `/copy/…`      | copy key | the granted peer | What the new upplet's agent fetches from the copied one: `manifest`, `file`, `done`. |
 
 ### `/update`
 
@@ -236,6 +240,79 @@ before anything changes. A certificate from `/certs` goes to the sites whose
 domain it is for, and to the sites without a domain when it is for none of
 them. An app's `/apps` entry carries `nginx-domain` while it has one.
 
+### Copy (`/copy-inventory`, `/copy-key`, `/copy-start`, `/copy/…`)
+
+The dashboard's New Upplet → Copy makes a new upplet a copy of another. The
+two agents do the work between themselves — every byte goes from agent to
+agent — and `copy_upplet.py` holds all of it.
+
+**Read-only for the copied upplet.** A copy reads its files and databases and
+writes nothing there but logs: the calculation's (`copy_inventory.log`) and the
+agent's own. The key and everything the grant records live in the agent's
+memory; the archives are made as they are sent, straight into the reply; and
+its firewall is never touched.
+
+1. **Calculation stage** (before anything is created): `POST /copy-inventory
+   {apps}` on the upplet to be copied runs `copy_upplet.py inventory`: disk in
+   use, and for each app its database's size as the database reports it
+   (`pg_database_size`, `information_schema`, the SQLite file) with a rough
+   guess at its archive (30% of that) — nothing is dumped. It also reads the
+   firewall: an agent port open to listed addresses only would shut the new
+   upplet out, so the calculation fails then. Its state lives in the agent;
+   its output is its log, the last line the result as JSON, which `GET
+   /copy-inventory` hands back. The dashboard refuses a copy whose disk in use
+   is more than the new upplet's disk ("Not enough space on the new upplet"),
+   and asks before going on when the databases come to more than 1 GB.
+2. **Keys**: once the new upplet's agent answers, the dashboard checks both
+   upplets' disks again (`/info`), makes a one-off key and gives it to both:
+   `POST /copy-key {key, peer: <new upplet's IP>}` on the copied one, which
+   keeps the grant in its memory only — the key's sha256, never on disk — and
+   drops it 5 minutes after its last use (or at `/copy/done`, `{revoke:
+   true}`, or a restart). The grant snapshots the firewall table and
+   `P5AGENT_ALLOW_IP` (what gets copied). It is refused when the agent port is
+   open to listed addresses only and the new upplet's is not one of them. Then `POST
+   /copy-start {source, key, source_name, target_name, apps, nginx, squid}` on
+   the new one.
+3. **Copy**: the new upplet's agent runs `copy_upplet.py import` as an install
+   (app name `copy`). It first fetches everything it needs from the copied
+   agent's `/copy/…` endpoints with the key — accepted only from the granted
+   address — and then lets the copied upplet go, so the grant is in use for
+   minutes, not for as long as the apps take to install:
+   - `GET /copy/manifest` — each app's install request (repo, branch and token
+     from its git checkout, type, command, ports, dependencies), its database
+     and Nginx settings, Squid, the static site, and the snapshot;
+   - `GET /copy/file?item=` — one archive, made by `copy_upplet.py stream` as
+     it is sent: `db:<app>` (the database dumped and gzipped: `pg_dump -Fc`,
+     `mysqldump`, or SQLite's SQL dump in one read transaction),
+     `config:<app>` (`/etc/<app>.env`, `/etc/<app>/` without its certs, and
+     the app's untracked `.env` files), `site` (`/var/www/html`),
+     `letsencrypt`, `squid` (passwd and whitelist) — gzipped tars. Its length
+     is not known ahead, so the reply ends with the connection; one that
+     fails part-way stops before its gzip end, and the new upplet refuses it
+     as incomplete;
+   - `POST /copy/done` — the key is dropped.
+
+   **Busy.** While either upplet is in a copy — the grant is live on the
+   copied one, the copy install runs on the new one — its agent refuses every
+   request that installs, sets up, changes or removes something (`/update`,
+   `/install-app`, `/install-util`, `/squid`, `/app`, `/utility`, `/firewall`,
+   `/certs`, `/squid-password`, `/static-site`, `/copy-start`, `/copy-key`)
+   with `409 {"error": "busy", "reason": …}`. Reading stays open. The copied
+   upplet is free again as soon as everything is fetched (`/copy/done`).
+
+   In order: the Let's Encrypt certificates; each app installed from scratch
+   (`install_app.sh` with `P5AGENT_NESTED=1`, logging into the same
+   `setup.log` and leaving the lock alone), its config files (its env file
+   keeps this upplet's `MGMT_TOKEN`, `PORT`, `HOST` and TLS pair), its
+   database restored; Nginx (`nginx.sh install sites` per public port, the
+   static site and its files); Squid with the same credentials and whitelist;
+   `P5AGENT_ALLOW_IP` merged in (the agent re-reads `/etc/p5agent.env` when it
+   changes — no restart); the firewall rules 1:1 (`firewall.sh --set`); and
+   last, every service the copy needs is checked to be running. The log ends
+   `copy installation completed` (or `failed`). An app behind Nginx on the
+   copied upplet is installed on its private port and put behind Nginx again;
+   when Nginx is not copied, it serves itself on the port Nginx served it on.
+
 ## Authorization
 
 Every request except `/` must carry the shared secret token in the
@@ -278,6 +355,8 @@ certificate (for the droplet's IP) under `/opt/p5agent/certs`.
 | `agent.py` | repo | The HTTP agent. |
 | `update.sh` | repo | Restarts the service to apply a pulled update. |
 | `install_app.sh` | repo | Backgrounded app installer (deps + clone + setup). |
+| `copy_upplet.py` | repo | Copying an upplet: the calculation stage, the archives and manifest on the copied upplet, the import on the new one. |
+| `copy_inventory.log` | data dir | The last calculation stage's log (its result is the last line). Nothing else of a copy is written on the copied upplet. |
 | `install_util.sh` | repo | Backgrounded utility installer: `utilities/<name>/<name>.sh install`, logged like an app install. |
 | `app_support/common.sh` | repo | Helpers shared by `install_app.sh` and `app_ops.sh`: `create_service`, and `app_version_line` (asks the app's `/api/info` which version is running — logged at the end of an install, an update and a rollback). |
 | `app_ops.sh` | repo | Start, stop, back up, update, roll back or uninstall one installed app; run by `/app`. |

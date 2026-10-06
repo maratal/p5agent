@@ -41,7 +41,10 @@ logline()  { printf '[%s] %s\n' "$(ts)" "$*" >> "$SETUP_LOG"; }
 stamp()    { while IFS= read -r line; do printf '[%s] %s\n' "$(ts)" "$line"; done >> "$SETUP_LOG"; }
 runlog()   { bash -c "$1" 2>&1 | stamp; return "${PIPESTATUS[0]}"; }
 
-fail() { logline "$*"; logline "${name:-app} installation failed"; rm -f "$PENDING"; exit 1; }
+# P5AGENT_NESTED=1: run as one step of a copy (copy_upplet.py import), which
+# holds the install lock and writes the completion marker itself — so the lock
+# is left alone and the last line is not the marker.
+fail() { logline "$*"; logline "${name:-app} installation failed"; [[ -n "${P5AGENT_NESTED:-}" ]] || rm -f "$PENDING"; exit 1; }
 
 # create_service — shared with app_ops.sh (an update rebuilds the same way).
 # shellcheck source=app_support/common.sh
@@ -391,5 +394,9 @@ fi
 # /progress reports completed=true when the log ends with it. Logging it
 # releases the install lock (pending_install.json); the log itself stays in
 # place as the record until the next accepted install archives it.
-logline "$name installation completed"
-rm -f "$PENDING"
+if [[ -n "${P5AGENT_NESTED:-}" ]]; then
+    logline "$name installed"
+else
+    logline "$name installation completed"
+    rm -f "$PENDING"
+fi

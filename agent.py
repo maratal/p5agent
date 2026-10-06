@@ -93,6 +93,40 @@ root systemd service on port 5005 and exposes:
                       agent's commit, installed versions of the supported
                       dependencies, and the firewall's rules
 
+  Copy (the dashboard's New Upplet → Copy; the work is copy_upplet.py's):
+    POST /copy-inventory {apps: [names] | null} — the calculation stage, on the
+                      upplet to be copied, as a job: disk in use, each app's
+                      database size as the database reports it, and a guess at
+                      its archive — nothing is dumped
+    GET  /copy-inventory the calculation's progress and outcome: {log, finished,
+                      returncode, result}
+    POST /copy-key    {key, peer} — on the upplet to be copied: let the upplet
+                      at `peer` copy it with `key`. Kept in this process's
+                      memory only (the key's sha256, never on disk) and gone
+                      COPY_KEY_IDLE (5 min) after its last use — or at
+                      /copy/done, {revoke: true}, or an agent restart. Takes a
+                      snapshot of the firewall and P5AGENT_ALLOW_IP. Refused
+                      when the agent port is open to listed addresses only and
+                      `peer` is not one of them: a copy never changes the
+                      copied upplet's firewall
+    POST /copy-start  {source, key, source_name, target_name, apps, nginx,
+                      squid} — on the new upplet: copy that upplet here, run
+                      like an install (lock, /progress, setup.log; app "copy")
+    The new upplet's agent then calls the copied one's, with the copy key in
+    place of the token and only from `peer`:
+    GET  /copy/manifest            what to rebuild (copy_upplet.py manifest)
+    GET  /copy/file?item=          one archive, made as it is sent — db:<app>,
+                                   config:<app>, site, letsencrypt, squid
+                                   (copy_upplet.py stream); nothing is written
+                                   to disk on the way
+    POST /copy/done                finished: the key is dropped
+    A copy is read-only for the copied upplet: it reads files and databases
+    and writes nothing but its logs (the calculation's, and the agent's own).
+    While either upplet is in a copy — a grant is live on the copied one, the
+    copy install runs on the new one — every POST that installs, sets up,
+    changes or removes something (COPY_BUSY_ROUTES) is refused:
+    409 {"error": "busy", "reason": …}.
+
 All endpoints except `/` require the shared secret token. `/command` and `/app`
 are also restricted by source IP.
 
@@ -123,6 +157,7 @@ import shutil
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -137,6 +172,31 @@ APP_DIR = os.path.dirname(os.path.realpath(__file__))
 APP_NAME = os.path.basename(APP_DIR)
 ALLOW_IP = {ip.strip() for ip in os.environ.get("P5AGENT_ALLOW_IP", "127.0.0.1").split(",") if ip.strip()}
 ENV_FILE = os.environ.get("P5AGENT_ENV_FILE", "/etc/p5agent.env")
+_ENV_SEEN = [None]          # ENV_FILE's mtime when ALLOW_IP was last read from it
+
+
+def refresh_allow_ip():
+    """Pick up P5AGENT_ALLOW_IP from ENV_FILE when the file has changed since
+    it was last read — a copy (copy_upplet.py import) writes the list there
+    from its own process, and this agent has to follow without a restart."""
+    try:
+        seen = os.stat(ENV_FILE).st_mtime_ns
+    except OSError:
+        return
+    if seen == _ENV_SEEN[0]:
+        return
+    _ENV_SEEN[0] = seen
+    try:
+        with open(ENV_FILE) as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        if line.startswith("P5AGENT_ALLOW_IP="):
+            value = line.split("=", 1)[1].strip()
+            ALLOW_IP.clear()
+            ALLOW_IP.update(ip.strip() for ip in value.split(",") if ip.strip())
+            os.environ["P5AGENT_ALLOW_IP"] = value
 
 
 def change_allow_ip(text, remove=False, caller=None, seconds=None):
@@ -151,6 +211,7 @@ def change_allow_ip(text, remove=False, caller=None, seconds=None):
         ip = str(ipaddress.ip_address(text.strip()))
     except ValueError:
         return 2, "Not an IP address: %s\n" % text
+    refresh_allow_ip()
     allowed = [a.strip() for a in os.environ.get("P5AGENT_ALLOW_IP", "").split(",") if a.strip()] or sorted(ALLOW_IP)
     if remove:
         if ip not in ALLOW_IP:
@@ -295,6 +356,107 @@ APP_UPDATE_DONE = "[p5agent] update finished rc="
 # marker; a failed install is cleared by its fail() or here (stall rule).
 PENDING_INSTALL = os.path.join(DATA_DIR, "pending_install.json")
 INSTALL_STALL_SECS = 1800  # no log activity for 30 min → the install failed
+# Copying an upplet (copy_upplet.py). For the copied upplet a copy is
+# read-only: the calculation stage (inventory) is a job whose state lives in
+# this process and whose only file is its log; the archives the new upplet
+# fetches are made as they are sent (copy_upplet.py stream), never stored; and
+# COPY_GRANT — the copy key's hash, the one address it is good from, when it
+# was last used, and the firewall and allowed addresses as they were when it
+# was given — is kept in memory only, gone a few minutes after its last use.
+# On the new upplet the copy is an install, under the install lock, logging to
+# setup.log.
+COPY_SCRIPT = os.path.join(APP_DIR, "copy_upplet.py")
+COPY_INV_LOG = os.path.join(DATA_DIR, "copy_inventory.log")
+COPY_INV_RESULT = "[p5agent] inventory result: "     # the job's last line: its JSON
+COPY_ITEM_RE = re.compile(r"^(?:(?:db|config):[A-Za-z0-9][A-Za-z0-9._-]*|site|letsencrypt|squid)$")
+COPY_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
+COPY_KEY_IDLE = 5 * 60       # a grant ends this long after its last use
+COPY_LOCK = threading.RLock()
+COPY_GRANT = {}              # the one grant, in memory only; {} when there is none
+COPY_INV = {}                # the calculation running or last run: {proc, started_at}
+
+
+def copy_inventory_status():
+    """The calculation stage: {started_at, log, finished, returncode, result}
+    — {} when there has been none since the agent started."""
+    with COPY_LOCK:
+        job = dict(COPY_INV)
+    if not job:
+        return {}
+    rc = job["proc"].poll()
+    lines, result = [], None
+    for line in read_file(COPY_INV_LOG).splitlines():
+        if line.startswith(COPY_INV_RESULT):
+            try:
+                result = json.loads(line[len(COPY_INV_RESULT):])
+            except ValueError:
+                pass
+        else:
+            lines.append(line)
+    status = {"started_at": job["started_at"], "log": "\n".join(lines) + "\n",
+              "finished": rc is not None, "returncode": rc}
+    if rc is not None and result is not None:
+        status["result"] = result
+    return status
+
+
+def copy_source_state():
+    """The copy granted on this upplet, or None. One unused for COPY_KEY_IDLE
+    has ended: it is dropped here, the first time anyone looks."""
+    with COPY_LOCK:
+        if not COPY_GRANT:
+            return None
+        # An archive on its way counts as use for as long as it takes.
+        if not COPY_GRANT.get("sending") and time.time() - COPY_GRANT.get("last_used", 0) > COPY_KEY_IDLE:
+            sys.stderr.write("[p5agent] %s (unused for %d min)\n" % (copy_source_clear(), COPY_KEY_IDLE // 60))
+            return None
+        return dict(COPY_GRANT)
+
+
+def copy_source_save(state):
+    with COPY_LOCK:
+        COPY_GRANT.clear()
+        COPY_GRANT.update(state)
+
+
+def copy_source_clear():
+    """End the grant. Returns a line for the log."""
+    with COPY_LOCK:
+        state = dict(COPY_GRANT)
+        COPY_GRANT.clear()
+        return "copy to %s ended" % state.get("peer") if state else ""
+
+
+def address_listed(ip, sources):
+    """Whether `ip` is one of the addresses or networks in `sources`."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    for source in sources or []:
+        try:
+            if addr in ipaddress.ip_network(str(source), strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def copy_busy():
+    """Why this upplet is tied up in a copy — being copied (a grant is live)
+    or being made a copy (the copy install runs) — or ""."""
+    grant = copy_source_state()
+    if grant:
+        return "this upplet is being copied to %s" % grant.get("peer")
+    current = install_status()
+    if current and not current.get("completed") and current.get("app") == "copy":
+        return "a copy onto this upplet is in progress"
+    return ""
+
+
+def copy_source_expire():
+    """The revoker's part: a grant left unused ends (copy_source_state)."""
+    copy_source_state()
 
 
 def static_site_port():
@@ -957,6 +1119,10 @@ def revoker():
             revoke_due()
         except Exception as exc:  # noqa: BLE001 - keep the thread alive
             sys.stderr.write("[p5agent] timed rules: %s\n" % exc)
+        try:
+            copy_source_expire()
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write("[p5agent] copy grant: %s\n" % exc)
         time.sleep(REVOKE_EVERY)
 
 
@@ -992,7 +1158,8 @@ def running_job():
     if installing and not installing.get("completed"):
         return "the installation of %s" % installing.get("app", "an app")
     for label, status in (("an app job", app_update_status()), ("a certificate run", certs_status()),
-                          ("a firewall update", firewall_status())):
+                          ("a firewall update", firewall_status()),
+                          ("a copy's calculation", copy_inventory_status())):
         if status and not status.get("finished"):
             if label == "an app job":
                 label = "%s's %s" % (status.get("name", "an app"), "update" if status.get("op") == "update" else status.get("op", "job"))
@@ -1161,7 +1328,7 @@ def install_status():
         app = completed_app(log)
         if not app:
             return None
-        return {"app": app, "kind": "utility" if app in UTILITY_NAMES else "app",
+        return {"app": app, "kind": "utility" if app in UTILITY_NAMES else "copy" if app == "copy" else "app",
                 "started_at": log_started_at(log), "completed": True}
 
     try:
@@ -1580,6 +1747,7 @@ class Handler(BaseHTTPRequestHandler):
         # Per-endpoint source-IP check (enforced in-process, not just by the
         # firewall). Loopback is treated as equivalent when ALLOW_IP is local.
         ip = self.client_address[0]
+        refresh_allow_ip()
         if ip in ALLOW_IP:
             return True
         if ALLOW_IP & {"127.0.0.1", "localhost"} and ip in ("127.0.0.1", "::1"):
@@ -1599,7 +1767,16 @@ class Handler(BaseHTTPRequestHandler):
     ROUTES = ("/update", "/command", "/install-app", "/install-util", "/progress", "/setup-log",
               "/supported", "/apps", "/certs", "/certs-log", "/info", "/app",
               "/app-log", "/firewall", "/firewall-log", "/squid", "/utilities",
-              "/ports", "/utility", "/utility-log", "/squid-password", "/static-site")
+              "/ports", "/utility", "/utility-log", "/squid-password", "/static-site",
+              "/copy-inventory", "/copy-key", "/copy-start")
+    # Refused with "busy" while the upplet is in a copy, either side of it:
+    # everything that installs, sets up, changes or removes something.
+    COPY_BUSY_ROUTES = ("/update", "/install-app", "/install-util", "/squid", "/app", "/utility",
+                        "/firewall", "/certs", "/squid-password", "/static-site", "/copy-start",
+                        "/copy-key")
+    # The new upplet's agent fetching a copy: the copy key, not the token, and
+    # only from the address it was granted to (see _copy_refusal).
+    COPY_ROUTES = ("/copy/manifest", "/copy/file", "/copy/done")
     # Only running arbitrary commands is locked to the allowed source IP; every
     # other operation needs just the token.
     IP_RESTRICTED = ("/command",)
@@ -1608,10 +1785,30 @@ class Handler(BaseHTTPRequestHandler):
         path = self._path()
         if path == "/":
             return self._send(200, {"status": "ok", "service": "p5agent", "started_at": STARTED_AT})
+        if path in self.COPY_ROUTES:
+            refused = self._copy_refusal()
+            if refused:
+                return self._send(*refused)
+            return self._guarded({
+                "/copy/manifest": self._do_copy_manifest,
+                "/copy/file": self._do_copy_file,
+                "/copy/done": self._do_copy_done,
+            }[path])
         if path not in self.ROUTES:
             return self._send(404, {"error": "not found", "path": path})
         if not self._authorized():
             return self._send(401, {"error": "unauthorized"})
+        if self.command == "POST" and path in self.COPY_BUSY_ROUTES:
+            busy = copy_busy()
+            # Withdrawing a grant is how a copy that did not start is undone.
+            if busy and path == "/copy-key":
+                try:
+                    if json.loads(self._body().decode("utf-8", "replace") or "{}").get("revoke") is True:
+                        busy = ""
+                except (ValueError, AttributeError):
+                    pass
+            if busy:
+                return self._send(409, {"error": "busy", "reason": busy})
         # Running commands is locked to the allowed source IP.
         if path in self.IP_RESTRICTED and not self._ip_allowed():
             def _mask_ip(ip):
@@ -1620,8 +1817,7 @@ class Handler(BaseHTTPRequestHandler):
                                     "detail": "%s is restricted to %s — this request came from %s" % (
                                         path, ", ".join(_mask_ip(ip) for ip in sorted(ALLOW_IP)),
                                         self.client_address[0])})
-        try:
-            return {
+        return self._guarded({
                 "/update": self._do_update,
                 "/command": self._do_command,
                 "/install-app": self._do_install_app,
@@ -1644,7 +1840,14 @@ class Handler(BaseHTTPRequestHandler):
                 "/utility": self._do_utility,
                 "/utility-log": self._do_utility_log,
                 "/squid-password": self._do_squid_password,
-            }[path]()
+                "/copy-inventory": self._do_copy_inventory,
+                "/copy-key": self._do_copy_key,
+                "/copy-start": self._do_copy_start,
+            }[path])
+
+    def _guarded(self, handler):
+        try:
+            return handler()
         except Exception as exc:  # noqa: BLE001 - never leak a traceback as 500 HTML
             try:
                 return self._send(500, {"error": "internal error", "detail": str(exc)})
@@ -1793,6 +1996,7 @@ class Handler(BaseHTTPRequestHandler):
             # Only an allow is timed; a removal is at once and for good.
             self._send(500, {"returncode": 2, "output": self.ALIAS_USAGE[name]})
             return True
+        refresh_allow_ip()
         with RULES_LOCK:
             if name == "token" and args in (["--print"], ["-p"]):
                 self._send(200, {"returncode": 0, "output": TOKEN + "\n"})
@@ -2373,6 +2577,236 @@ class Handler(BaseHTTPRequestHandler):
         if not status:
             return self._send(200, {})
         return self._send(200, status)
+
+    # ---- copy ------------------------------------------------------------
+    def _json_request(self):
+        """The body as a JSON object, or None after answering 400."""
+        try:
+            req = json.loads(self._body().decode("utf-8", "replace") or "{}")
+        except ValueError:
+            self._send(400, {"error": "body must be JSON"})
+            return None
+        if not isinstance(req, dict):
+            self._send(400, {"error": "body must be a JSON object"})
+            return None
+        return req
+
+    def _do_copy_inventory(self):
+        """The calculation stage, on the upplet to be copied. POST {apps}
+        starts it; GET follows it. Its state lives in this process; its log is
+        the only file it writes."""
+        if self.command == "GET":
+            return self._send(200, copy_inventory_status())
+        req = self._json_request()
+        if req is None:
+            return None
+        apps = req.get("apps")
+        if apps is not None and (not isinstance(apps, list) or len(apps) > 100
+                                 or not all(isinstance(a, str) and re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", a)
+                                            for a in apps)):
+            return self._send(400, {"error": "apps must be a list of app names"})
+        if not os.path.isfile(COPY_SCRIPT):
+            return self._send(500, {"error": "copy_upplet.py not found"})
+        with COPY_LOCK:
+            current = copy_inventory_status()
+            if current and not current.get("finished"):
+                return self._send(409, {"error": "the calculation is running already"})
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(COPY_INV_LOG, "w") as log:
+                proc = subprocess.Popen(
+                    ["python3", COPY_SCRIPT, "inventory", "-" if apps is None else ",".join(apps)],
+                    cwd=APP_DIR,
+                    env=dict(os.environ, HOME="/root", P5AGENT_PORT=str(PORT)),
+                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            COPY_INV.clear()
+            COPY_INV.update(proc=proc, started_at=int(time.time()))
+        return self._send(200, {"status": "started"})
+
+    def _do_copy_key(self):
+        """POST {key, peer}: let the upplet at `peer` copy this one with `key`
+        — a grant held in memory only, until COPY_KEY_IDLE after its last use.
+        {revoke: true}: end the grant now. Nothing on this upplet changes."""
+        if self.command != "POST":
+            return self._send(405, {"error": "POST only"})
+        req = self._json_request()
+        if req is None:
+            return None
+        if req.get("revoke") is True:
+            return self._send(200, {"ok": True, "ended": copy_source_clear()})
+        key = str(req.get("key") or "")
+        if not COPY_KEY_RE.match(key):
+            return self._send(400, {"error": "a key of 32 to 256 letters, digits, '-' and '_' is required"})
+        try:
+            peer = str(ipaddress.ip_address(str(req.get("peer") or "").strip()))
+        except ValueError:
+            return self._send(400, {"error": "peer must be the new upplet's IP address"})
+        current = copy_source_state()
+        now = time.time()
+        if current and current.get("peer") != peer:
+            return self._send(409, {"error": "this upplet is being copied to %s already" % current.get("peer")})
+
+        # As they are now: what the new upplet copies 1:1 (read, not changed).
+        refresh_allow_ip()
+        rc, out = run(["bash", FIREWALL_SCRIPT, "--plan"], extra_env={"P5AGENT_CALLER_IP": self.client_address[0]})
+        try:
+            firewall = json.loads(out.strip().splitlines()[-1]) if rc == 0 else None
+        except (ValueError, IndexError):
+            firewall = None
+        listed = [a.strip() for a in os.environ.get("P5AGENT_ALLOW_IP", "").split(",") if a.strip()]
+        allow = [a for a in listed if a in ALLOW_IP] + sorted(a for a in ALLOW_IP if a not in listed)
+        snapshot = {"firewall": firewall, "allow": allow, "timed": timed_rules_load()}
+
+        # The new upplet has to reach this agent, and a copy changes nothing
+        # here — the firewall included: an agent port open to listed addresses
+        # only, without the new upplet's, is a copy that cannot happen.
+        fw = firewall_rules()
+        if firewall and fw and fw.get("status") == "active":
+            row = next((r for r in firewall.get("rules") or []
+                        if r.get("port") == PORT and r.get("proto") == "tcp"), None)
+            if row and row.get("from") and not address_listed(peer, row["from"]):
+                return self._send(409, {"error": "the agent port (%d) of this upplet is open to listed addresses only, "
+                                                 "and %s is not one of them — open it to that address in Firewall "
+                                                 "Settings to copy this upplet" % (PORT, peer)})
+        copy_source_save({
+            "key_sha": hashlib.sha256(key.encode("utf-8")).hexdigest(),
+            "peer": peer,
+            "created": int(now),
+            "last_used": int(now),
+            "snapshot": snapshot,
+        })
+        return self._send(200, {"ok": True, "idle": COPY_KEY_IDLE})
+
+    def _do_copy_start(self):
+        """POST on the new upplet: copy `source` here — an install, under the
+        install lock, logged to setup.log, its app "copy"."""
+        if self.command != "POST":
+            return self._send(405, {"error": "POST only"})
+        req = self._json_request()
+        if req is None:
+            return None
+        try:
+            source = str(ipaddress.ip_address(str(req.get("source") or "").strip()))
+        except ValueError:
+            return self._send(400, {"error": "source must be the IP address of the upplet to copy"})
+        key = str(req.get("key") or "")
+        if not COPY_KEY_RE.match(key):
+            return self._send(400, {"error": "the copy key is missing or malformed"})
+        apps = req.get("apps")
+        if apps is not None and (not isinstance(apps, list)
+                                 or not all(isinstance(a, str) and re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", a)
+                                            for a in apps)):
+            return self._send(400, {"error": "apps must be a list of app names"})
+        if not os.path.isfile(COPY_SCRIPT):
+            return self._send(500, {"error": "copy_upplet.py not found"})
+
+        def label(value):
+            return re.sub(r"[^\w .()-]", "", str(value or ""))[:64]
+
+        job = {
+            "source": source, "key": key, "apps": apps,
+            "source_name": label(req.get("source_name")) or source,
+            "target_name": label(req.get("target_name")),
+            "nginx": req.get("nginx") is not False,
+            "squid": req.get("squid") is not False,
+            # The dashboard, as this upplet sees it: firewall.sh keeps it on
+            # every restricted list it copies.
+            "caller": self.client_address[0],
+        }
+        os.makedirs(TMP_DIR, exist_ok=True)
+        # A name of its own: a second request in the same second (refused, its
+        # file removed) must not take the first one's with it.
+        fd, path = tempfile.mkstemp(prefix="copy_request_", suffix=".json", dir=TMP_DIR)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(job, fh)
+        return self._start_install("copy", "copy", ["python3", COPY_SCRIPT, "import", path], files=[path],
+                                   note="a copy of %s (%s)" % (job["source_name"], source))
+
+    def _copy_refusal(self):
+        """(status, payload) when a /copy/ request may not go on, else None —
+        and the grant is marked as in use."""
+        with COPY_LOCK:
+            state = copy_source_state()
+            if not state:
+                return 401, {"error": "no copy of this upplet is granted"}
+            auth = self.headers.get("Authorization", "")
+            supplied = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
+            if not hmac.compare_digest(hashlib.sha256(supplied.encode("utf-8")).hexdigest(), state["key_sha"]):
+                return 401, {"error": "unauthorized"}
+            if self.client_address[0] != state.get("peer"):
+                return 403, {"error": "this copy is granted to another address"}
+            COPY_GRANT["last_used"] = int(time.time())
+        return None
+
+    def _do_copy_manifest(self):
+        proc = subprocess.run(["python3", COPY_SCRIPT, "manifest"], cwd=APP_DIR, capture_output=True,
+                              timeout=300, env=dict(os.environ, HOME="/root"))
+        try:
+            manifest = json.loads(proc.stdout.decode("utf-8", "replace"))
+        except ValueError:
+            return self._send(500, {"error": "could not describe this upplet",
+                                    "detail": proc.stderr.decode("utf-8", "replace")[-500:]})
+        # What the grant snapshotted (it lives in this process only).
+        snapshot = (copy_source_state() or {}).get("snapshot") or {}
+        manifest.update(allow=snapshot.get("allow") or [], timed=snapshot.get("timed") or [],
+                        firewall=snapshot.get("firewall"))
+        return self._send(200, manifest)
+
+    def _do_copy_file(self):
+        """One archive, made as it is sent: copy_upplet.py stream writes it to
+        its stdout, which goes straight into the reply — nothing is stored on
+        the way. Its length is not known ahead, so the reply ends with the
+        connection. A stream that fails part-way is cut off before its end:
+        the new upplet finds the archive incomplete and stops."""
+        item = (parse_qs(urlparse(self.path).query).get("item") or [""])[0]
+        if not COPY_ITEM_RE.match(item):
+            return self._send(400, {"error": "unknown item"})
+        proc = subprocess.Popen(["python3", COPY_SCRIPT, "stream", item], cwd=APP_DIR,
+                                env=dict(os.environ, HOME="/root"),
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        errors = []
+        drain = threading.Thread(target=lambda: errors.append(proc.stderr.read()), daemon=True)
+        drain.start()
+        with COPY_LOCK:
+            COPY_GRANT["sending"] = COPY_GRANT.get("sending", 0) + 1
+        sent = 0
+        try:
+            first = proc.stdout.read(256 * 1024)
+            if not first:
+                rc = proc.wait()
+                drain.join(5)
+                detail = b"".join(errors).decode("utf-8", "replace").strip()
+                return self._send(500, {"error": "%s could not be sent" % item, "detail": detail[-500:],
+                                        "returncode": rc})
+            self._body()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/gzip")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            chunk = first
+            while chunk:
+                self.wfile.write(chunk)
+                sent += len(chunk)
+                chunk = proc.stdout.read(256 * 1024)
+            rc = proc.wait()
+            drain.join(5)
+            if rc != 0:
+                sys.stderr.write("[p5agent] %s was cut off after %d bytes: %s\n" % (
+                    item, sent, b"".join(errors).decode("utf-8", "replace").strip()[-300:]))
+            self.wfile.flush()
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            with COPY_LOCK:
+                if COPY_GRANT:
+                    COPY_GRANT["sending"] = max(0, COPY_GRANT.get("sending", 1) - 1)
+                    COPY_GRANT["last_used"] = int(time.time())
+        return None
+
+    def _do_copy_done(self):
+        return self._send(200, {"ok": True, "ended": copy_source_clear()})
 
 
 class Server(ThreadingHTTPServer):
