@@ -368,9 +368,33 @@ INSTALL_STALL_SECS = 1800  # no log activity for 30 min → the install failed
 COPY_SCRIPT = os.path.join(APP_DIR, "copy_upplet.py")
 COPY_INV_LOG = os.path.join(DATA_DIR, "copy_inventory.log")
 COPY_INV_RESULT = "[p5agent] inventory result: "     # the job's last line: its JSON
-COPY_ITEM_RE = re.compile(r"^(?:(?:db|config):[A-Za-z0-9][A-Za-z0-9._-]*|site|letsencrypt|squid)$")
+COPY_ITEM_RE = re.compile(r"^(?:(?:db|config|data):[A-Za-z0-9][A-Za-z0-9._-]*|site|letsencrypt|squid)$")
+COPY_DATA_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 COPY_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
 APP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def copy_data_folder_ok(path):
+    """A data folder as the dashboard's registry names it: relative to the
+    app's own, plain names only (copy_upplet.py checks it stays inside)."""
+    path = path if isinstance(path, str) else ""
+    return 0 < len(path) <= 200 and all(p not in ("", ".", "..") and COPY_DATA_PART_RE.match(p)
+                                        for p in path.split("/"))
+
+
+def copy_data_map(value):
+    """{app: [folder, …]} checked, or None when it is malformed."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or len(value) > 100:
+        return None
+    out = {}
+    for name, folders in value.items():
+        if not (isinstance(name, str) and APP_NAME_RE.match(name) and isinstance(folders, list)
+                and len(folders) <= 20 and all(copy_data_folder_ok(f) for f in folders)):
+            return None
+        out[name] = list(folders)
+    return out
 COPY_KEY_IDLE = 5 * 60       # a grant ends this long after its last use
 COPY_LOCK = threading.RLock()
 COPY_GRANT = {}              # the one grant, in memory only; {} when there is none
@@ -2648,6 +2672,9 @@ class Handler(BaseHTTPRequestHandler):
                                  or not all(isinstance(a, str) and re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", a)
                                             for a in apps)):
             return self._send(400, {"error": "apps must be a list of app names"})
+        data = copy_data_map(req.get("data"))
+        if data is None:
+            return self._send(400, {"error": "data must map app names to folders inside them"})
         if not os.path.isfile(COPY_SCRIPT):
             return self._send(500, {"error": "copy_upplet.py not found"})
         with COPY_LOCK:
@@ -2657,7 +2684,8 @@ class Handler(BaseHTTPRequestHandler):
             os.makedirs(DATA_DIR, exist_ok=True)
             with open(COPY_INV_LOG, "w") as log:
                 proc = subprocess.Popen(
-                    ["python3", COPY_SCRIPT, "inventory", "-" if apps is None else ",".join(apps)],
+                    ["python3", COPY_SCRIPT, "inventory", "-" if apps is None else ",".join(apps),
+                     json.dumps(data)],
                     cwd=APP_DIR,
                     env=dict(os.environ, HOME="/root", P5AGENT_PORT=str(PORT)),
                     stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
@@ -2760,6 +2788,9 @@ class Handler(BaseHTTPRequestHandler):
             if inst.get("demo"):
                 one["demo"] = True
             clean[name] = one
+        data = copy_data_map(req.get("data"))
+        if data is None:
+            return self._send(400, {"error": "data must map app names to folders inside them"})
         if not os.path.isfile(COPY_SCRIPT):
             return self._send(500, {"error": "copy_upplet.py not found"})
 
@@ -2767,7 +2798,7 @@ class Handler(BaseHTTPRequestHandler):
             return re.sub(r"[^\w .()-]", "", str(value or ""))[:64]
 
         job = {
-            "source": source, "key": key, "apps": apps, "installs": clean,
+            "source": source, "key": key, "apps": apps, "installs": clean, "data": data,
             "source_name": label(req.get("source_name")) or source,
             "target_name": label(req.get("target_name")),
             "nginx": req.get("nginx") is not False,
@@ -2821,10 +2852,15 @@ class Handler(BaseHTTPRequestHandler):
         the way. Its length is not known ahead, so the reply ends with the
         connection. A stream that fails part-way is cut off before its end:
         the new upplet finds the archive incomplete and stops."""
-        item = (parse_qs(urlparse(self.path).query).get("item") or [""])[0]
+        query = parse_qs(urlparse(self.path).query)
+        item = (query.get("item") or [""])[0]
         if not COPY_ITEM_RE.match(item):
             return self._send(400, {"error": "unknown item"})
-        proc = subprocess.Popen(["python3", COPY_SCRIPT, "stream", item], cwd=APP_DIR,
+        # A data folder: which one, inside the app's own.
+        folder = (query.get("path") or [""])[0]
+        if item.startswith("data:") != bool(folder) or (folder and not copy_data_folder_ok(folder)):
+            return self._send(400, {"error": "a data item needs its folder, inside the app's"})
+        proc = subprocess.Popen(["python3", COPY_SCRIPT, "stream", item] + ([folder] if folder else []), cwd=APP_DIR,
                                 env=dict(os.environ, HOME="/root"),
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         errors = []

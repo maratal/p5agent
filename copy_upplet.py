@@ -9,14 +9,16 @@ upplet, /copy-start on the new one). Every byte goes from agent to agent.
 On the copied upplet (the source) a copy is read-only: these read files and
 databases and write nothing but their output.
 
-    copy_upplet.py inventory <app,app,… | ->
+    copy_upplet.py inventory <app,app,… | -> [<data>]
                     the calculation stage, before anything is created: how much
                     of the disk is in use, and for each app how big its database
                     is, as the database itself reports it — and from that a rough
-                    guess at its archive (ARCHIVE_RATIO). Nothing is dumped. Its
-                    output is the agent's log of it, ending with the result as
-                    JSON on one line. "-": every app.
-    copy_upplet.py stream <item>
+                    guess at its archive (ARCHIVE_RATIO) — and how much is in its
+                    data folders (<data>: JSON {app: [folder, …]}, folders
+                    relative to the app's own, as the dashboard's registry names
+                    them). Nothing is dumped. Its output is the agent's log of
+                    it, ending with the result as JSON on one line. "-": every app.
+    copy_upplet.py stream <item> [<folder>]
                     one archive, written to stdout as it is made (the agent's
                     /copy/file sends it on as it comes):
                       db:<app>       the app's database, dumped and gzipped
@@ -24,6 +26,8 @@ databases and write nothing but their output.
                                      SQLite's SQL dump)
                       config:<app>   /etc/<app>.env, /etc/<app>/ (not its certs)
                                      and the app's untracked .env files
+                      data:<app>     <folder> of the app's own (its uploads,
+                                     say), which a fresh clone does not have
                       site           the static site Nginx serves (/var/www/html)
                       letsencrypt    /etc/letsencrypt
                       squid          Squid's passwd file and whitelist
@@ -56,6 +60,7 @@ import shlex
 import shutil
 import socket
 import sqlite3
+import stat
 import ssl
 import subprocess
 import sys
@@ -100,7 +105,8 @@ DB_LABELS = {"postgresql": "PostgreSQL", "mysql": "MySQL", "mariadb": "MariaDB",
 DB_SERVICES = {"postgresql": "postgresql", "mysql": "mysql", "mariadb": "mariadb", "redis": "redis-server"}
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 IDENT_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.$-]{0,62}$")   # a database, role or user name
-ITEM_RE = re.compile(r"^(?:(?:db|config):[A-Za-z0-9][A-Za-z0-9._-]*|site|letsencrypt|squid)$")
+ITEM_RE = re.compile(r"^(?:(?:db|config|data):[A-Za-z0-9][A-Za-z0-9._-]*|site|letsencrypt|squid)$")
+DATA_PART_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 # The settings each upplet keeps for itself when an app's env file is copied:
 # the agent's own token, and how the app is reached here (Nginx sets those).
 OWN_ENV_KEYS = ("MGMT_TOKEN", "PORT", "HOST", "TLS_CERT_PATH", "TLS_KEY_PATH")
@@ -544,6 +550,48 @@ def say(text):
     print(text, flush=True)
 
 
+def data_path_ok(path):
+    """A data folder as the registry names it: relative to the app's folder,
+    plain names only — nothing absolute, no "." or ".."."""
+    path = str(path or "")
+    parts = path.split("/")
+    return 0 < len(path) <= 200 and all(p not in ("", ".", "..") and DATA_PART_RE.match(p) for p in parts)
+
+
+def app_folder(app):
+    return app.get("path") or os.path.join(APPS_DIR, app["name"])
+
+
+def data_source(app, rel):
+    """<rel> in <app>'s folder here, checked to stay inside it (links
+    followed) — or CopyError."""
+    if not data_path_ok(rel):
+        raise CopyError("%r is not a data folder" % rel)
+    base = os.path.realpath(app_folder(app))
+    full = os.path.realpath(os.path.join(base, rel))
+    if not full.startswith(base + os.sep):
+        raise CopyError("%s is outside %s" % (rel, base))
+    return full
+
+
+def data_size(path):
+    """The bytes in the files under <path>, and how many there are (links are
+    not followed)."""
+    if os.path.isfile(path):
+        return os.lstat(path).st_size, 1
+    total = files = 0
+    for root, dirs, names in os.walk(path):
+        for n in names:
+            try:
+                st = os.lstat(os.path.join(root, n))
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                total += st.st_size
+                files += 1
+    return total, files
+
+
 def agent_port_listing():
     """The addresses the agent port is open to when it is open to listed
     ones only (firewall.sh --plan reads ufw, changes nothing), else []."""
@@ -559,16 +607,21 @@ def agent_port_listing():
     return list(row.get("from") or []) if row else []
 
 
-def cmd_inventory(wanted):
+def cmd_inventory(wanted, data="{}"):
     """The calculation stage: disk in use, and each app's database size with
     a guess at its archive — asked of the database, never dumped. Writes
     nothing: its output is the log, ending with the result as JSON."""
     wanted = None if wanted == "-" else [w for w in wanted.split(",") if w]
+    try:
+        data = json.loads(data or "{}")
+    except ValueError:
+        data = {}
+    data = data if isinstance(data, dict) else {}
     apps = [a for a in installed_apps() if wanted is None or a["name"] in wanted]
     du = shutil.disk_usage("/")
     say("Disk: %s in use of %s" % (human(du.used), human(du.total)))
     result = {"disk": {"used": du.used, "total": du.total}, "apps": [], "db_total": 0,
-              "at": int(time.time())}
+              "data_total": 0, "at": int(time.time())}
     failed = []
     for app in apps:
         name = app["name"]
@@ -592,6 +645,24 @@ def cmd_inventory(wanted):
                 entry["error"] = str(exc)
                 failed.append(name)
                 say("✗ %s: %s" % (name, exc))
+        # Its data folders: files, sent as they are.
+        entry["data"] = []
+        for rel in data.get(name) or []:
+            try:
+                full = data_source(app, rel)
+            except CopyError as exc:
+                entry["error"] = str(exc)
+                failed.append(name)
+                say("✗ %s: %s" % (name, exc))
+                continue
+            if not os.path.exists(full):
+                say("%s: %s is not there — nothing to copy" % (name, rel))
+                entry["data"].append({"path": rel, "missing": True, "bytes": 0, "files": 0})
+                continue
+            size, files = data_size(full)
+            entry["data"].append({"path": rel, "bytes": size, "files": files})
+            result["data_total"] += size
+            say("%s: %s — %d file%s, %s" % (name, rel, files, "" if files == 1 else "s", human(size)))
         result["apps"].append(entry)
     listing = agent_port_listing()
     if listing:
@@ -604,11 +675,13 @@ def cmd_inventory(wanted):
         say("✗ The database of %s could not be measured" % ", ".join(failed))
     if not failed and not listing:
         say("Database archives: about %s in all" % human(result["db_total"]))
+        if result["data_total"]:
+            say("Data folders: %s in all" % human(result["data_total"]))
     say(INVENTORY_RESULT + json.dumps(result))
     return 1 if failed or listing else 0
 
 
-def cmd_stream(item):
+def cmd_stream(item, folder=""):
     """One archive to stdout, made as it goes; errors to stderr. On failure the
     process ends at once, without the archive's end: the receiver sees the
     archive is incomplete rather than taking a short one for whole."""
@@ -618,7 +691,7 @@ def cmd_stream(item):
             raise CopyError("unknown item: %s" % item)
         kind, _, name = item.partition(":")
         apps = {a["name"]: a for a in installed_apps()}
-        if kind in ("db", "config") and name not in apps:
+        if kind in ("db", "config", "data") and name not in apps:
             raise CopyError("%s is not installed here" % name)
         if kind == "db":
             db = app_db(apps[name])
@@ -626,8 +699,14 @@ def cmd_stream(item):
                 raise CopyError("%s has no database to copy" % name)
             stream_db(db, out)
             return 0
+        if kind == "data":
+            full = data_source(apps[name], folder)
+            if not os.path.exists(full):
+                raise CopyError("%s of %s is not there" % (folder, name))
         tar = tarfile.open(fileobj=out, mode="w|gz")
-        if kind == "config":
+        if kind == "data":
+            add_to_tar(tar, full, "data")
+        elif kind == "config":
             app = apps[name]
             env = "/etc/%s.env" % name
             if os.path.isfile(env):
@@ -767,11 +846,12 @@ class Peer:
                                                      data.get("error") or "HTTP %d" % status))
         return data
 
-    def fetch(self, item, dest):
+    def fetch(self, item, dest, folder=""):
         """Receive one archive straight from the copied upplet's agent, made
         as it is sent; its length is not known until it has arrived. Returns
         its size. Whether it arrived whole is checked when it is unpacked."""
-        req = urllib.request.Request(self.url("/copy/file?item=" + urllib.parse.quote(item)))
+        query = "item=" + urllib.parse.quote(item) + ("&path=" + urllib.parse.quote(folder) if folder else "")
+        req = urllib.request.Request(self.url("/copy/file?" + query))
         req.add_header("Authorization", "Bearer " + self.key)
         got = 0
         try:
@@ -805,6 +885,7 @@ class Import:
         self.dst = req.get("target_name") or socket.gethostname()
         self.wanted_apps = req.get("apps")              # None: every app
         self.installs = req.get("installs") or {}       # the dashboard's install request per app
+        self.data = req.get("data") or {}               # each app's data folders, as the registry names them
         self.want_nginx = req.get("nginx") is not False
         self.want_squid = req.get("squid") is not False
         self.caller = req.get("caller") or ""
@@ -879,6 +960,8 @@ class Import:
                 logline("Dumping the %s database of %s on %s and sending it to %s..." % (
                     DB_LABELS[db["type"]], product, self.src, self.dst))
                 self.receive("db:" + name, "the database file of %s" % product, said=True)
+            for rel in self.data.get(name) or []:
+                self.receive("data:" + name, "%s of %s" % (rel, product), folder=rel)
         if site:
             self.receive("site", "the static site's files")
         if squid:
@@ -888,14 +971,17 @@ class Import:
         # (the log window shows ANSI colours, and so does a terminal).
         logline("\x1b[1;34m✓ Everything is here — %s is no longer involved\x1b[0m" % self.src)
 
-    def receive(self, item, what, said=False):
-        """One archive from the copied upplet, into this run's folder."""
+    def receive(self, item, what, said=False, folder=""):
+        """One archive from the copied upplet, into this run's folder. A data
+        folder's is kept as data:<app>:<folder>."""
         if not said:
             logline("Sending %s from %s to %s..." % (what, self.src, self.dst))
-        dest = os.path.join(self.work, item.replace(":", "_") + (".gz" if item.startswith("db:") else ".tar.gz"))
-        size = self.peer.fetch(item, dest)
+        key = item + (":" + folder if folder else "")
+        dest = os.path.join(self.work, "%d_%s" % (len(self.archives), re.sub(r"[^A-Za-z0-9._-]", "_", key)) +
+                            (".gz" if item.startswith("db:") else ".tar.gz"))
+        size = self.peer.fetch(item, dest, folder)
         logline("    received %s" % human(size))
-        self.archives[item] = dest
+        self.archives[key] = dest
         return dest
 
     def release(self, ok):
@@ -1005,6 +1091,11 @@ class Import:
             logline("Putting the config files of %s in place..." % product)
             self.apply_config(app, self.archives["config:" + name])
 
+        for rel in self.data.get(name) or []:
+            if "data:%s:%s" % (name, rel) in self.archives:
+                logline("Putting %s of %s in place..." % (rel, product))
+                self.restore_data(name, rel, self.archives["data:%s:%s" % (name, rel)])
+
         if "db:" + name in self.archives:
             logline("Restoring the database of %s on %s..." % (product, self.dst))
             self.restore_db(app, self.archives["db:" + name])
@@ -1018,6 +1109,37 @@ class Import:
         if service_exists(name):
             run(["systemctl", "restart", name])
         logline("✓ %s copied" % product)
+
+    def restore_data(self, name, rel, archive):
+        """A data folder into the app's folder here, in place of whatever the
+        install left there, owned by the user the app runs as."""
+        rec = next((a for a in installed_apps() if a["name"] == name), {"name": name})
+        base = os.path.realpath(app_folder(rec))
+        dest = os.path.join(base, rel)
+        if not os.path.realpath(dest).startswith(base + os.sep):
+            raise CopyError("%s is outside %s" % (rel, base))
+        staged = tempfile.mkdtemp(prefix="data-", dir=self.work)
+        extract(archive, staged)
+        got = os.path.join(staged, "data")
+        if not os.path.lexists(got):
+            raise CopyError("%s of %s came over empty" % (rel, name))
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        old = dest + ".p5copy-old"
+        for path in (old,):
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            elif os.path.lexists(path):
+                os.remove(path)
+        if os.path.lexists(dest):
+            os.rename(dest, old)
+        shutil.move(got, dest)
+        if os.path.isdir(old) and not os.path.islink(old):
+            shutil.rmtree(old, ignore_errors=True)
+        elif os.path.lexists(old):
+            os.remove(old)
+        chown_user(dest, unit_user(name), recursive=True)
+        size, files = data_size(dest)
+        logline("    %s — %d file%s, %s" % (dest, files, "" if files == 1 else "s", human(size)))
 
     def apply_config(self, app, archive):
         name = app["name"]
@@ -1423,10 +1545,10 @@ def main(argv):
         sys.stderr.write(__doc__)
         return 2
     mode = argv[1]
-    if mode == "inventory" and len(argv) == 3:
-        return cmd_inventory(argv[2])
-    if mode == "stream" and len(argv) == 3:
-        return cmd_stream(argv[2])
+    if mode == "inventory" and len(argv) in (3, 4):
+        return cmd_inventory(*argv[2:])
+    if mode == "stream" and len(argv) in (3, 4):
+        return cmd_stream(*argv[2:])
     if mode == "manifest":
         return cmd_manifest()
     if mode == "import" and len(argv) == 3:

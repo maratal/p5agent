@@ -25,7 +25,7 @@ nothing to install. The idle process uses roughly 12–18 MB of RAM.
 | POST       | `/certs`       | yes  | any        | Start a Let's Encrypt run for one domain or several: obtain or renew each, point the apps at it, restart them. Returns once the job is spawned. |
 | GET        | `/certs-log`   | yes  | any        | The current (or last) certificate run: `{domain, log, finished, returncode}`. Poll it (~every 2s) to follow one. |
 | GET        | `/info`        | yes  | any        | The upplet itself: OS, kernel, arch, uptime, memory, disk, this agent's commit, installed versions of the supported dependencies, and the firewall's rules. |
-| GET / POST | `/copy-inventory` | yes | any      | Copy's calculation stage, on the upplet to be copied: disk in use, each app's database size and a guess at its archive (nothing is dumped). A job: POST starts it, GET follows it. |
+| GET / POST | `/copy-inventory` | yes | any      | Copy's calculation stage, on the upplet to be copied: disk in use, each app's database size and a guess at its archive (nothing is dumped), and the size of its data folders. A job: POST starts it, GET follows it. |
 | POST       | `/copy-key`    | yes  | any        | Let another upplet copy this one: `{key, peer}` — kept in memory only, gone 5 minutes after its last use. `{revoke: true}` ends it. |
 | POST       | `/copy-start`  | yes  | any        | On the new upplet: copy `{source, key, …}` here — an install (lock, `/progress`, `setup.log`) named `copy`. |
 | GET / POST | `/copy/…`      | copy key | the granted peer | What the new upplet's agent fetches from the copied one: `manifest`, `file`, `done`. |
@@ -253,16 +253,20 @@ memory; the archives are made as they are sent, straight into the reply; and
 its firewall is never touched.
 
 1. **Calculation stage** (before anything is created): `POST /copy-inventory
-   {apps}` on the upplet to be copied runs `copy_upplet.py inventory`: disk in
+   {apps, data}` on the upplet to be copied runs `copy_upplet.py inventory`: disk in
    use, and for each app its database's size as the database reports it
    (`pg_database_size`, `information_schema`, the SQLite file) with a rough
-   guess at its archive (30% of that) — nothing is dumped. It also reads the
+   guess at its archive (30% of that) — nothing is dumped — and the files in
+   its data folders. `data` maps an app to folders of its own that a fresh
+   clone does not have (its uploads, say), as the dashboard's registry names
+   them (apps.json `data`): relative to the app's folder, plain names only,
+   and checked to stay inside it, links followed. It also reads the
    firewall: an agent port open to listed addresses only would shut the new
    upplet out, so the calculation fails then. Its state lives in the agent;
    its output is its log, the last line the result as JSON, which `GET
    /copy-inventory` hands back. The dashboard refuses a copy whose disk in use
    is more than the new upplet's disk ("Not enough space on the new upplet"),
-   and asks before going on when the databases come to more than 1 GB.
+   and asks before going on when the databases and files come to more than 1 GB.
 2. **Keys**: once the new upplet's agent answers, the dashboard checks both
    upplets' disks again (`/info`), makes a one-off key and gives it to both:
    `POST /copy-key {key, peer: <new upplet's IP>}` on the copied one, which
@@ -271,8 +275,8 @@ its firewall is never touched.
    true}`, or a restart). The grant snapshots the firewall table and
    `P5AGENT_ALLOW_IP` (what gets copied). It is refused when the agent port is
    open to listed addresses only and the new upplet's is not one of them. Then `POST
-   /copy-start {source, key, source_name, target_name, apps, installs, nginx,
-   squid}` on the new one. `installs` maps each app to the install request the
+   /copy-start {source, key, source_name, target_name, apps, installs, data,
+   nginx, squid}` on the new one. `installs` maps each app to the install request the
    dashboard builds from its own registry, as it would install the app
    anywhere — dependencies included, less those switched off in Details. The
    copied upplet's record of an app is not used for it: only where an app the
@@ -287,11 +291,13 @@ its firewall is never touched.
      (repo, branch and token from its git checkout; the rest is used only
      when the dashboard sends no `installs`), its database
      and Nginx settings, Squid, the static site, and the snapshot;
-   - `GET /copy/file?item=` — one archive, made by `copy_upplet.py stream` as
+   - `GET /copy/file?item=[&path=]` — one archive, made by `copy_upplet.py stream` as
      it is sent: `db:<app>` (the database dumped and gzipped: `pg_dump -Fc`,
      `mysqldump`, or SQLite's SQL dump in one read transaction),
      `config:<app>` (`/etc/<app>.env`, `/etc/<app>/` without its certs, and
-     the app's untracked `.env` files), `site` (`/var/www/html`),
+     the app's untracked `.env` files), `data:<app>` with `path=<folder>` (one
+     of its data folders, put in place of what the install left there and
+     owned by the user the app runs as), `site` (`/var/www/html`),
      `letsencrypt`, `squid` (passwd and whitelist) — gzipped tars. Its length
      is not known ahead, so the reply ends with the connection; one that
      fails part-way stops before its gzip end, and the new upplet refuses it
