@@ -370,6 +370,7 @@ COPY_INV_LOG = os.path.join(DATA_DIR, "copy_inventory.log")
 COPY_INV_RESULT = "[p5agent] inventory result: "     # the job's last line: its JSON
 COPY_ITEM_RE = re.compile(r"^(?:(?:db|config):[A-Za-z0-9][A-Za-z0-9._-]*|site|letsencrypt|squid)$")
 COPY_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
+APP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 COPY_KEY_IDLE = 5 * 60       # a grant ends this long after its last use
 COPY_LOCK = threading.RLock()
 COPY_GRANT = {}              # the one grant, in memory only; {} when there is none
@@ -2740,6 +2741,25 @@ class Handler(BaseHTTPRequestHandler):
                                  or not all(isinstance(a, str) and re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", a)
                                             for a in apps)):
             return self._send(400, {"error": "apps must be a list of app names"})
+        # How the dashboard installs each app (from its registry): the copied
+        # upplet only says which apps it runs.
+        installs = req.get("installs") or {}
+        if not isinstance(installs, dict):
+            return self._send(400, {"error": "installs must map app names to install requests"})
+        clean = {}
+        for name, inst in installs.items():
+            if not (isinstance(name, str) and APP_NAME_RE.match(name) and isinstance(inst, dict)):
+                return self._send(400, {"error": "installs must map app names to install requests"})
+            deps = inst.get("dependencies") or []
+            if not (isinstance(deps, list) and all(isinstance(d, str) for d in deps)):
+                return self._send(400, {"error": "dependencies of %s must be a list of names" % name})
+            one = {"dependencies": [d.strip() for d in deps if d.strip()]}
+            for k in ("repo", "branch", "path", "product-name", "app-type", "app-cmd"):
+                if inst.get(k) is not None:
+                    one[k] = str(inst[k])
+            if inst.get("demo"):
+                one["demo"] = True
+            clean[name] = one
         if not os.path.isfile(COPY_SCRIPT):
             return self._send(500, {"error": "copy_upplet.py not found"})
 
@@ -2747,7 +2767,7 @@ class Handler(BaseHTTPRequestHandler):
             return re.sub(r"[^\w .()-]", "", str(value or ""))[:64]
 
         job = {
-            "source": source, "key": key, "apps": apps,
+            "source": source, "key": key, "apps": apps, "installs": clean,
             "source_name": label(req.get("source_name")) or source,
             "target_name": label(req.get("target_name")),
             "nginx": req.get("nginx") is not False,

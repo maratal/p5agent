@@ -502,6 +502,17 @@ def install_request(app):
     return req, ""
 
 
+def same_repo(a, b):
+    """Whether two clone URLs name the same repo (scheme, credentials, case,
+    ".git" and a trailing slash aside)."""
+    def norm(url):
+        parts = urllib.parse.urlsplit(str(url or "").strip())
+        host = (parts.hostname or "").lower()
+        path = re.sub(r"(?:\.git)?/*$", "", parts.path).lower()
+        return host + path if host and path else ""
+    return bool(norm(a)) and norm(a) == norm(b)
+
+
 def static_site():
     """The static site Nginx serves here: {port, domain}, or None."""
     conf = read_file(STATIC_SITE_CONF)
@@ -793,6 +804,7 @@ class Import:
         self.src = self.peer.name
         self.dst = req.get("target_name") or socket.gethostname()
         self.wanted_apps = req.get("apps")              # None: every app
+        self.installs = req.get("installs") or {}       # the dashboard's install request per app
         self.want_nginx = req.get("nginx") is not False
         self.want_squid = req.get("squid") is not False
         self.caller = req.get("caller") or ""
@@ -857,7 +869,7 @@ class Import:
         if certificates:
             self.receive("letsencrypt", "the Let's Encrypt certificates")
         for app in apps:
-            if not app.get("install"):
+            if not self.install_for(app):
                 continue
             name, product = app["name"], app["product"]
             if app.get("config"):
@@ -918,9 +930,34 @@ class Import:
         logline("✓ Certificates in place (renewals work here once the domains point to this upplet)")
 
     # ── one app ──────────────────────────────────────────────────────────────
+    def install_for(self, app):
+        """The /install-app request that installs `app` here, or None when it
+        cannot be. The dashboard's, built from its registry the way it installs
+        the app anywhere — dependencies included, less those switched off; the
+        copied upplet only adds what the dashboard cannot know: where an app
+        the registry does not list comes from, and for the same repo, the
+        branch it is on and the key a private one is cloned with. With a
+        dashboard that sends none, the copied upplet's own record."""
+        src = app.get("install") or {}
+        mine = self.installs.get(app["name"])
+        if mine is None:
+            return dict(src) if src else None
+        req = dict(mine, name=app["name"])
+        if not (req.get("repo") or req.get("demo")):
+            if not (src.get("repo") or src.get("demo")):
+                return None
+            for k, v in src.items():
+                req.setdefault(k, v)
+        elif req.get("repo") and same_repo(req["repo"], src.get("repo")):
+            for k in ("branch", "key"):
+                if src.get(k):
+                    req.setdefault(k, src[k])
+        return req
+
     def copy_app(self, app, nginx_apps, taken):
         name, product = app["name"], app["product"]
-        if not app.get("install"):
+        install = self.install_for(app)
+        if not install:
             self.warn("%s cannot be installed from scratch (%s) — skipped" % (product, app.get("skip") or "no recipe"))
             return
         # The port: behind Nginx it is installed on its private port, which
@@ -933,7 +970,7 @@ class Import:
                 port = public
         taken.add(port)
 
-        req = dict(app["install"], port=port)
+        req = dict(install, port=port)
         logline("Installing %s from scratch on %s..." % (product, self.dst))
         path = os.path.join(self.work, "install_%s.json" % name)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -950,6 +987,11 @@ class Import:
             raise CopyError("%s was not installed" % product)
         self.services.append(name)
         self.services += app.get("services") or []
+        # The database servers it was installed with, and the one its data goes into.
+        used = [str(d).split()[0].lower() for d in req.get("dependencies") or [] if str(d).strip()]
+        if app.get("db"):
+            used.append(app["db"].get("type") or "")
+        self.services += [DB_SERVICES[d] for d in used if d in DB_SERVICES]
 
         if "config:" + name in self.archives:
             logline("Putting the config files of %s in place..." % product)

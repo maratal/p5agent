@@ -271,15 +271,21 @@ its firewall is never touched.
    true}`, or a restart). The grant snapshots the firewall table and
    `P5AGENT_ALLOW_IP` (what gets copied). It is refused when the agent port is
    open to listed addresses only and the new upplet's is not one of them. Then `POST
-   /copy-start {source, key, source_name, target_name, apps, nginx, squid}` on
-   the new one.
+   /copy-start {source, key, source_name, target_name, apps, installs, nginx,
+   squid}` on the new one. `installs` maps each app to the install request the
+   dashboard builds from its own registry, as it would install the app
+   anywhere — dependencies included, less those switched off in Details. The
+   copied upplet's record of an app is not used for it: only where an app the
+   registry does not list comes from, and for the same repo the branch it is
+   on and the key a private one is cloned with, are read off its checkout.
 3. **Copy**: the new upplet's agent runs `copy_upplet.py import` as an install
    (app name `copy`). It first fetches everything it needs from the copied
    agent's `/copy/…` endpoints with the key — accepted only from the granted
    address — and then lets the copied upplet go, so the grant is in use for
    minutes, not for as long as the apps take to install:
-   - `GET /copy/manifest` — each app's install request (repo, branch and token
-     from its git checkout, type, command, ports, dependencies), its database
+   - `GET /copy/manifest` — each app's install request as recorded there
+     (repo, branch and token from its git checkout; the rest is used only
+     when the dashboard sends no `installs`), its database
      and Nginx settings, Squid, the static site, and the snapshot;
    - `GET /copy/file?item=` — one archive, made by `copy_upplet.py stream` as
      it is sent: `db:<app>` (the database dumped and gzipped: `pg_dump -Fc`,
@@ -301,7 +307,7 @@ its firewall is never touched.
    upplet is free again as soon as everything is fetched (`/copy/done`).
 
    In order: the Let's Encrypt certificates; each app installed from scratch
-   (`install_app.sh` with `P5AGENT_NESTED=1`, logging into the same
+   (`install_app.sh` with `P5AGENT_NESTED=1` and the dashboard's request, logging into the same
    `setup.log` and leaving the lock alone), its config files (its env file
    keeps this upplet's `MGMT_TOKEN`, `PORT`, `HOST` and TLS pair), its
    database restored; Nginx (`nginx.sh install sites` per public port, the
