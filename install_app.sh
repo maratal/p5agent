@@ -177,6 +177,12 @@ PY
 # service-user setups succeed — always, not only for the dependencies here:
 # the app's own install script may apt-install such packages itself.
 runlog "chage -d \"\$(date +%F)\" root || true"
+# Packages a previous failed run left unpacked but unconfigured (that same
+# postinst failure) block every later apt install; finish configuring them.
+if [[ -n "$(dpkg --audit 2>/dev/null)" ]]; then
+    logline "Finishing package setup a previous run left incomplete"
+    runlog "DEBIAN_FRONTEND=noninteractive dpkg --configure -a" || logline "dpkg --configure -a failed"
+fi
 
 app_services=""   # systemd units of service deps (postgres, redis, …) the app needs
 if (( ${#DEPS[@]} == 0 )); then
