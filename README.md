@@ -316,8 +316,12 @@ its firewall is never touched.
    changes — no restart); the firewall rules 1:1 (`firewall.sh --set`); and
    last, every service the copy needs is checked to be running. The log ends
    `copy installation completed` (or `failed`). An app behind Nginx on the
-   copied upplet is installed on its private port and put behind Nginx again;
-   when Nginx is not copied, it serves itself on the port Nginx served it on.
+   copied upplet is installed serving itself on the port Nginx served it on —
+   as it was installed there before Nginx, and as an app's own installer may
+   bind anyway — and stopped once copied, so the next app can do the same;
+   Nginx then moves each to its private port and starts it. When Nginx is
+   not copied, such an app serves itself on that port (unless another app
+   copied has it already).
 
 ## Authorization
 

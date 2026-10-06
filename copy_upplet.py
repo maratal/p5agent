@@ -849,7 +849,7 @@ class Import:
 
         taken = set()
         for app in apps:
-            self.copy_app(app, nginx_apps, taken)
+            self.copy_app(app, app in nginx_apps, taken)
 
         if nginx_apps or site:
             self.setup_nginx(nginx_apps, site)
@@ -884,7 +884,9 @@ class Import:
         if squid:
             self.receive("squid", "Squid's credentials and whitelist")
         self.release(True)
-        logline("✓ Everything is here — %s is no longer involved" % self.src)
+        # The copy's turning point, in blue: the dashboard's log window shows
+        # ANSI colours, and so does a terminal.
+        logline("\x1b[34m✓ Everything is here — %s is no longer involved\x1b[39m" % self.src)
 
     def receive(self, item, what, said=False):
         """One archive from the copied upplet, into this run's folder."""
@@ -954,21 +956,27 @@ class Import:
                     req.setdefault(k, src[k])
         return req
 
-    def copy_app(self, app, nginx_apps, taken):
+    def copy_app(self, app, behind_nginx, taken):
         name, product = app["name"], app["product"]
         install = self.install_for(app)
         if not install:
             self.warn("%s cannot be installed from scratch (%s) — skipped" % (product, app.get("skip") or "no recipe"))
             return
-        # The port: behind Nginx it is installed on its private port, which
-        # Nginx then serves; without Nginx it serves itself, on the port Nginx
-        # served it on (unless another app copied has that one already).
-        port = app.get("port") or "443"
-        if app.get("nginx") and app not in nginx_apps:
-            public = str(app["nginx"]["public"])
-            if public not in taken:
-                port = public
-        taken.add(port)
+        # The port. An app going behind Nginx is installed as it was in the
+        # first place, serving itself on the port Nginx serves it on (an app's
+        # own installer may bind that one whatever it is given: ChatServer's
+        # binds 443), and is stopped once copied, so the next app can do the
+        # same; Nginx then moves each to its private port and starts it, all
+        # its ports bound at once. An app that was behind Nginx when Nginx is
+        # not copied serves itself on that port, unless another app copied
+        # has it already; any other app keeps its own.
+        port = str(app.get("port") or "443")
+        if behind_nginx:
+            port = str(app["nginx"]["public"])
+        else:
+            if app.get("nginx") and str(app["nginx"]["public"]) not in taken:
+                port = str(app["nginx"]["public"])
+            taken.add(port)
 
         req = dict(install, port=port)
         logline("Installing %s from scratch on %s..." % (product, self.dst))
@@ -1001,6 +1009,12 @@ class Import:
             logline("Restoring the database of %s on %s..." % (product, self.dst))
             self.restore_db(app, self.archives["db:" + name])
 
+        if behind_nginx:
+            # Nginx starts it, on its private port.
+            if service_exists(name):
+                run(["systemctl", "stop", name])
+            logline("✓ %s copied — stopped until Nginx serves it" % product)
+            return
         if service_exists(name):
             run(["systemctl", "restart", name])
         logline("✓ %s copied" % product)
