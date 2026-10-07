@@ -1300,15 +1300,19 @@ def setup_log_id():
 
 
 COMPLETED_SUFFIX = " installation completed"
+# Colour codes a log line may carry. They are removed before the completion
+# marker is checked, so a marker written in colour still counts.
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def completed_app(log):
     """The app name from the completion marker — the log's LAST line being
     "[ts] <app> installation completed" — or None."""
     lines = log.rstrip().splitlines() if log.strip() else []
-    if not lines or not lines[-1].endswith(COMPLETED_SUFFIX):
+    last = ANSI_ESCAPE_RE.sub("", lines[-1]).rstrip() if lines else ""
+    if not last.endswith(COMPLETED_SUFFIX):
         return None
-    app = lines[-1][:-len(COMPLETED_SUFFIX)]
+    app = last[:-len(COMPLETED_SUFFIX)]
     if app.startswith("[") and "] " in app:
         app = app.split("] ", 1)[1]
     return app.strip() or None

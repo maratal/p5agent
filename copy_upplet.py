@@ -1528,9 +1528,11 @@ def cmd_import(req_path):
     if ok:
         if imp.warnings:
             logline("Done, with %d warning(s): %s" % (len(imp.warnings), "; ".join(imp.warnings)))
-        logline("✓ %s is a copy of %s" % (imp.dst, imp.src))
-        # The agent's completion marker: the log's last line.
-        logline("copy installation completed")
+        # The end of a successful copy, in bold green. The second line is the
+        # agent's completion marker, which must stay the log's last line; the
+        # agent ignores the colour codes when it checks for it.
+        logline("\x1b[1;32m✓ %s is a copy of %s\x1b[0m" % (imp.dst, imp.src))
+        logline("\x1b[1;32mcopy installation completed\x1b[0m")
     else:
         logline("copy installation failed")
     try:
