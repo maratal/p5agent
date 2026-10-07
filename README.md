@@ -206,9 +206,10 @@ into `setup.log`.
 # Squid: an authenticated forward proxy (password in the environment only)
 curl -X POST "https://<ip>:5005/install-util" -H "Authorization: Bearer $TOKEN" \
      -H "Content-Type: application/json" \
-     -d '{"name": "squid", "user": "squiduser", "password": "…", "port": 3128,
-          "whitelist": true, "domains": [".github.com"]}'
-# (`"keep_credentials": true` instead of user/password keeps those of a Squid set up already.)
+     -d '{"name": "squid", "users": [{"user": "alice"}, {"user": "bob", "password": "…"}],
+          "port": 3128, "whitelist": true, "domains": [".github.com"]}'
+# The proxy's users become exactly those listed: one with a password gets it, one
+# without keeps the password it has, and any user not listed is removed.
 
 # Nginx in front of an installed app (port 0: picked on the upplet)
 curl -X POST "https://<ip>:5005/install-util" -H "Authorization: Bearer $TOKEN" \

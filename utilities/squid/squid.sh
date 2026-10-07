@@ -3,9 +3,9 @@
 # squid.sh — Squid on an upplet (utilities/squid/ in p5agent): an authenticated,
 # optionally domain-whitelisted forward proxy. Its card in the dashboard runs everything but a manual setup.
 #
-#   squid.sh [install|setup]  set it up (or again: port, whitelist, credentials)
-#                             — with no settings in the environment it asks for
-#                             the username and password. `install` is what
+#   squid.sh [install|setup]  set it up (or again: port, whitelist, users) —
+#                             with no SQUID_USERS in the environment it asks for
+#                             one username and password. `install` is what
 #                             p5agent's install_util.sh runs (/install-util).
 #   squid.sh start | stop     the service
 #   squid.sh update           upgrade the package, then restart
@@ -17,11 +17,11 @@
 #
 # setup's environment:
 #         PROXY_PORT      (default 3128)
-#         PROXY_USER      username — skips the prompt when set
-#         PROXY_PASS      password — skips the prompt when set
-#         SQUID_KEEP_PASSWD 1 = keep the credentials a previous run set up
-#                         (its passwd file): no prompt, PROXY_USER/PROXY_PASS
-#                         unused — for changing the rest (port, whitelist)
+#         SQUID_USERS     the proxy's users, space-separated: the passwd file
+#                         holds exactly these, in this order, and any other
+#                         user is removed. The i-th one (from 1) with
+#                         PROXY_PASS_<i> set gets that password; without it,
+#                         it keeps the password it has (it must have one)
 #         WHITELIST_FILE  domain list to use instead of whitelist.txt next to it
 #         SQUID_WHITELIST 0 = no domain whitelist: any destination for an
 #                         authenticated user (default 1)
@@ -194,25 +194,31 @@ for p in /usr/lib/squid/basic_ncsa_auth /usr/lib64/squid/basic_ncsa_auth \
 done
 [[ -n "$AUTH_HELPER" ]] || die "basic_ncsa_auth helper not found"
 
-# --- Prompt for credentials ------------------------------------------------
-KEEP_PASSWD=0
-if [[ "${SQUID_KEEP_PASSWD:-0}" == "1" ]]; then
-    PROXY_USER="$(head -n1 "$PASSWD_FILE" 2>/dev/null | cut -d: -f1 || true)"
-    [[ -n "$PROXY_USER" ]] || die "no credentials to keep: $PASSWD_FILE is missing or empty"
-    KEEP_PASSWD=1
-    PROXY_PASS="kept"             # not used: the passwd file stays as it is
-elif [[ -z "${PROXY_USER:-}" ]]; then
-    read -r -p "Proxy username: " PROXY_USER
-fi
-[[ -n "$PROXY_USER" ]] || die "username cannot be empty"
-[[ "$PROXY_USER" != *:* ]] || die "username cannot contain ':'"
+# --- Users -----------------------------------------------------------------
+# SQUID_USERS, each with PROXY_PASS_<i> for a new password or none to keep
+# the one it has — checked here, before anything changes, and written with
+# the passwd file below. Run by hand without it: one user, asked for.
+passwd_has_user() { awk -F: -v u="$1" '$1 == u { found = 1 } END { exit !found }' "$PASSWD_FILE" 2>/dev/null; }
 
-if [[ -z "${PROXY_PASS:-}" ]]; then
-    read -r -s -p "Proxy password: " PROXY_PASS; echo
+if [[ -z "${SQUID_USERS:-}" ]]; then
+    read -r -p "Proxy username: " SQUID_USERS
+    read -r -s -p "Proxy password: " PROXY_PASS_1; echo
     read -r -s -p "Confirm password: " PROXY_PASS2; echo
-    [[ -n "$PROXY_PASS" ]] || die "password cannot be empty"
-    [[ "$PROXY_PASS" == "$PROXY_PASS2" ]] || die "passwords do not match"
+    [[ -n "$PROXY_PASS_1" ]] || die "password cannot be empty"
+    [[ "$PROXY_PASS_1" == "$PROXY_PASS2" ]] || die "passwords do not match"
+    unset PROXY_PASS2
 fi
+read -r -a USERS <<< "$SQUID_USERS"
+(( ${#USERS[@]} > 0 )) || die "no proxy users"
+declare -A SEEN=()
+for (( i = 1; i <= ${#USERS[@]}; i++ )); do
+    user="${USERS[i-1]}"; pass_var="PROXY_PASS_$i"
+    [[ "$user" != *:* ]] || die "'$user': a username cannot contain ':'"
+    [[ -z "${SEEN[$user]:-}" ]] || die "'$user' is listed twice"
+    SEEN[$user]=1
+    [[ -n "${!pass_var:-}" ]] || passwd_has_user "$user" || die "'$user' has no password to keep — give it one"
+done
+PROXY_USER="${USERS[0]}"          # for the closing message
 
 # --- p5agent port (for the firewall) --------------------------------------
 # Defaults to 5005/tcp; override with e.g. P5AGENT_PORT=5006/tcp in the environment.
@@ -221,13 +227,26 @@ P5AGENT_PORT="${P5AGENT_PORT:-5005/tcp}"
 [[ "$P5AGENT_PORT" == */* ]] || P5AGENT_PORT="$P5AGENT_PORT/tcp"
 
 # --- Write password file (password read from stdin, not visible in ps) ----
-if [[ "$KEEP_PASSWD" == "1" ]]; then
-    echo "Credentials kept for user '$PROXY_USER'."
-else
-    printf '%s' "$PROXY_PASS" | htpasswd -i -c -B "$PASSWD_FILE" "$PROXY_USER" >/dev/null
-    echo "Password file written for user '$PROXY_USER'."
-fi
-unset PROXY_PASS PROXY_PASS2
+# Built next to the old file and moved over it, so a failure halfway leaves
+# the previous users working. A kept user's line (its hash) is copied as it
+# is; a user with a password gets a fresh hash.
+NEW_PASSWD="$PASSWD_FILE.new"
+( umask 077; : > "$NEW_PASSWD" )
+written=()
+for (( i = 1; i <= ${#USERS[@]}; i++ )); do
+    user="${USERS[i-1]}"; pass_var="PROXY_PASS_$i"
+    if [[ -n "${!pass_var:-}" ]]; then
+        printf '%s' "${!pass_var}" | htpasswd -i -B "$NEW_PASSWD" "$user" >/dev/null \
+            || { rm -f "$NEW_PASSWD"; die "htpasswd failed for '$user'"; }
+        unset "$pass_var"
+        written+=("$user")
+    else
+        awk -F: -v u="$user" '$1 == u { print; exit }' "$PASSWD_FILE" >> "$NEW_PASSWD"
+        written+=("$user (kept)")
+    fi
+done
+mv "$NEW_PASSWD" "$PASSWD_FILE"
+echo "Password file written: ${#written[@]} user(s) — ${written[*]}."
 
 # Determine the user Squid runs as
 SQUID_USER="proxy"
